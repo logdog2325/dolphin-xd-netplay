@@ -1,0 +1,132 @@
+From 36afcf7ae204451569dcb6280aa8adf0dd348836 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 15:40:50 -0700
+Subject: [PATCH 17/17] Android: XD Netplay launcher icon
+
+Original mark in a Shadow-Lugia-inspired palette: silver XD monogram
+with a red eye inside the D, wing and mask arcs on deep violet. No
+copyrighted artwork; legacy pre-API-26 mipmaps keep the stock icon.
+---
+ .../src/main/res/drawable/ic_xd_launcher.xml  | 46 +++++++++++++++++++
+ .../main/res/drawable/ic_xd_silhouette.xml    | 27 +++++++++++
+ .../res/mipmap-anydpi-v26/ic_launcher.xml     |  8 ++--
+ .../app/src/main/res/values/xd_colors.xml     |  4 ++
+ 4 files changed, 81 insertions(+), 4 deletions(-)
+ create mode 100644 Source/Android/app/src/main/res/drawable/ic_xd_launcher.xml
+ create mode 100644 Source/Android/app/src/main/res/drawable/ic_xd_silhouette.xml
+ create mode 100644 Source/Android/app/src/main/res/values/xd_colors.xml
+
+diff --git a/Source/Android/app/src/main/res/drawable/ic_xd_launcher.xml b/Source/Android/app/src/main/res/drawable/ic_xd_launcher.xml
+new file mode 100644
+index 0000000..62257df
+--- /dev/null
++++ b/Source/Android/app/src/main/res/drawable/ic_xd_launcher.xml
+@@ -0,0 +1,46 @@
++<?xml version="1.0" encoding="utf-8"?>
++<!-- XD Netplay launcher icon: original mark, Shadow-Lugia-inspired palette. -->
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++
++    <!-- wing swoosh -->
++    <path
++        android:pathData="M12,80 C38,58 70,58 96,80 C70,70 38,70 12,80 Z"
++        android:fillColor="#4A3378" />
++    <!-- upper mask arc -->
++    <path
++        android:pathData="M20,34 C44,22 64,22 88,34 C64,28 44,28 20,34 Z"
++        android:fillColor="#3A2A5E" />
++
++    <!-- X -->
++    <path
++        android:pathData="M31,40 L49,68"
++        android:strokeColor="#ECECF4"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++    <path
++        android:pathData="M49,40 L31,68"
++        android:strokeColor="#ECECF4"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++
++    <!-- D -->
++    <path
++        android:pathData="M59,40 L59,68"
++        android:strokeColor="#ECECF4"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++    <path
++        android:pathData="M59,40 C78,43 78,65 59,68"
++        android:strokeColor="#ECECF4"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++
++    <!-- red eye inside the D -->
++    <path
++        android:pathData="M62,54 a4.2,4.2 0 1,0 8.4,0 a4.2,4.2 0 1,0 -8.4,0 Z"
++        android:fillColor="#E23B4E" />
++</vector>
+diff --git a/Source/Android/app/src/main/res/drawable/ic_xd_silhouette.xml b/Source/Android/app/src/main/res/drawable/ic_xd_silhouette.xml
+new file mode 100644
+index 0000000..e71bba8
+--- /dev/null
++++ b/Source/Android/app/src/main/res/drawable/ic_xd_silhouette.xml
+@@ -0,0 +1,27 @@
++<?xml version="1.0" encoding="utf-8"?>
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <path
++        android:pathData="M31,40 L49,68"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++    <path
++        android:pathData="M49,40 L31,68"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++    <path
++        android:pathData="M59,40 L59,68"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++    <path
++        android:pathData="M59,40 C78,43 78,65 59,68"
++        android:strokeColor="#FFFFFFFF"
++        android:strokeWidth="8.5"
++        android:strokeLineCap="round" />
++</vector>
+diff --git a/Source/Android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml b/Source/Android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+index fefddc1..e8ad9ee 100644
+--- a/Source/Android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
++++ b/Source/Android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml
+@@ -1,6 +1,6 @@
+ <?xml version="1.0" encoding="utf-8"?>
+ <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+-    <background android:drawable="@color/ic_launcher_background"/>
+-    <foreground android:drawable="@drawable/ic_dolphin_launcher"/>
+-    <monochrome android:drawable="@drawable/ic_dolphin_silhouette"/>
+-</adaptive-icon>
+\ No newline at end of file
++    <background android:drawable="@color/ic_xd_launcher_background"/>
++    <foreground android:drawable="@drawable/ic_xd_launcher"/>
++    <monochrome android:drawable="@drawable/ic_xd_silhouette"/>
++</adaptive-icon>
+diff --git a/Source/Android/app/src/main/res/values/xd_colors.xml b/Source/Android/app/src/main/res/values/xd_colors.xml
+new file mode 100644
+index 0000000..97d4e4e
+--- /dev/null
++++ b/Source/Android/app/src/main/res/values/xd_colors.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <color name="ic_xd_launcher_background">#221640</color>
++</resources>
+-- 
+2.39.5 (Apple Git-154)
+
