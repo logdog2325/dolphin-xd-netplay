@@ -1,0 +1,123 @@
+From 935b5fb085a499f928077385d98c52cae56685cd Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 14:28:44 -0700
+Subject: [PATCH 12/12] Android: show team-save install state in the launcher
+ checklist
+
+XD refuses fresh GBA saves with an in-game 'save must be progressed'
+message; make the bundled-save seeding visible as its own checklist row
+so the failure mode is diagnosable at a glance.
+---
+ .../features/xdnetplay/ui/XDLauncherActivity.kt  | 16 ++++++++++------
+ .../features/xdnetplay/ui/XDLauncherScreen.kt    | 10 ++++++++++
+ 2 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 2fc7307..b2da211 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -35,6 +35,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var initialized by mutableStateOf(false)
+     private var xdGameFound by mutableStateOf(false)
+     private var emeraldRomSet by mutableStateOf(false)
++    private var teamSavesReady by mutableStateOf(false)
+ 
+     private val pickXdFolder =
+         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+@@ -88,6 +89,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     initialized = initialized,
+                     xdGameFound = xdGameFound,
+                     emeraldRomSet = emeraldRomSet,
++                    teamSavesReady = teamSavesReady,
+                     onPickXdFolder = { pickXdFolder.launch(null) },
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+@@ -115,25 +117,24 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         emeraldRomSet = StringSetting.MAIN_GBA_ROM_2.string.isNotEmpty() ||
+             StringSetting.MAIN_GBA_ROM_3.string.isNotEmpty()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+-        if (emeraldRomSet) {
+-            seedTeamSaves()
+-        }
++        teamSavesReady = if (emeraldRomSet) seedTeamSaves() else false
+     }
+ 
+     /**
+      * Places the bundled dummy team saves where Dolphin expects the netplay
+      * GBA saves, so hosting works out of the box. Never overwrites.
+      */
+-    private fun seedTeamSaves() {
++    private fun seedTeamSaves(): Boolean {
+         val rom = StringSetting.MAIN_GBA_ROM_2.string
+             .ifEmpty { StringSetting.MAIN_GBA_ROM_3.string }
+-        if (rom.isEmpty()) return
+-        try {
++        if (rom.isEmpty()) return false
++        return try {
+             val savesDir = File(
+                 DirectoryInitialization.getUserDirectory(),
+                 "GBA" + File.separator + "Saves"
+             )
+             savesDir.mkdirs()
++            var allPresent = true
+             for (role in TeamRole.entries) {
+                 val target = File(SaveNaming.deriveSavePath(savesDir.path, rom, role.deviceNumber))
+                 if (!target.exists()) {
+@@ -141,9 +142,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                         target.outputStream().use { input.copyTo(it) }
+                     }
+                 }
++                allPresent = allPresent && target.exists()
+             }
++            allPresent
+         } catch (_: Exception) {
+             // Non-fatal: the team editor can still create saves on demand.
++            false
+         }
+     }
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index b36d469..e3f7b8e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -38,6 +38,7 @@ fun XDLauncherScreen(
+     initialized: Boolean,
+     xdGameFound: Boolean,
+     emeraldRomSet: Boolean,
++    teamSavesReady: Boolean,
+     onPickXdFolder: () -> Unit,
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
+@@ -76,6 +77,7 @@ fun XDLauncherScreen(
+                 ReadinessCard(
+                     xdGameFound = xdGameFound,
+                     emeraldRomSet = emeraldRomSet,
++                    teamSavesReady = teamSavesReady,
+                     onPickXdFolder = onPickXdFolder,
+                     onPickEmeraldRom = onPickEmeraldRom
+                 )
+@@ -112,6 +114,7 @@ fun XDLauncherScreen(
+ private fun ReadinessCard(
+     xdGameFound: Boolean,
+     emeraldRomSet: Boolean,
++    teamSavesReady: Boolean,
+     onPickXdFolder: () -> Unit,
+     onPickEmeraldRom: () -> Unit
+ ) {
+@@ -136,6 +139,13 @@ private fun ReadinessCard(
+                 fixLabel = "Choose ROM…",
+                 onFix = onPickEmeraldRom
+             )
++            CheckRow(
++                ok = teamSavesReady,
++                okText = "Team saves installed (XD requires progressed saves)",
++                missingText = "Team saves install automatically once the Emerald ROM is set",
++                fixLabel = "",
++                onFix = null
++            )
+             CheckRow(
+                 ok = true,
+                 okText = "GBA BIOS + XD OU rules bundled",
+-- 
+2.39.5 (Apple Git-154)
+

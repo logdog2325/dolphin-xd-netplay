@@ -1,7 +1,7 @@
 From b80369a04d6740f0887a15b669fefa46637b9c01 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:17:17 -0700
-Subject: [PATCH 03/11] Bundle XD OU Fixes cheat and open-source GBA BIOS in
+Subject: [PATCH 03/12] Bundle XD OU Fixes cheat and open-source GBA BIOS in
  Sys
 
 Ships the $XD OU Fixes Action Replay code in the default XD game INI
