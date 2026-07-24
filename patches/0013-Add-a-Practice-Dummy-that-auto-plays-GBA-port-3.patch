@@ -1,0 +1,128 @@
+From 565593eebb4dc594655999b0b8a5b7ba9b019caf Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 14:48:51 -0700
+Subject: [PATCH 13/13] Add a Practice Dummy that auto-plays GBA port 3
+
+A toggle in GBA Link settings rhythmically presses A on the second
+integrated GBA when netplay is not running, so one player can run a
+full XD GBA-vs-GBA battle alone: the dummy mashes through Emerald's
+battle menus picking the first move. Useful for testing the whole
+battle flow and as a scripted sparring partner.
+---
+ .../features/settings/model/BooleanSetting.kt      |  6 ++++++
+ .../settings/ui/SettingsFragmentPresenter.kt       |  8 ++++++++
+ Source/Android/app/src/main/res/values/strings.xml |  2 ++
+ Source/Core/Core/Config/MainSettings.cpp           |  1 +
+ Source/Core/Core/Config/MainSettings.h             |  1 +
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp         | 14 ++++++++++++++
+ 6 files changed, 32 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index 3c515fc..0772fa1 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -313,6 +313,12 @@ enum class BooleanSetting(
+         "MuteLinkAudio",
+         false
+     ),
++    MAIN_GBA_PRACTICE_DUMMY(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_GBA,
++        "PracticeDummy",
++        false
++    ),
+     MAIN_IR_ALWAYS_RECENTER(
+         Settings.FILE_DOLPHIN,
+         Settings.SECTION_INI_ANDROID,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
+index 1b33f0e..a36a721 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -1493,6 +1493,14 @@ class SettingsFragmentPresenter(
+     }
+ 
+     private fun addGbaLinkSettings(sl: ArrayList<SettingsItem>) {
++        sl.add(
++            SwitchSetting(
++                context,
++                BooleanSetting.MAIN_GBA_PRACTICE_DUMMY,
++                R.string.gba_practice_dummy,
++                R.string.gba_practice_dummy_description
++            )
++        )
+         sl.add(
+             SwitchSetting(
+                 context,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 3b4f9e7..fc21af6 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -76,6 +76,8 @@
+     <string name="gba_link_scale_fit">Fit, keep aspect ratio</string>
+     <string name="gba_link_scale_stretch">Stretch to full screen</string>
+     <string name="gba_link_scale_integer">Integer scale</string>
++    <string name="gba_practice_dummy">Practice Dummy on GBA 3</string>
++    <string name="gba_practice_dummy_description">Auto-presses A on GBA port 3 so you can battle a scripted opponent by yourself. Turn off for real matches.</string>
+     <string name="gba_link_external_display">Use External Display for GBA Link</string>
+     <string name="gba_link_external_display_description">Shows the active GBA Link screen on a valid external presentation display when one is connected.</string>
+     <string name="gba_link_position">GBA Screen Position</string>
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 9d42394..f53386b 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -408,6 +408,7 @@ const std::array<Info<std::string>, 5> MAIN_GBA_ROM_PATHS{
+ const Info<std::string> MAIN_GBA_SAVES_PATH{{System::Main, "GBA", "SavesPath"}, ""};
+ const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH{{System::Main, "GBA", "SavesInRomPath"}, false};
+ const Info<bool> MAIN_GBA_LINK_MUTED{{System::Main, "GBA", "MuteLinkAudio"}, false};
++const Info<bool> MAIN_GBA_PRACTICE_DUMMY{{System::Main, "GBA", "PracticeDummy"}, false};
+ #endif
+ 
+ // Main.Network
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index 27ffc13..e4ed9fe 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -228,6 +228,7 @@ extern const std::array<Info<std::string>, 5> MAIN_GBA_ROM_PATHS;
+ extern const Info<std::string> MAIN_GBA_SAVES_PATH;
+ extern const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH;
+ extern const Info<bool> MAIN_GBA_LINK_MUTED;
++extern const Info<bool> MAIN_GBA_PRACTICE_DUMMY;
+ 
+ static constexpr std::size_t GBPLAYER_GBA_INDEX = 4;
+ #endif
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 36ccc15..3d5c196 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -10,6 +10,8 @@
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Logging/Log.h"
++#include "Common/Config/Config.h"
++#include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/GBACore.h"
+@@ -124,7 +126,19 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+ {
+   GCPadStatus pad_status{};
+   if (!NetPlay::IsNetPlayRunning())
++  {
+     pad_status = Pad::GetGBAStatus(m_device_number);
++
++    // Practice dummy: rhythmically press A on GBA port 3 so a single player
++    // can spar against a scripted opponent without netplay.
++    if (m_device_number == 2 && Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY))
++    {
++      const u64 tenths = m_system.GetCoreTiming().GetTicks() /
++                         (m_system.GetSystemTimers().GetTicksPerSecond() / 10);
++      if (tenths % 7 < 2)
++        pad_status.button |= PadButton::PAD_BUTTON_A;
++    }
++  }
+   SerialInterface::CSIDevice_GCController::HandleMoviePadStatus(m_system.GetMovie(),
+                                                                 m_device_number, &pad_status);
+ 
+-- 
+2.39.5 (Apple Git-154)
+

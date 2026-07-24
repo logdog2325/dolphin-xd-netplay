@@ -1,7 +1,7 @@
 From 8597e8c4dee3d4280b4044230e4d2407a46e8ca7 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 12:58:00 -0700
-Subject: [PATCH 01/12] Android: implement netplay GBA ROM lookup and chat
+Subject: [PATCH 01/13] Android: implement netplay GBA ROM lookup and chat
  notices
 
 Fill in the two NetPlayUICallbacks stubs so GBA (Integrated) netplay
