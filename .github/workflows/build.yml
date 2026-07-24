@@ -68,6 +68,12 @@ jobs:
           java-version: "21"
       - name: Install NDK
         run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;30.0.15729638" > /dev/null
+      - name: Pre-copy Sys assets
+        run: |
+          mkdir -p Source/Android/app/src/main/assets
+          rm -rf Source/Android/app/src/main/assets/Sys
+          cp -r Data/Sys Source/Android/app/src/main/assets/Sys
+          rm -rf Source/Android/app/src/main/assets/Sys/Themes
       - name: Build APK
         working-directory: Source/Android
         run: ./gradlew assembleDebug --no-daemon
