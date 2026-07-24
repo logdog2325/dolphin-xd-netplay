@@ -1,0 +1,49 @@
+From 81989a7e03854e7a79a6dcc4594fb15c6dcc3638 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 13:19:20 -0700
+Subject: [PATCH 4/4] Android: prefer physical second screens over phantom
+ displays
+
+Some handheld firmware (AYN Odin 2 / Thor) exposes a virtual
+presentation display named like the built-in screen, which can win the
+presentation-display lookup and turn the dual-screen feature into a
+mirror. Filter candidates the way Azahar does: skip displays that share
+the default display's name or look built-in, falling back to any valid
+candidate so other devices keep the old behavior.
+---
+ .../dualscreen/ExternalDisplayManager.kt      | 20 +++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/ExternalDisplayManager.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/ExternalDisplayManager.kt
+index 0fc0f92..f7a443a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/ExternalDisplayManager.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/ExternalDisplayManager.kt
+@@ -127,9 +127,21 @@ class ExternalDisplayManager(private val context: Context) : DisplayManager.Disp
+             return findPresentationDisplay(displayManager) != null
+         }
+ 
+-        private fun findPresentationDisplay(displayManager: DisplayManager): Display? =
+-            displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).firstOrNull {
+-                it.displayId != Display.DEFAULT_DISPLAY && it.state == Display.STATE_ON
+-            }
++        private fun findPresentationDisplay(displayManager: DisplayManager): Display? {
++            val defaultName = displayManager.getDisplay(Display.DEFAULT_DISPLAY)?.name
++            val candidates =
++                displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION).filter {
++                    it.displayId != Display.DEFAULT_DISPLAY &&
++                        it.state == Display.STATE_ON &&
++                        it.isValid
++                }
++
++            // Some devices (e.g. AYN Odin 2 / Thor firmware) expose a phantom virtual
++            // display that shares the built-in display's name. Prefer a display that
++            // doesn't look like the default one so the physical second screen wins.
++            return candidates.firstOrNull {
++                it.name != defaultName && !it.name.contains("Built", ignoreCase = true)
++            } ?: candidates.firstOrNull()
++        }
+     }
+ }
+-- 
+2.39.5 (Apple Git-154)
+
