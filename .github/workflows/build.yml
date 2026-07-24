@@ -71,6 +71,23 @@ jobs:
       - name: Build APK
         working-directory: Source/Android
         run: ./gradlew assembleDebug --no-daemon
+      - name: Verify APK contents
+        run: |
+          set -euo pipefail
+          apk="$(ls Source/Android/app/build/outputs/apk/debug/*.apk | head -1)"
+          entries="$(unzip -Z1 "$apk")"
+          for f in \
+            lib/arm64-v8a/libmain.so \
+            assets/Sys/GBA/gba_bios.bin \
+            assets/Sys/GameSettings/GXXE01.ini \
+            assets/xdnetplay/gen3data.json \
+            assets/xdnetplay/EMERALD-2.sav \
+            assets/xdnetplay/EMERALD-3.sav; do
+            grep -qx "$f" <<< "$entries" || { echo "APK missing $f" >&2; exit 1; }
+          done
+          wrong="$(awk -F/ '/^lib\//{print $2}' <<< "$entries" | sort -u | grep -vx arm64-v8a || true)"
+          if [ -n "$wrong" ]; then echo "unexpected ABI(s): $wrong" >&2; exit 1; fi
+          echo "APK contents OK"
       - name: Rename APK
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)

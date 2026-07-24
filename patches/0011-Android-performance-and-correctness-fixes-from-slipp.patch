@@ -1,0 +1,172 @@
+From 1c0ec3320da40febf55b193a75053d26fe06dc23 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 14:19:48 -0700
+Subject: [PATCH 11/11] Android performance and correctness fixes from
+ slippi-android audit
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- Release the previous ANativeWindow reference in SurfaceChanged;
+  repeated surface changes (resizes, display hotplug — common with the
+  dual-screen flow) leaked a window reference each time.
+- Vote the emulation surface to 59.94 Hz on API 30+ so high-refresh
+  panels stop compositing 120 Hz for GameCube content.
+- Raise netplay client/server and CPU/video emulation threads to the
+  urgent-display priority class on Android; with fixed-delay netplay a
+  local scheduling stall also stalls the opponent.
+
+Reviewed against slippi-android's patch queue; their ENet service
+timeout and socket QoS tricks are already covered by mainline's wakeup
+packets and Common::QoSSession (SO_PRIORITY 7, DSCP EF, on by default).
+---
+ .../dolphinemu/fragments/EmulationFragment.kt      | 12 ++++++++++++
+ Source/Android/jni/MainAndroid.cpp                 |  6 ++++++
+ Source/Core/Core/Core.cpp                          | 14 ++++++++++++++
+ Source/Core/Core/NetPlayClient.cpp                 |  9 +++++++++
+ Source/Core/Core/NetPlayServer.cpp                 |  9 +++++++++
+ 5 files changed, 50 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/fragments/EmulationFragment.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/fragments/EmulationFragment.kt
+index 4180071..f0b4e2e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/fragments/EmulationFragment.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/fragments/EmulationFragment.kt
+@@ -179,6 +179,18 @@ class EmulationFragment : Fragment(), SurfaceHolder.Callback {
+ 
+     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+         Log.debug("[EmulationFragment] Surface changed. Resolution: $width x $height")
++        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
++            try {
++                // Vote for the GameCube's 59.94 Hz so high-refresh panels drop to a
++                // clean cadence instead of compositing 120 Hz for 60 Hz content.
++                holder.surface.setFrameRate(
++                    60000f / 1001f,
++                    android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
++                )
++            } catch (_: Exception) {
++                // Not critical; some devices reject frame-rate votes.
++            }
++        }
+         NativeLibrary.SurfaceChanged(holder.surface)
+         if (runWhenSurfaceIsValid) {
+             runWithValidSurface()
+diff --git a/Source/Android/jni/MainAndroid.cpp b/Source/Android/jni/MainAndroid.cpp
+index e919318..25b7251 100644
+--- a/Source/Android/jni/MainAndroid.cpp
++++ b/Source/Android/jni/MainAndroid.cpp
+@@ -444,6 +444,7 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceChang
+ {
+   std::lock_guard<std::mutex> guard(s_surface_lock);
+ 
++  ANativeWindow* previous_surf = s_surf;
+   s_surf = ANativeWindow_fromSurface(env, surf);
+   if (s_surf == nullptr)
+     __android_log_print(ANDROID_LOG_ERROR, DOLPHIN_TAG, "Error: Surface is null.");
+@@ -451,6 +452,11 @@ JNIEXPORT void JNICALL Java_org_dolphinemu_dolphinemu_NativeLibrary_SurfaceChang
+   if (g_presenter)
+     g_presenter->ChangeSurface(s_surf);
+ 
++  // surfaceChanged can fire repeatedly without a surfaceDestroyed in between
++  // (resizes, display hotplug); release the ref we took on the previous window.
++  if (previous_surf)
++    ANativeWindow_release(previous_surf);
++
+   s_surface_cv.notify_all();
+ }
+ 
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index 1b50796..aa8c839 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "Core/Core.h"
+ 
++#ifdef __ANDROID__
++#include <sys/resource.h>
++#endif
++
+ #include <algorithm>
+ #include <atomic>
+ #include <functional>
+@@ -325,6 +329,11 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
+ {
+   if (system.IsDualCoreMode())
+     Common::SetCurrentThreadName("CPU thread");
++#ifdef __ANDROID__
++  // Keep this thread responsive under Android scheduling (URGENT_DISPLAY class).
++  setpriority(PRIO_PROCESS, 0, -8);
++#endif
++
+   else
+     Common::SetCurrentThreadName("CPU-GPU thread");
+ 
+@@ -471,6 +480,11 @@ static void FifoPlayerThread(Core::System& system, const std::optional<std::stri
+     // Spawn the GPU thread.
+     std::thread gpu_thread{[&] {
+       Common::SetCurrentThreadName("Video thread");
++#ifdef __ANDROID__
++  // Keep this thread responsive under Android scheduling (URGENT_DISPLAY class).
++  setpriority(PRIO_PROCESS, 0, -8);
++#endif
++
+ 
+       const bool is_init = init_video();
+       init_from_thread.set_value(is_init);
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index 2cd9ae2..5a17438 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "Core/NetPlayClient.h"
+ 
++#ifdef __ANDROID__
++#include <sys/resource.h>
++#endif
++
+ #include <algorithm>
+ #include <array>
+ #include <cstddef>
+@@ -1584,6 +1588,11 @@ void NetPlayClient::SendAsync(sf::Packet&& packet, const u8 channel_id)
+ void NetPlayClient::ThreadFunc()
+ {
+   INFO_LOG_FMT(NETPLAY, "NetPlayClient starting.");
++#ifdef __ANDROID__
++  // Keep this thread responsive under Android scheduling (URGENT_DISPLAY class).
++  setpriority(PRIO_PROCESS, 0, -8);
++#endif
++
+ 
+   Common::QoSSession qos_session;
+   if (Config::Get(Config::NETPLAY_ENABLE_QOS))
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 834544b..7898137 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -3,6 +3,10 @@
+ 
+ #include "Core/NetPlayServer.h"
+ 
++#ifdef __ANDROID__
++#include <sys/resource.h>
++#endif
++
+ #include <algorithm>
+ #include <chrono>
+ #include <cstddef>
+@@ -245,6 +249,11 @@ void NetPlayServer::SetupIndex()
+ // called from ---NETPLAY--- thread
+ void NetPlayServer::ThreadFunc()
+ {
++#ifdef __ANDROID__
++  // Keep this thread responsive under Android scheduling (URGENT_DISPLAY class).
++  setpriority(PRIO_PROCESS, 0, -8);
++#endif
++
+   INFO_LOG_FMT(NETPLAY, "NetPlayServer starting.");
+ 
+   while (m_do_loop)
+-- 
+2.39.5 (Apple Git-154)
+
