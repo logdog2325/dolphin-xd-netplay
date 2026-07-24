@@ -1,0 +1,89 @@
+From fec395c16def8613ccc566a1cdf84e12adb47345 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 15:18:22 -0700
+Subject: [PATCH 16/16] Android: public battle lobby (Find Battles)
+
+Android counterpart of the desktop NetPlay Browser: a Sea-themed
+session list over Dolphin's public index server, filtered to Pokemon XD
+by default, with tap-to-join for traversal and direct sessions,
+password support via the index's server-id encryption, and a publish
+panel that arms NetPlayServer's built-in index publishing (UseIndex +
+name/region config) before hosting. Only same-build sessions are shown,
+matching netplay's version requirement.
+---
+ Source/Android/app/src/main/AndroidManifest.xml          | 5 +++++
+ .../features/xdnetplay/ui/XDLauncherActivity.kt          | 1 +
+ .../dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt | 9 +++++++++
+ Source/Android/jni/CMakeLists.txt                        | 1 +
+ 4 files changed, 16 insertions(+)
+
+diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
+index d70af29..de9e6a1 100644
+--- a/Source/Android/app/src/main/AndroidManifest.xml
++++ b/Source/Android/app/src/main/AndroidManifest.xml
+@@ -71,6 +71,11 @@
+             android:exported="false"
+             android:theme="@style/Theme.Dolphin.Main" />
+ 
++        <activity
++            android:name=".features.xdnetplay.ui.FindBattlesActivity"
++            android:exported="false"
++            android:theme="@style/Theme.Dolphin.Main" />
++
+         <provider
+             android:name="androidx.core.content.FileProvider"
+             android:authorities="${applicationId}.xdshare"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index a37f619..4ca9d51 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -97,6 +97,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+                     onBattle = { NetplaySetupActivity.launch(this) },
++                    onFindBattles = { FindBattlesActivity.launch(this) },
+                     onOpenSettings = {
+                         SettingsActivity.launch(this, MenuTag.SETTINGS)
+                     },
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 7d06e90..515c682 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -44,6 +44,7 @@ fun XDLauncherScreen(
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
+     onBattle: () -> Unit,
++    onFindBattles: () -> Unit,
+     onOpenSettings: () -> Unit,
+     onOpenDolphin: () -> Unit
+ ) {
+@@ -100,6 +101,14 @@ fun XDLauncherScreen(
+                 ) {
+                     Text("Battle  —  Host or Join", style = MaterialTheme.typography.titleMedium)
+                 }
++                Spacer(Modifier.height(12.dp))
++                OutlinedButton(
++                    onClick = onFindBattles,
++                    enabled = xdGameFound,
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    Text("Find Battles  —  public lobby", style = MaterialTheme.typography.titleMedium)
++                }
+                 Spacer(Modifier.height(24.dp))
+ 
+                 Row {
+diff --git a/Source/Android/jni/CMakeLists.txt b/Source/Android/jni/CMakeLists.txt
+index fe432fb..913b7d0 100644
+--- a/Source/Android/jni/CMakeLists.txt
++++ b/Source/Android/jni/CMakeLists.txt
+@@ -33,6 +33,7 @@ add_library(main SHARED
+   Input/NumericSetting.cpp
+   Input/NumericSetting.h
+   NetPlay/Netplay.cpp
++  NetPlay/NetPlayIndexBridge.cpp
+   NetPlay/NetPlayUICallbacks.cpp
+   NetPlay/NetPlayUICallbacks.h
+   MainAndroid.cpp
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,1516 @@
+From 592020e32bf52bb273d2a6511108406b6d376d9c Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 15:16:25 -0700
+Subject: [PATCH 14/16] Android: auto-map the built-in controller on launch
+
+The launcher detects the first physical gamepad and applies a standard
+template to GameCube pad 1 and GBA pads 2/3 (never overwriting an
+existing non-touchscreen mapping), persisting exactly like the mapping
+UI. A checklist row shows the result with a jump into input settings.
+---
+ .../features/xdnetplay/NetPlayIndexBridge.kt  | 120 +++++
+ .../features/xdnetplay/input/AutoMapper.kt    | 340 +++++++++++++++
+ .../xdnetplay/ui/FindBattlesActivity.kt       | 310 +++++++++++++
+ .../xdnetplay/ui/FindBattlesScreen.kt         | 409 ++++++++++++++++++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |   8 +
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  16 +-
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        | 190 ++++++++
+ 7 files changed, 1391 insertions(+), 2 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/NetPlayIndexBridge.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesScreen.kt
+ create mode 100644 Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/NetPlayIndexBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/NetPlayIndexBridge.kt
+new file mode 100644
+index 0000000..b90dd00
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/NetPlayIndexBridge.kt
+@@ -0,0 +1,120 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++/**
++ * Kotlin side of Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp — a thin client
++ * for Dolphin's NetPlay session index ("lobby server").
++ *
++ * All list calls are blocking HTTP; call them from Dispatchers.IO only.
++ *
++ * Only sessions whose published version equals this build's version string
++ * (Common::GetScmDescStr) are ever returned — anything else is unjoinable anyway.
++ */
++object NetPlayIndexBridge {
++
++    /**
++     * Lists open sessions, optionally filtered by (partial) session name, region code
++     * and game string. Returns null on failure — see [lastError].
++     *
++     * Note on the game filter: the index's "game" field holds whatever name the host
++     * published, not necessarily a 6-character game ID. Desktop hosts publish
++     * "Long Name (GAMEID, Region)", but this fork's Android hosts publish the plain
++     * long name (nativeChangeGame passes GameFile.getLongName()), which does NOT
++     * contain "GXXE01". So for the default XD-only view, pass gameId = "" here and
++     * filter client-side with [LobbySession.isXdBattle] instead.
++     */
++    fun listSessions(
++        name: String = "",
++        region: String = "",
++        gameId: String = ""
++    ): List<LobbySession>? =
++        nativeListSessions(name, region, gameId)?.map { LobbySession.fromRow(it) }
++
++    /** Error token from the last failed call: "NO_RESPONSE", "BAD_JSON", or a server status. */
++    val lastError: String
++        get() = nativeGetLastError()
++
++    /** This build's version string as the index stores it (Common::GetScmDescStr). */
++    val localVersion: String
++        get() = nativeGetScmVersion()
++
++    /**
++     * Decrypts a password-protected session's server_id (XOR + checksum scheme from
++     * NetPlaySession::DecryptID). Returns null if the password is wrong.
++     */
++    fun decryptServerId(encryptedServerId: String, password: String): String? =
++        nativeDecryptServerId(encryptedServerId, password)
++
++    /** Region (code, label) pairs accepted by the index, e.g. ("NA", "North America"). */
++    fun regions(): List<Pair<String, String>> {
++        val flat = nativeGetRegions()
++        return (flat.indices step 2).map { flat[it] to flat[it + 1] }
++    }
++
++    private external fun nativeListSessions(
++        name: String,
++        region: String,
++        gameId: String
++    ): Array<Array<String>>?
++
++    private external fun nativeGetLastError(): String
++
++    private external fun nativeGetScmVersion(): String
++
++    private external fun nativeDecryptServerId(serverId: String, password: String): String?
++
++    private external fun nativeGetRegions(): Array<String>
++}
++
++/**
++ * One row from the session index. Field order mirrors the String[10] encoding
++ * produced by NetPlayIndexBridge.cpp.
++ */
++data class LobbySession(
++    val name: String,
++    val region: String,
++    /** "traversal" (join via host code) or "direct" (join via IP). */
++    val method: String,
++    /** Traversal code or IP address; XOR-encrypted when [hasPassword] is true. */
++    val serverId: String,
++    /** The game string the host published (a name, not necessarily a game ID). */
++    val game: String,
++    val version: String,
++    val playerCount: Int,
++    val port: Int,
++    val hasPassword: Boolean,
++    val inGame: Boolean
++) {
++    val isTraversal: Boolean
++        get() = method == "traversal"
++
++    /**
++     * True when this session looks like a Pokemon XD (GXXE01) battle. Matches both
++     * desktop-published names ("... (GXXE01, GC)") and this fork's Android-published
++     * long names ("Pokemon XD: Gale of Darkness").
++     */
++    val isXdBattle: Boolean
++        get() {
++            val g = game.lowercase()
++            return g.contains("gxxe01") ||
++                g.contains("gale of darkness") ||
++                g.contains("pokemon xd") ||
++                g.contains("pokémon xd")
++        }
++
++    companion object {
++        fun fromRow(row: Array<String>): LobbySession = LobbySession(
++            name = row[0],
++            region = row[1],
++            method = row[2],
++            serverId = row[3],
++            game = row[4],
++            version = row[5],
++            playerCount = row[6].toIntOrNull() ?: 0,
++            port = row[7].toIntOrNull() ?: 0,
++            hasPassword = row[8] == "1",
++            inGame = row[9] == "1"
++        )
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+new file mode 100644
+index 0000000..762a9b3
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+@@ -0,0 +1,340 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.input
++
++import org.dolphinemu.dolphinemu.features.input.model.ControllerInterface
++import org.dolphinemu.dolphinemu.features.input.model.MappingCommon
++import org.dolphinemu.dolphinemu.features.input.model.controlleremu.Control
++import org.dolphinemu.dolphinemu.features.input.model.controlleremu.ControlGroup
++import org.dolphinemu.dolphinemu.features.input.model.controlleremu.EmulatedController
++
++/**
++ * Automatically maps a physical Android gamepad (e.g. the built-in controller of gaming
++ * handhelds like the AYN Thor) to the emulated controllers used by XD netplay:
++ *
++ * - GameCube controller 1 (A/B/X/Y/Z/Start, D-Pad, Control Stick, C Stick, L/R triggers)
++ * - GBA pads 2 and 3 (A/B/L/R/SELECT/START, D-Pad)
++ *
++ * The mapping template uses the control names exposed by the Android ControllerInterface
++ * backend (Source/Core/InputCommon/ControllerInterface/Android/Android.cpp):
++ * button inputs are named after their Android keycodes ("Button A", "Button L1", "Start",
++ * "Select", "Up", ...) and gamepad axes are named "Axis <id><sign>" where <id> is the
++ * android.view.MotionEvent axis constant and <sign> is '+' or '-' for the half of the axis
++ * ("Axis 1-" is left-stick up, because Android's Y axis is negative upwards).
++ *
++ * Only controls that actually exist on the detected device are mapped, so the same template
++ * degrades gracefully on gamepads with e.g. digital-only triggers or a key-based D-Pad.
++ *
++ * Persistence works exactly like the mapping UI: expressions are applied through
++ * [org.dolphinemu.dolphinemu.features.input.model.controlleremu.ControlReference.setExpression]
++ * + [EmulatedController.updateSingleControlReference], and then [MappingCommon.save] writes
++ * the pad configs (GCPadNew.ini / GBA.ini) to disk, so the mapping survives app restarts.
++ *
++ * Must only be called after the native library and user directory are initialized
++ * (i.e. any point at which the existing mapping UI would also work).
++ */
++object AutoMapper {
++    private const val TOUCHSCREEN_SUFFIX = "/Touchscreen"
++
++    // ControlGroup UI names (see GCPadEmu.cpp / GBAPadEmu.cpp; no string translator is
++    // registered on Android, so getUiName() returns these raw strings).
++    private const val GROUP_BUTTONS = "Buttons"
++    private const val GROUP_MAIN_STICK = "Control Stick" // ui_name of the "Main Stick" group
++    private const val GROUP_C_STICK = "C Stick" // ui_name of the "C-Stick" group
++    private const val GROUP_TRIGGERS = "Triggers"
++    private const val GROUP_DPAD = "D-Pad"
++
++    // Android gamepad button controls (Android.cpp KEYCODE_NAMES).
++    private const val BTN_A = "Button A"
++    private const val BTN_B = "Button B"
++    private const val BTN_X = "Button X"
++    private const val BTN_Y = "Button Y"
++    private const val BTN_Z = "Button Z"
++    private const val BTN_L1 = "Button L1"
++    private const val BTN_R1 = "Button R1"
++    private const val BTN_L2 = "Button L2"
++    private const val BTN_R2 = "Button R2"
++    private const val BTN_START = "Start" // KEYCODE_BUTTON_START
++    private const val BTN_SELECT = "Select" // KEYCODE_BUTTON_SELECT
++    private const val BTN_MENU = "Menu"
++    private const val BTN_BACK = "Back"
++    private const val KEY_DPAD_UP = "Up" // KEYCODE_DPAD_UP etc.
++    private const val KEY_DPAD_DOWN = "Down"
++    private const val KEY_DPAD_LEFT = "Left"
++    private const val KEY_DPAD_RIGHT = "Right"
++
++    // Android gamepad axis controls: "Axis <MotionEvent axis id><+/->" for joystick-source
++    // axes (Android.cpp ConstructAxisName). The '-' input reads positive when the raw axis
++    // value is negative.
++    private const val AXIS_LSTICK_LEFT = "Axis 0-" // AXIS_X
++    private const val AXIS_LSTICK_RIGHT = "Axis 0+"
++    private const val AXIS_LSTICK_UP = "Axis 1-" // AXIS_Y (negative = up)
++    private const val AXIS_LSTICK_DOWN = "Axis 1+"
++    private const val AXIS_RSTICK_LEFT = "Axis 11-" // AXIS_Z
++    private const val AXIS_RSTICK_RIGHT = "Axis 11+"
++    private const val AXIS_RSTICK_LEFT_ALT = "Axis 12-" // AXIS_RX
++    private const val AXIS_RSTICK_RIGHT_ALT = "Axis 12+"
++    private const val AXIS_RSTICK_UP = "Axis 14-" // AXIS_RZ
++    private const val AXIS_RSTICK_DOWN = "Axis 14+"
++    private const val AXIS_RSTICK_UP_ALT = "Axis 13-" // AXIS_RY
++    private const val AXIS_RSTICK_DOWN_ALT = "Axis 13+"
++    private const val AXIS_HAT_LEFT = "Axis 15-" // AXIS_HAT_X
++    private const val AXIS_HAT_RIGHT = "Axis 15+"
++    private const val AXIS_HAT_UP = "Axis 16-" // AXIS_HAT_Y (negative = up)
++    private const val AXIS_HAT_DOWN = "Axis 16+"
++    private const val AXIS_LTRIGGER = "Axis 17+" // AXIS_LTRIGGER
++    private const val AXIS_RTRIGGER = "Axis 18+" // AXIS_RTRIGGER
++    private const val AXIS_GAS = "Axis 22+" // AXIS_GAS (alternative right trigger)
++    private const val AXIS_BRAKE = "Axis 23+" // AXIS_BRAKE (alternative left trigger)
++
++    // Inputs whose presence identifies a device as a gamepad.
++    private val GAMEPAD_MARKER_CONTROLS = arrayOf(BTN_A, "Button 1")
++
++    /**
++     * Returns the device string (e.g. "Android/1/AYN Thor Gamepad") of the first available
++     * input device that is a real gamepad, or null if none is connected.
++     *
++     * The legacy Touchscreen device, the Device Sensors device, keyboards and mice are
++     * excluded: a device qualifies only if it exposes a gamepad button input
++     * ("Button A" or "Button 1").
++     */
++    fun physicalGamepadDevice(): String? =
++        ControllerInterface.getAllDeviceStrings().firstOrNull { isPhysicalGamepad(it) }
++
++    /**
++     * Returns true if GameCube pad 1 already has a non-touchscreen default device and a
++     * mapped A button.
++     */
++    fun isMapped(): Boolean = isControllerMapped(EmulatedController.getGcPad(0))
++
++    /**
++     * Maps GameCube controller 1 and GBA pads 2 and 3 to the first detected physical
++     * gamepad, then saves the pad configs to disk.
++     *
++     * Safe to call on every app launch: controllers that already have a non-touchscreen
++     * mapping are never overwritten, and nothing is written to disk if no controller
++     * needed mapping.
++     *
++     * @return true if GameCube pad 1 is mapped to a physical gamepad after this call
++     * (whether it already was or was just mapped), false if no physical gamepad is available.
++     */
++    fun autoMap(): Boolean {
++        val gcPad = EmulatedController.getGcPad(0)
++        val gbaPads = listOf(EmulatedController.getGbaPad(1), EmulatedController.getGbaPad(2))
++
++        val gcNeedsMapping = !isControllerMapped(gcPad)
++        val gbaNeedingMapping = gbaPads.filterNot { isControllerMapped(it) }
++        if (!gcNeedsMapping && gbaNeedingMapping.isEmpty()) {
++            return true
++        }
++
++        val device = physicalGamepadDevice() ?: return !gcNeedsMapping
++        val coreDevice = ControllerInterface.getDevice(device) ?: return !gcNeedsMapping
++        val inputs = coreDevice.getInputs().mapTo(HashSet()) { it.getName() }
++
++        if (gcNeedsMapping) {
++            mapGcPad(gcPad, device, inputs)
++        }
++        for (gbaPad in gbaNeedingMapping) {
++            mapGbaPad(gbaPad, device, inputs)
++        }
++
++        // Persist the same way the mapping UI does when settings are saved
++        // (Settings.saveSettings -> MappingCommon.save -> Pad::GetConfig()->SaveConfig()
++        // and Pad::GetGBAConfig()->SaveConfig()).
++        MappingCommon.save()
++
++        return isMapped()
++    }
++
++    private fun isPhysicalGamepad(deviceString: String): Boolean {
++        if (deviceString.endsWith(TOUCHSCREEN_SUFFIX)) {
++            return false
++        }
++        val device = ControllerInterface.getDevice(deviceString) ?: return false
++        val inputs = device.getInputs()
++        return inputs.any { it.getName() in GAMEPAD_MARKER_CONTROLS }
++    }
++
++    private fun isControllerMapped(controller: EmulatedController): Boolean {
++        val defaultDevice = controller.getDefaultDevice()
++        if (defaultDevice.isEmpty() || defaultDevice.endsWith(TOUCHSCREEN_SUFFIX)) {
++            return false
++        }
++        val aButton = findControl(controller, GROUP_BUTTONS, "A") ?: return false
++        return aButton.getControlReference().getExpression().isNotBlank()
++    }
++
++    private fun mapGcPad(pad: EmulatedController, device: String, inputs: Set<String>) {
++        pad.setDefaultDevice(device)
++
++        // Triggers first, so that the Z mapping can avoid colliding with a digital-only
++        // trigger fallback that claims R1.
++        val lAnalog = firstPresent(inputs, AXIS_LTRIGGER, AXIS_BRAKE)
++        val rAnalog = firstPresent(inputs, AXIS_RTRIGGER, AXIS_GAS)
++        val lDigitalParts = listOfNotNull(lAnalog, firstPresent(inputs, BTN_L2))
++        val rDigitalParts = listOfNotNull(rAnalog, firstPresent(inputs, BTN_R2))
++
++        var r1ClaimedByTrigger = false
++        val lDigital: String?
++        val rDigital: String?
++        if (lDigitalParts.isNotEmpty() || rDigitalParts.isNotEmpty()) {
++            lDigital = alternation(device, lDigitalParts)
++            rDigital = alternation(device, rDigitalParts)
++        } else {
++            // No analog trigger axes and no L2/R2 keys: fall back to the shoulder buttons.
++            lDigital = firstPresent(inputs, BTN_L1)?.let { expression(device, it) }
++            rDigital = firstPresent(inputs, BTN_R1)?.let { expression(device, it) }
++            r1ClaimedByTrigger = rDigital != null
++        }
++
++        val zButton = when {
++            !r1ClaimedByTrigger && BTN_R1 in inputs -> BTN_R1
++            else -> firstPresent(inputs, BTN_Z, BTN_SELECT)
++        }
++
++        val buttons = findGroup(pad, GROUP_BUTTONS)
++        setMapping(pad, buttons, "A", singleExpression(device, inputs, BTN_A))
++        setMapping(pad, buttons, "B", singleExpression(device, inputs, BTN_B))
++        setMapping(pad, buttons, "X", singleExpression(device, inputs, BTN_X))
++        setMapping(pad, buttons, "Y", singleExpression(device, inputs, BTN_Y))
++        setMapping(pad, buttons, "Z", zButton?.let { expression(device, it) })
++        setMapping(pad, buttons, "START", singleExpression(device, inputs, BTN_START, BTN_MENU))
++
++        val triggers = findGroup(pad, GROUP_TRIGGERS)
++        setMapping(pad, triggers, "L", lDigital)
++        setMapping(pad, triggers, "R", rDigital)
++        setMapping(pad, triggers, "L-Analog", lAnalog?.let { expression(device, it) })
++        setMapping(pad, triggers, "R-Analog", rAnalog?.let { expression(device, it) })
++
++        val mainStick = findGroup(pad, GROUP_MAIN_STICK)
++        setMapping(pad, mainStick, "Up", singleExpression(device, inputs, AXIS_LSTICK_UP))
++        setMapping(pad, mainStick, "Down", singleExpression(device, inputs, AXIS_LSTICK_DOWN))
++        setMapping(pad, mainStick, "Left", singleExpression(device, inputs, AXIS_LSTICK_LEFT))
++        setMapping(pad, mainStick, "Right", singleExpression(device, inputs, AXIS_LSTICK_RIGHT))
++
++        // Right stick: prefer AXIS_Z/AXIS_RZ (the standard Android gamepad layout),
++        // fall back to AXIS_RX/AXIS_RY.
++        val cStick = findGroup(pad, GROUP_C_STICK)
++        setMapping(
++            pad, cStick, "Up",
++            singleExpression(device, inputs, AXIS_RSTICK_UP, AXIS_RSTICK_UP_ALT)
++        )
++        setMapping(
++            pad, cStick, "Down",
++            singleExpression(device, inputs, AXIS_RSTICK_DOWN, AXIS_RSTICK_DOWN_ALT)
++        )
++        setMapping(
++            pad, cStick, "Left",
++            singleExpression(device, inputs, AXIS_RSTICK_LEFT, AXIS_RSTICK_LEFT_ALT)
++        )
++        setMapping(
++            pad, cStick, "Right",
++            singleExpression(device, inputs, AXIS_RSTICK_RIGHT, AXIS_RSTICK_RIGHT_ALT)
++        )
++
++        mapDpad(pad, device, inputs)
++    }
++
++    private fun mapGbaPad(pad: EmulatedController, device: String, inputs: Set<String>) {
++        pad.setDefaultDevice(device)
++
++        val buttons = findGroup(pad, GROUP_BUTTONS)
++        setMapping(pad, buttons, "A", singleExpression(device, inputs, BTN_A))
++        setMapping(pad, buttons, "B", singleExpression(device, inputs, BTN_B))
++        setMapping(pad, buttons, "L", singleExpression(device, inputs, BTN_L1, BTN_L2, AXIS_LTRIGGER, AXIS_BRAKE))
++        setMapping(pad, buttons, "R", singleExpression(device, inputs, BTN_R1, BTN_R2, AXIS_RTRIGGER, AXIS_GAS))
++        setMapping(pad, buttons, "SELECT", singleExpression(device, inputs, BTN_SELECT, BTN_BACK))
++        setMapping(pad, buttons, "START", singleExpression(device, inputs, BTN_START, BTN_MENU))
++
++        mapDpad(pad, device, inputs)
++    }
++
++    /**
++     * Maps the D-Pad group. Real gamepads deliver their D-Pad either as DPAD key events or
++     * as AXIS_HAT_X/AXIS_HAT_Y motion events (Dolphin consumes the motion events, so Android
++     * does not synthesize fallback DPAD keys); mapping both forms with an OR covers either.
++     */
++    private fun mapDpad(pad: EmulatedController, device: String, inputs: Set<String>) {
++        val dpad = findGroup(pad, GROUP_DPAD)
++        setMapping(pad, dpad, "Up", presentAlternation(device, inputs, KEY_DPAD_UP, AXIS_HAT_UP))
++        setMapping(pad, dpad, "Down", presentAlternation(device, inputs, KEY_DPAD_DOWN, AXIS_HAT_DOWN))
++        setMapping(pad, dpad, "Left", presentAlternation(device, inputs, KEY_DPAD_LEFT, AXIS_HAT_LEFT))
++        setMapping(pad, dpad, "Right", presentAlternation(device, inputs, KEY_DPAD_RIGHT, AXIS_HAT_RIGHT))
++    }
++
++    /** Builds a (properly quoted) expression for a control on the default device. */
++    private fun expression(device: String, controlName: String): String =
++        MappingCommon.getExpressionForControl(controlName, device, device)
++
++    /** Expression for the first of [candidates] that exists on the device, or null. */
++    private fun singleExpression(
++        device: String,
++        inputs: Set<String>,
++        vararg candidates: String
++    ): String? = firstPresent(inputs, *candidates)?.let { expression(device, it) }
++
++    /** OR-expression of all of [candidates] that exist on the device, or null. */
++    private fun presentAlternation(
++        device: String,
++        inputs: Set<String>,
++        vararg candidates: String
++    ): String? = alternation(device, candidates.filter { it in inputs })
++
++    private fun alternation(device: String, controlNames: List<String>): String? =
++        controlNames
++            .takeIf { it.isNotEmpty() }
++            ?.joinToString("|") { expression(device, it) }
++
++    private fun firstPresent(inputs: Set<String>, vararg candidates: String): String? =
++        candidates.firstOrNull { it in inputs }
++
++    private fun findGroup(controller: EmulatedController, uiName: String): ControlGroup? {
++        for (i in 0 until controller.getGroupCount()) {
++            val group = controller.getGroup(i)
++            if (group.getUiName() == uiName) {
++                return group
++            }
++        }
++        return null
++    }
++
++    private fun findControl(
++        controller: EmulatedController,
++        groupUiName: String,
++        controlUiName: String
++    ): Control? = findGroup(controller, groupUiName)?.let { findControl(it, controlUiName) }
++
++    private fun findControl(group: ControlGroup, controlUiName: String): Control? {
++        for (i in 0 until group.getControlCount()) {
++            val control = group.getControl(i)
++            if (control.getUiName() == controlUiName) {
++                return control
++            }
++        }
++        return null
++    }
++
++    /**
++     * Applies an expression to a control the same way the mapping UI does
++     * (setExpression + updateSingleControlReference). Skips controls or expressions that
++     * are unavailable, so the template degrades gracefully on unusual gamepads.
++     */
++    private fun setMapping(
++        controller: EmulatedController,
++        group: ControlGroup?,
++        controlUiName: String,
++        expression: String?
++    ) {
++        if (group == null || expression.isNullOrEmpty()) {
++            return
++        }
++        val control = findControl(group, controlUiName) ?: return
++        val controlReference = control.getControlReference()
++        if (controlReference.setExpression(expression) != null) {
++            // Parse error; leave the control unmapped rather than half-configured.
++            return
++        }
++        controller.updateSingleControlReference(controlReference)
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+new file mode 100644
+index 0000000..5d5ddab
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+@@ -0,0 +1,310 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.appcompat.app.AppCompatActivity
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.lifecycle.asFlow
++import androidx.lifecycle.lifecycleScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
++import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
++import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
++import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
++import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
++import org.dolphinemu.dolphinemu.features.settings.model.Settings
++import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
++import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++import org.dolphinemu.dolphinemu.services.GameFileCacheManager
++import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
++import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.AfterDirectoryInitializationRunner
++import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
++import org.dolphinemu.dolphinemu.utils.ThemeHelper
++
++/**
++ * Public lobby browser — the Android counterpart of desktop Dolphin's NetPlay
++ * Session Browser, styled for the XD Netplay fork.
++ *
++ * Joining mirrors desktop NetPlayBrowser::accept(): the tapped session's method,
++ * port and server id (traversal code or IP) are written to the NetPlay config
++ * keys that NetplaySession.nativeJoin() reads, then the join is performed
++ * directly through NetplayManager (same code path NetplaySetupViewModel uses)
++ * and NetplayActivity is launched on success.
++ *
++ * Publishing needs no new native code: Core's NetPlayServer::SetupIndex()
++ * publishes automatically while hosting whenever NetPlay/UseIndex,
++ * NetPlay/IndexName and NetPlay/IndexRegion are set, keeps the entry fresh from
++ * the server ping loop, and unlists it when hosting stops. The publish panel
++ * here just writes those keys, then hands off to the normal host flow.
++ */
++class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
++    override var themeId: Int = 0
++
++    private var initialized by mutableStateOf(false)
++    private var uiState by mutableStateOf(FindBattlesState())
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        ThemeHelper.setTheme(this)
++        enableEdgeToEdge()
++        super.onCreate(savedInstanceState)
++
++        DirectoryInitialization.start(this)
++        AfterDirectoryInitializationRunner().runWithLifecycle(this) {
++            initialized = true
++            GameFileCacheManager.startLoad()
++            loadPublishPrefs()
++            refresh()
++        }
++
++        setContent {
++            DolphinTheme {
++                FindBattlesScreen(
++                    initialized = initialized,
++                    state = uiState,
++                    onBack = { finish() },
++                    onRefresh = ::refresh,
++                    onToggleXdOnly = { uiState = uiState.copy(xdOnly = it) },
++                    onJoin = { join(it, password = null) },
++                    onPasswordSubmit = { session, password -> join(session, password) },
++                    onPasswordDismiss = { uiState = uiState.copy(passwordPrompt = null) },
++                    onPublishEnabledChange = ::setPublishEnabled,
++                    onPublishNameChange = ::setPublishName,
++                    onPublishRegionChange = ::setPublishRegion,
++                    onPublishPasswordChange = ::setPublishPassword,
++                    onHostPublic = ::hostPublicBattle
++                )
++            }
++        }
++    }
++
++    override fun setTheme(themeId: Int) {
++        super.setTheme(themeId)
++        this.themeId = themeId
++    }
++
++    override fun onResume() {
++        ThemeHelper.setCorrectTheme(this)
++        super.onResume()
++    }
++
++    /** Fetches the session list off the main thread; errors land in state, never throw. */
++    private fun refresh() {
++        if (!initialized || uiState.loading) return
++        uiState = uiState.copy(loading = true, error = null)
++
++        lifecycleScope.launch {
++            val (sessions, error) = withContext(Dispatchers.IO) {
++                try {
++                    val result = NetPlayIndexBridge.listSessions()
++                    if (result == null) {
++                        null to friendlyListError(NetPlayIndexBridge.lastError)
++                    } else {
++                        result to null
++                    }
++                } catch (e: Throwable) {
++                    null to "Could not read the lobby: ${e.message ?: "unknown error"}"
++                }
++            }
++            uiState = uiState.copy(
++                loading = false,
++                sessions = sessions ?: emptyList(),
++                error = error
++            )
++        }
++    }
++
++    private fun friendlyListError(code: String): String = when (code) {
++        "NO_RESPONSE" ->
++            "Could not reach the lobby server. Check your internet connection and try again."
++        "BAD_JSON" ->
++            "The lobby server sent an unexpected response. Try again in a moment."
++        else ->
++            "The lobby server reported an error: $code"
++    }
++
++    /**
++     * Tap-to-join. For password sessions the lobby stores an encrypted server id;
++     * decrypting it with the entered password (checksum-verified) is the whole
++     * "authentication", after which the join is a normal traversal/direct join.
++     */
++    private fun join(session: LobbySession, password: String?) {
++        if (uiState.joining) return
++
++        var serverId = session.serverId
++        if (session.hasPassword) {
++            if (password.isNullOrEmpty()) {
++                uiState = uiState.copy(passwordPrompt = session)
++                return
++            }
++            val decrypted = NetPlayIndexBridge.decryptServerId(session.serverId, password)
++            if (decrypted == null) {
++                uiState = uiState.copy(
++                    passwordPrompt = null,
++                    status = "Wrong password for \"${session.name}\"."
++                )
++                return
++            }
++            serverId = decrypted
++        }
++
++        // Same config handoff as desktop NetPlayBrowser::accept();
++        // NetplaySession.nativeJoin() reads exactly these keys.
++        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, session.method)
++        IntSetting.NETPLAY_CONNECT_PORT.setInt(NativeConfig.LAYER_BASE, session.port)
++        if (session.isTraversal) {
++            StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, serverId)
++        } else {
++            StringSetting.NETPLAY_ADDRESS.setString(NativeConfig.LAYER_BASE, serverId)
++        }
++
++        uiState = uiState.copy(
++            joining = true,
++            passwordPrompt = null,
++            status = "Joining \"${session.name}\"..."
++        )
++
++        lifecycleScope.launch {
++            var errorForwarding: Job? = null
++            try {
++                // NetplaySession's UI callbacks need the game list; wait like
++                // NetplaySetupViewModel.connect() does.
++                GameFileCacheManager.isLoading().asFlow().first { it == false }
++
++                val netplaySession = NetplayManager.createSession()
++                errorForwarding = netplaySession.connectionErrors
++                    .onEach { uiState = uiState.copy(status = it) }
++                    .launchIn(this)
++
++                if (netplaySession.join()) {
++                    uiState = uiState.copy(status = null)
++                    NetplayActivity.launch(this@FindBattlesActivity)
++                } else {
++                    uiState = uiState.copy(
++                        status = "Could not connect to \"${session.name}\". " +
++                            "It may have just closed - refresh and try again."
++                    )
++                }
++            } finally {
++                errorForwarding?.cancel()
++                uiState = uiState.copy(joining = false)
++            }
++        }
++    }
++
++    // ---- Publishing (host side) ----
++
++    private fun loadPublishPrefs() {
++        val defaultName = "${StringSetting.NETPLAY_NICKNAME.string}'s XD battle"
++        uiState = uiState.copy(
++            publishEnabled = NativeConfig.getBoolean(
++                NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_USE_INDEX, false
++            ),
++            publishName = NativeConfig.getString(
++                NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_INDEX_NAME, ""
++            ).ifEmpty { defaultName },
++            publishRegion = NativeConfig.getString(
++                NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_INDEX_REGION, ""
++            ).ifEmpty { "NA" },
++            publishPassword = NativeConfig.getString(
++                NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_INDEX_PASSWORD, ""
++            ),
++            regions = NetPlayIndexBridge.regions(),
++            buildVersion = NetPlayIndexBridge.localVersion
++        )
++    }
++
++    private fun setPublishEnabled(enabled: Boolean) {
++        uiState = uiState.copy(publishEnabled = enabled)
++        NativeConfig.setBoolean(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_USE_INDEX, enabled)
++        NativeConfig.save(NativeConfig.LAYER_BASE)
++    }
++
++    private fun setPublishName(name: String) {
++        uiState = uiState.copy(publishName = name)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_NAME, name)
++    }
++
++    private fun setPublishRegion(region: String) {
++        uiState = uiState.copy(publishRegion = region)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_REGION, region)
++    }
++
++    private fun setPublishPassword(password: String) {
++        uiState = uiState.copy(publishPassword = password)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_PASSWORD, password)
++    }
++
++    /**
++     * Ensures the index config is set, then hands off to the standard host flow.
++     * When the user taps Host there, NetPlayServer::SetupIndex() publishes the
++     * session (immediately for direct, on traversal-code assignment for traversal)
++     * and removes it when the room closes.
++     */
++    private fun hostPublicBattle() {
++        val state = uiState
++        NativeConfig.setBoolean(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_USE_INDEX, true)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_NAME, state.publishName)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_REGION, state.publishRegion)
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_PASSWORD, state.publishPassword)
++        // Traversal needs no port forwarding - the sane default on mobile.
++        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, "traversal")
++        NativeConfig.save(NativeConfig.LAYER_BASE)
++
++        uiState = state.copy(publishEnabled = true)
++        NetplaySetupActivity.launch(this)
++    }
++
++    companion object {
++        private const val FILE = Settings.FILE_DOLPHIN
++        private const val SECTION = Settings.SECTION_INI_NETPLAY
++        private const val KEY_USE_INDEX = "UseIndex"
++        private const val KEY_INDEX_NAME = "IndexName"
++        private const val KEY_INDEX_REGION = "IndexRegion"
++        private const val KEY_INDEX_PASSWORD = "IndexPassword"
++
++        @JvmStatic
++        fun launch(context: Context) {
++            context.startActivity(Intent(context, FindBattlesActivity::class.java))
++        }
++    }
++}
++
++data class FindBattlesState(
++    val loading: Boolean = false,
++    val joining: Boolean = false,
++    /** Friendly list-area error (network/server); null when the last refresh worked. */
++    val error: String? = null,
++    /** One-line status under the list (join progress, wrong password, ...). */
++    val status: String? = null,
++    val sessions: List<LobbySession> = emptyList(),
++    /** Default on: only Pokemon XD (GXXE01) battles. Off: every session on the index. */
++    val xdOnly: Boolean = true,
++    /** Session awaiting a password entry, or null. */
++    val passwordPrompt: LobbySession? = null,
++    val publishEnabled: Boolean = false,
++    val publishName: String = "",
++    val publishRegion: String = "NA",
++    val publishPassword: String = "",
++    /** (code, label) pairs from NetPlayIndex::GetRegions(). */
++    val regions: List<Pair<String, String>> = emptyList(),
++    /** This build's version string; only same-version sessions are listed. */
++    val buildVersion: String = ""
++) {
++    val visibleSessions: List<LobbySession>
++        get() = if (xdOnly) sessions.filter { it.isXdBattle } else sessions
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesScreen.kt
+new file mode 100644
+index 0000000..875948a
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesScreen.kt
+@@ -0,0 +1,409 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.horizontalScroll
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.ButtonDefaults
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.OutlinedTextFieldDefaults
++import androidx.compose.material3.Switch
++import androidx.compose.material3.SwitchDefaults
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.PasswordVisualTransformation
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
++
++/**
++ * Lobby browser screen in the Pokemon Box "Sea" design language (see XDTheme.kt):
++ * floating navy panels on the blue gradient, yellow accent for selection and
++ * warnings only.
++ */
++@Composable
++fun FindBattlesScreen(
++    initialized: Boolean,
++    state: FindBattlesState,
++    onBack: () -> Unit,
++    onRefresh: () -> Unit,
++    onToggleXdOnly: (Boolean) -> Unit,
++    onJoin: (LobbySession) -> Unit,
++    onPasswordSubmit: (LobbySession, String) -> Unit,
++    onPasswordDismiss: () -> Unit,
++    onPublishEnabledChange: (Boolean) -> Unit,
++    onPublishNameChange: (String) -> Unit,
++    onPublishRegionChange: (String) -> Unit,
++    onPublishPasswordChange: (String) -> Unit,
++    onHostPublic: () -> Unit
++) {
++    SeaBackground {
++        Column(
++            modifier = Modifier
++                .fillMaxSize()
++                .verticalScroll(rememberScrollState())
++                .padding(16.dp)
++        ) {
++            // Title bar
++            SeaPanel(title = null) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text("XD NETPLAY", color = XDColors.TextAccent, fontWeight = FontWeight.Bold)
++                    Text("  ✦  ", color = XDColors.TextDim)
++                    Text("Find Battles", color = XDColors.TextPrimary)
++                    Spacer(Modifier.weight(1f))
++                    TextButton(onClick = onBack) { Text("Back", color = XDColors.TextDim) }
++                }
++            }
++            Spacer(Modifier.height(12.dp))
++
++            // Filter chips + refresh
++            Row(
++                verticalAlignment = Alignment.CenterVertically,
++                horizontalArrangement = Arrangement.spacedBy(8.dp)
++            ) {
++                FilterChip(label = "XD battles", selected = state.xdOnly) { onToggleXdOnly(true) }
++                FilterChip(label = "All games", selected = !state.xdOnly) { onToggleXdOnly(false) }
++                Spacer(Modifier.weight(1f))
++                Button(
++                    onClick = onRefresh,
++                    enabled = initialized && !state.loading,
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.Accent,
++                        contentColor = XDColors.ChipText,
++                        disabledContainerColor = XDColors.PanelLight.copy(alpha = 0.5f),
++                        disabledContentColor = XDColors.ChipText
++                    )
++                ) { Text(if (state.loading) "Loading" else "Refresh") }
++            }
++            Spacer(Modifier.height(14.dp))
++
++            // Session list
++            SeaPanel(title = "OPEN BATTLES") {
++                when {
++                    !initialized -> {
++                        Text("Setting things up...", color = XDColors.TextDim)
++                    }
++
++                    state.loading -> {
++                        Text("Scanning the lobby...", color = XDColors.TextDim)
++                    }
++
++                    state.error != null -> {
++                        Text(state.error, color = XDColors.Accent, fontSize = 14.sp)
++                        Spacer(Modifier.height(4.dp))
++                        Text(
++                            "Tap Refresh to try again.",
++                            color = XDColors.TextDim,
++                            fontSize = 12.sp
++                        )
++                    }
++
++                    state.visibleSessions.isEmpty() -> {
++                        Text(
++                            text = if (state.xdOnly) {
++                                "No open XD battles right now."
++                            } else {
++                                "No open sessions right now."
++                            },
++                            color = XDColors.TextDim
++                        )
++                        Spacer(Modifier.height(4.dp))
++                        Text(
++                            text = "Host a public battle below, or tap Refresh in a bit.",
++                            color = XDColors.TextDim,
++                            fontSize = 12.sp
++                        )
++                    }
++
++                    else -> {
++                        state.visibleSessions.forEach { session ->
++                            SessionRow(
++                                session = session,
++                                enabled = !state.joining,
++                                onClick = { onJoin(session) }
++                            )
++                        }
++                        Spacer(Modifier.height(6.dp))
++                        val count = state.visibleSessions.size
++                        Text(
++                            text = if (count == 1) "1 battle found - tap to join"
++                            else "$count battles found - tap to join",
++                            color = XDColors.TextDim,
++                            fontSize = 12.sp
++                        )
++                    }
++                }
++            }
++            Spacer(Modifier.height(14.dp))
++
++            // Join / error status
++            if (state.status != null) {
++                SeaPanel(title = "STATUS") {
++                    Text(
++                        text = state.status,
++                        color = if (state.joining) XDColors.TextPrimary else XDColors.Accent,
++                        fontSize = 13.sp
++                    )
++                }
++                Spacer(Modifier.height(14.dp))
++            }
++
++            // Publish panel (host side)
++            SeaPanel(title = "HOST A PUBLIC BATTLE") {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f)) {
++                        Text(
++                            "List my hosted battles in the lobby",
++                            color = XDColors.TextPrimary,
++                            fontSize = 14.sp
++                        )
++                        Text(
++                            "Your battle is visible while you host and unlisted when the room closes.",
++                            color = XDColors.TextDim,
++                            fontSize = 11.sp
++                        )
++                    }
++                    Switch(
++                        checked = state.publishEnabled,
++                        onCheckedChange = onPublishEnabledChange,
++                        colors = SwitchDefaults.colors(
++                            checkedThumbColor = XDColors.Accent,
++                            checkedTrackColor = XDColors.PanelLight,
++                            uncheckedThumbColor = XDColors.TextDim,
++                            uncheckedTrackColor = XDColors.Panel
++                        )
++                    )
++                }
++                Spacer(Modifier.height(10.dp))
++
++                OutlinedTextField(
++                    value = state.publishName,
++                    onValueChange = onPublishNameChange,
++                    label = { Text("Battle name", color = XDColors.TextDim, fontSize = 12.sp) },
++                    singleLine = true,
++                    colors = seaFieldColors(),
++                    modifier = Modifier.fillMaxWidth()
++                )
++                Spacer(Modifier.height(10.dp))
++
++                Text(
++                    "REGION",
++                    color = XDColors.TextAccent,
++                    fontSize = 11.sp,
++                    fontWeight = FontWeight.Bold
++                )
++                Spacer(Modifier.height(6.dp))
++                Row(
++                    horizontalArrangement = Arrangement.spacedBy(6.dp),
++                    modifier = Modifier.horizontalScroll(rememberScrollState())
++                ) {
++                    state.regions.forEach { (code, label) ->
++                        FilterChip(
++                            label = "$label ($code)",
++                            selected = code == state.publishRegion
++                        ) { onPublishRegionChange(code) }
++                    }
++                }
++                Spacer(Modifier.height(10.dp))
++
++                OutlinedTextField(
++                    value = state.publishPassword,
++                    onValueChange = onPublishPasswordChange,
++                    label = {
++                        Text("Password (optional)", color = XDColors.TextDim, fontSize = 12.sp)
++                    },
++                    singleLine = true,
++                    visualTransformation = PasswordVisualTransformation(),
++                    colors = seaFieldColors(),
++                    modifier = Modifier.fillMaxWidth()
++                )
++                Spacer(Modifier.height(12.dp))
++
++                Button(
++                    onClick = onHostPublic,
++                    enabled = initialized && !state.joining && state.publishName.isNotBlank(),
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.Accent,
++                        contentColor = XDColors.ChipText,
++                        disabledContainerColor = XDColors.PanelLight.copy(alpha = 0.5f),
++                        disabledContentColor = XDColors.ChipText
++                    ),
++                    modifier = Modifier.fillMaxWidth()
++                ) { Text("Host now") }
++            }
++            Spacer(Modifier.height(12.dp))
++
++            if (state.buildVersion.isNotEmpty()) {
++                Text(
++                    text = "Only battles hosted on build ${state.buildVersion} are shown.",
++                    color = XDColors.TextDim,
++                    fontSize = 10.sp
++                )
++            }
++            Spacer(Modifier.height(16.dp))
++        }
++    }
++
++    state.passwordPrompt?.let { session ->
++        PasswordDialog(
++            session = session,
++            onDismiss = onPasswordDismiss,
++            onSubmit = { password -> onPasswordSubmit(session, password) }
++        )
++    }
++}
++
++@Composable
++private fun FilterChip(label: String, selected: Boolean, onClick: () -> Unit) {
++    Text(
++        text = label,
++        color = if (selected) XDColors.ChipText else XDColors.TextDim,
++        fontSize = 13.sp,
++        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
++        modifier = Modifier
++            .background(
++                if (selected) XDColors.Accent else XDColors.Panel,
++                RoundedCornerShape(16.dp)
++            )
++            .border(1.dp, XDColors.PanelLight, RoundedCornerShape(16.dp))
++            .clickable(onClick = onClick)
++            .padding(horizontal = 14.dp, vertical = 6.dp)
++    )
++}
++
++@Composable
++private fun SessionRow(session: LobbySession, enabled: Boolean, onClick: () -> Unit) {
++    Row(
++        verticalAlignment = Alignment.CenterVertically,
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(Color.Transparent, RoundedCornerShape(10.dp))
++            .clickable(enabled = enabled, onClick = onClick)
++            .padding(horizontal = 8.dp, vertical = 8.dp)
++    ) {
++        Column(Modifier.weight(1f)) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    text = session.name.ifEmpty { "(unnamed)" },
++                    color = XDColors.TextPrimary,
++                    fontWeight = FontWeight.SemiBold
++                )
++                if (session.hasPassword) {
++                    Spacer(Modifier.width(6.dp))
++                    Badge(text = "LOCKED", accent = true)
++                }
++                if (session.inGame) {
++                    Spacer(Modifier.width(6.dp))
++                    Badge(text = "IN GAME", accent = false)
++                }
++            }
++            Text(
++                text = "${session.game.ifEmpty { "Unknown game" }} · ${session.region}",
++                color = XDColors.TextDim,
++                fontSize = 12.sp
++            )
++        }
++        Column(horizontalAlignment = Alignment.End) {
++            Text(
++                text = "${session.playerCount}P",
++                color = XDColors.TextPrimary,
++                fontSize = 13.sp,
++                fontWeight = FontWeight.Bold
++            )
++            Text(
++                text = if (session.isTraversal) "room code" else "direct",
++                color = XDColors.TextDim,
++                fontSize = 10.sp
++            )
++        }
++    }
++}
++
++/** Tiny outlined pill; accent (yellow) marks locked sessions, plain marks in-game. */
++@Composable
++private fun Badge(text: String, accent: Boolean) {
++    val color = if (accent) XDColors.Accent else XDColors.TextDim
++    Text(
++        text = text,
++        color = color,
++        fontSize = 9.sp,
++        fontWeight = FontWeight.Bold,
++        modifier = Modifier
++            .border(1.dp, color, RoundedCornerShape(6.dp))
++            .padding(horizontal = 5.dp, vertical = 1.dp)
++    )
++}
++
++@Composable
++private fun PasswordDialog(
++    session: LobbySession,
++    onDismiss: () -> Unit,
++    onSubmit: (String) -> Unit
++) {
++    var password by remember { mutableStateOf("") }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        containerColor = Color(0xFF183454),
++        title = { Text("Password required", color = XDColors.TextPrimary) },
++        text = {
++            Column {
++                Text(
++                    "\"${session.name}\" is locked. Enter its password to join.",
++                    color = XDColors.TextDim,
++                    fontSize = 13.sp
++                )
++                Spacer(Modifier.height(8.dp))
++                OutlinedTextField(
++                    value = password,
++                    onValueChange = { password = it },
++                    singleLine = true,
++                    visualTransformation = PasswordVisualTransformation(),
++                    colors = seaFieldColors(),
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++        },
++        confirmButton = {
++            TextButton(onClick = { onSubmit(password) }, enabled = password.isNotEmpty()) {
++                Text("Join", color = XDColors.Accent)
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) { Text("Cancel", color = XDColors.TextDim) }
++        }
++    )
++}
++
++@Composable
++private fun seaFieldColors() = OutlinedTextFieldDefaults.colors(
++    focusedTextColor = XDColors.TextPrimary,
++    unfocusedTextColor = XDColors.TextPrimary,
++    focusedBorderColor = XDColors.Accent,
++    unfocusedBorderColor = XDColors.PanelLight,
++    cursorColor = XDColors.Accent
++)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index b2da211..a37f619 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -18,6 +18,7 @@ import java.io.File
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveNaming
++import org.dolphinemu.dolphinemu.features.xdnetplay.input.AutoMapper
+ import org.dolphinemu.dolphinemu.features.settings.ui.MenuTag
+ import org.dolphinemu.dolphinemu.features.settings.ui.SettingsActivity
+ import org.dolphinemu.dolphinemu.model.GameFileCache
+@@ -36,6 +37,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var xdGameFound by mutableStateOf(false)
+     private var emeraldRomSet by mutableStateOf(false)
+     private var teamSavesReady by mutableStateOf(false)
++    private var controllerMapped by mutableStateOf(false)
+ 
+     private val pickXdFolder =
+         registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+@@ -90,6 +92,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     xdGameFound = xdGameFound,
+                     emeraldRomSet = emeraldRomSet,
+                     teamSavesReady = teamSavesReady,
++                    controllerMapped = controllerMapped,
+                     onPickXdFolder = { pickXdFolder.launch(null) },
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+@@ -118,6 +121,11 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+             StringSetting.MAIN_GBA_ROM_3.string.isNotEmpty()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+         teamSavesReady = if (emeraldRomSet) seedTeamSaves() else false
++        controllerMapped = try {
++            AutoMapper.isMapped() || AutoMapper.autoMap()
++        } catch (_: Exception) {
++            false
++        }
+     }
+ 
+     /**
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index e3f7b8e..7d06e90 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -39,6 +39,7 @@ fun XDLauncherScreen(
+     xdGameFound: Boolean,
+     emeraldRomSet: Boolean,
+     teamSavesReady: Boolean,
++    controllerMapped: Boolean,
+     onPickXdFolder: () -> Unit,
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
+@@ -78,8 +79,10 @@ fun XDLauncherScreen(
+                     xdGameFound = xdGameFound,
+                     emeraldRomSet = emeraldRomSet,
+                     teamSavesReady = teamSavesReady,
++                    controllerMapped = controllerMapped,
+                     onPickXdFolder = onPickXdFolder,
+-                    onPickEmeraldRom = onPickEmeraldRom
++                    onPickEmeraldRom = onPickEmeraldRom,
++                    onOpenSettings = onOpenSettings
+                 )
+                 Spacer(Modifier.height(24.dp))
+ 
+@@ -115,8 +118,10 @@ private fun ReadinessCard(
+     xdGameFound: Boolean,
+     emeraldRomSet: Boolean,
+     teamSavesReady: Boolean,
++    controllerMapped: Boolean,
+     onPickXdFolder: () -> Unit,
+-    onPickEmeraldRom: () -> Unit
++    onPickEmeraldRom: () -> Unit,
++    onOpenSettings: () -> Unit
+ ) {
+     Card(modifier = Modifier.fillMaxWidth()) {
+         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+@@ -146,6 +151,13 @@ private fun ReadinessCard(
+                 fixLabel = "",
+                 onFix = null
+             )
++            CheckRow(
++                ok = controllerMapped,
++                okText = "Controller mapped",
++                missingText = "No gamepad detected — connect one, or map manually",
++                fixLabel = "Input settings…",
++                onFix = onOpenSettings
++            )
+             CheckRow(
+                 ok = true,
+                 okText = "GBA BIOS + XD OU rules bundled",
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+new file mode 100644
+index 0000000..c97aff8
+--- /dev/null
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -0,0 +1,190 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Android bridge for the NetPlay session index ("lobby server", NETPLAY_INDEX_URL,
++// default https://lobby.dolphin-emu.org).
++//
++// Listing only. Publishing is deliberately NOT exposed here: Core's NetPlayServer
++// already owns a NetPlayIndex (NetPlayServer::m_index) and publishes automatically
++// from NetPlayServer::SetupIndex() whenever the NetPlay/UseIndex, NetPlay/IndexName
++// and NetPlay/IndexRegion config keys are set before/while hosting. SetupIndex()
++// runs at server creation for "direct" hosting and from OnTraversalStateChanged()
++// once a traversal host code has been assigned, and the index entry is removed by
++// NetPlayIndex's destructor when the server is torn down. A second, static index
++// instance here would double-publish and would not track player count / in-game
++// state, so the Android host flow publishes purely by setting those config keys
++// from Kotlin (see features/xdnetplay/ui/FindBattlesActivity.kt).
++//
++// Kotlin counterpart: org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++//
++// Session row encoding (String[10], see NetPlayIndexBridge.kt / LobbySession):
++//   [0] name  [1] region  [2] method ("traversal"/"direct")  [3] server_id
++//   [4] game  [5] version  [6] player_count  [7] port
++//   [8] has_password ("1"/"0")  [9] in_game ("1"/"0")
++//
++// Version semantics: NetPlayIndex::Add() publishes version=Common::GetScmDescStr()
++// (the scmdesc/"git describe" string of the build), and the desktop browser both
++// sends it as the server-side "version" filter and greys out rows whose version
++// differs from the local GetScmDescStr(). We do the same: the filter is always
++// sent, and any stragglers the server returns anyway are dropped client-side, so
++// only sessions hosted by the exact same fork build are ever surfaced.
++
++#include <jni.h>
++
++#include <map>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "Common/Version.h"
++#include "UICommon/NetPlayIndex.h"
++
++#include "jni/AndroidCommon/AndroidCommon.h"
++
++namespace
++{
++std::mutex s_last_error_mutex;
++std::string s_last_error;
++
++void SetLastError(std::string error)
++{
++  std::lock_guard lock(s_last_error_mutex);
++  s_last_error = std::move(error);
++}
++
++std::string GetLastError()
++{
++  std::lock_guard lock(s_last_error_mutex);
++  return s_last_error;
++}
++}  // namespace
++
++extern "C" {
++
++// Blocking HTTP call — must be invoked off the Android main thread
++// (Dispatchers.IO on the Kotlin side).
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeListSessions(
++    JNIEnv* env, jobject, jstring jname, jstring jregion, jstring jgame_id)
++{
++  std::map<std::string, std::string> filters;
++
++  const std::string name = GetJString(env, jname);
++  const std::string region = GetJString(env, jregion);
++  const std::string game_id = GetJString(env, jgame_id);
++
++  if (!name.empty())
++    filters["name"] = name;
++  if (!region.empty())
++    filters["region"] = region;
++  if (!game_id.empty())
++    filters["game"] = game_id;
++
++  // Only sessions from the same build are joinable; mirror the desktop browser's
++  // "Hide Incompatible Sessions" behaviour, permanently enabled.
++  filters["version"] = Common::GetScmDescStr();
++
++  NetPlayIndex client;
++  auto sessions = client.List(filters);
++  if (!sessions)
++  {
++    SetLastError(client.GetLastError());
++    return nullptr;
++  }
++
++  // Belt and suspenders: drop anything the server returned with a foreign version.
++  std::vector<NetPlaySession> compatible;
++  compatible.reserve(sessions->size());
++  for (auto& session : *sessions)
++  {
++    if (session.version == Common::GetScmDescStr())
++      compatible.push_back(std::move(session));
++  }
++
++  jclass string_array_class = env->FindClass("[Ljava/lang/String;");
++  if (!string_array_class)
++  {
++    SetLastError("JNI_CLASS_LOOKUP_FAILED");
++    return nullptr;
++  }
++
++  jobjectArray result =
++      env->NewObjectArray(static_cast<jsize>(compatible.size()), string_array_class, nullptr);
++  if (!result)
++  {
++    SetLastError("JNI_ALLOC_FAILED");
++    return nullptr;
++  }
++
++  for (jsize i = 0; i < static_cast<jsize>(compatible.size()); i++)
++  {
++    const NetPlaySession& session = compatible[i];
++    const std::vector<std::string> fields{
++        session.name,
++        session.region,
++        session.method,
++        session.server_id,
++        session.game_id,
++        session.version,
++        std::to_string(session.player_count),
++        std::to_string(session.port),
++        session.has_password ? "1" : "0",
++        session.in_game ? "1" : "0",
++    };
++    jobjectArray row = SpanToJStringArray(env, fields);
++    env->SetObjectArrayElement(result, i, row);
++    env->DeleteLocalRef(row);
++  }
++
++  return result;
++}
++
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeGetLastError(
++    JNIEnv* env, jobject)
++{
++  return ToJString(env, GetLastError());
++}
++
++// The version string the index stores for this build (Common::GetScmDescStr()).
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeGetScmVersion(
++    JNIEnv* env, jobject)
++{
++  return ToJString(env, Common::GetScmDescStr());
++}
++
++// A lobby "password" does not gate the netplay server itself; it merely XOR-encrypts
++// the published server_id (traversal code or IP). Decrypting it with the correct
++// password (checksum-verified) is all a joiner needs. Returns null on a wrong
++// password or corrupt ID.
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeDecryptServerId(
++    JNIEnv* env, jobject, jstring jserver_id, jstring jpassword)
++{
++  NetPlaySession session;
++  session.server_id = GetJString(env, jserver_id);
++
++  const std::optional<std::string> decrypted = session.DecryptID(GetJString(env, jpassword));
++  if (!decrypted)
++    return nullptr;
++
++  return ToJString(env, *decrypted);
++}
++
++// Region codes accepted by the index, flattened as [code0, label0, code1, label1, ...].
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeGetRegions(JNIEnv* env,
++                                                                                      jobject)
++{
++  std::vector<std::string> flat;
++  for (const auto& [code, label] : NetPlayIndex::GetRegions())
++  {
++    flat.push_back(code);
++    flat.push_back(label);
++  }
++  return SpanToJStringArray(env, flat);
++}
++
++}  // extern "C"
+-- 
+2.39.5 (Apple Git-154)
+

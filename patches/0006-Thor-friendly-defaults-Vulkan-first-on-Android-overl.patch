@@ -1,7 +1,7 @@
 From 3179801d202e1fa1d82447cc55ce48b30fb5808f Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:54:55 -0700
-Subject: [PATCH 06/13] Thor-friendly defaults: Vulkan first on Android,
+Subject: [PATCH 06/16] Thor-friendly defaults: Vulkan first on Android,
  overlay off, XD graphics preset
 
 Android now prefers the Vulkan backend like macOS does, the touch input

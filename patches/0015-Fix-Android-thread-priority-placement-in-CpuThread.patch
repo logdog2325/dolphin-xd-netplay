@@ -1,0 +1,37 @@
+From c3e4c23d93d3e1aee7ad8b3e5a779fc1f7163fea Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 15:18:22 -0700
+Subject: [PATCH 15/16] Fix Android thread-priority placement in CpuThread
+
+The setpriority block landed between an if and its else, which only
+became real code on Android builds. Move it after the complete
+statement.
+---
+ Source/Core/Core/Core.cpp | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index aa8c839..6a404de 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -329,14 +329,14 @@ static void CpuThread(Core::System& system, const std::optional<std::string>& sa
+ {
+   if (system.IsDualCoreMode())
+     Common::SetCurrentThreadName("CPU thread");
++  else
++    Common::SetCurrentThreadName("CPU-GPU thread");
++
+ #ifdef __ANDROID__
+   // Keep this thread responsive under Android scheduling (URGENT_DISPLAY class).
+   setpriority(PRIO_PROCESS, 0, -8);
+ #endif
+ 
+-  else
+-    Common::SetCurrentThreadName("CPU-GPU thread");
+-
+   // This needs to be delayed until after the video backend is ready.
+   DolphinAnalytics::Instance().ReportGameStart();
+ 
+-- 
+2.39.5 (Apple Git-154)
+
