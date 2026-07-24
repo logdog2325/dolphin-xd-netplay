@@ -1,0 +1,32 @@
+From e44233c05271d6316caa322fead1686d8e973545 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 13:00:27 -0700
+Subject: [PATCH 2/2] Android: build arm64-v8a only and skip C++ unit tests
+
+Trims CI build time; x86_64 and the test targets are not needed for
+device builds.
+---
+ Source/Android/app/build.gradle.kts | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/Source/Android/app/build.gradle.kts b/Source/Android/app/build.gradle.kts
+index 64abfd0..4b97410 100644
+--- a/Source/Android/app/build.gradle.kts
++++ b/Source/Android/app/build.gradle.kts
+@@ -105,10 +105,10 @@ android {
+                     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+                     // , "-DENABLE_GENERIC=ON"
+                 )
+-                abiFilters("arm64-v8a", "x86_64") //, "armeabi-v7a", "x86"
++                abiFilters("arm64-v8a") //, "x86_64", "armeabi-v7a", "x86"
+ 
+-                // Uncomment the line below if you don't want to build the C++ unit tests
+-                //targets("main", "hook_impl", "main_hook", "gsl_alloc_hook", "file_redirect_hook")
++                // Skip building the C++ unit tests
++                targets("main", "hook_impl", "main_hook", "gsl_alloc_hook", "file_redirect_hook")
+             }
+         }
+     }
+-- 
+2.39.5 (Apple Git-154)
+

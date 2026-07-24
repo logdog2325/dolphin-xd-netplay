@@ -1,0 +1,105 @@
+name: Build XD Netplay
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      build_windows:
+        description: "Also build the Windows desktop client"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build
+  cancel-in-progress: true
+
+env:
+  # dolphin-emu/dolphin master as of 2026-07-23 (includes Android netplay, PR 14647)
+  BASE_SHA: d6e803e63d7a809fcafb4e39c79bdf4aabb49c79
+  # PR 14745 "Android: add dual-screen Wii pointer and GBA support" head
+  PR_SHA: 6ea62d8b29ba22e0e2cdc88b4359334a875b6224
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.mk.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ci
+      - name: Construct xd-netplay branch
+        id: mk
+        run: |
+          set -eux
+          git clone --single-branch --branch master https://github.com/dolphin-emu/dolphin.git dolphin
+          cd dolphin
+          git config user.name "logdog2325"
+          git config user.email "loganjayfisher@gmail.com"
+          git fetch origin refs/pull/14745/head:pr-14745
+          git checkout -b xd-netplay "$BASE_SHA"
+          if git cat-file -e "$PR_SHA^{commit}" 2>/dev/null; then
+            MERGE_REF="$PR_SHA"
+          else
+            MERGE_REF="pr-14745"
+            echo "::warning::Pinned PR 14745 SHA is gone (force push upstream); using current head"
+          fi
+          git merge --no-edit "$MERGE_REF"
+          git am ../ci/patches/*.patch
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          git remote add mine "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git push -f mine xd-netplay
+          if [ -n "$TAG" ]; then git push -f mine "refs/tags/$TAG"; fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  android:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - name: Install NDK
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;30.0.15729638" > /dev/null
+      - name: Build APK
+        working-directory: Source/Android
+        run: ./gradlew assembleDebug --no-daemon
+      - name: Rename APK
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          mkdir -p out
+          cp Source/Android/app/build/outputs/apk/debug/*.apk "out/dolphin-xd-netplay-${SHORT_SHA}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-apk
+          path: out/*.apk
+
+  windows:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_windows }}
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build
+        run: msbuild Source/dolphin-emu.sln /m /v:m /p:Configuration=Release /p:Platform=x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-win64
+          path: Binary/x64/
