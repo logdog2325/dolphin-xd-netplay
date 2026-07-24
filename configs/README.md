@@ -33,6 +33,22 @@ the entire contents of `desktop-portable/` next to the executable
 for both players — build teams into them with PKHeX + Auto-Legality Mod, or
 on Android use PKHeXMAUI).
 
+## Team building on Android: PKHeXMAUI
+
+PKHeX itself is Windows-only, but PKHeXMAUI is an actively maintained Android
+port with the Auto-Legality Mod built in (paste a Showdown team, it
+auto-legalizes into the save — same workflow as the PKHeX bundled with the
+original XDNetplay):
+
+- APK releases: https://github.com/santacrab2/PKHeXMAUI/releases
+- Load `EMERALD-2.sav` or `EMERALD-3.sav`, import your Showdown sets, check
+  IVs on legendaries/event-move Pokémon (ALM prioritizes legality — fix
+  Hidden Power IVs manually), export the save, and the session host puts it
+  in place. Works with vanilla Emerald saves like these; it does not support
+  ROM-hack saves.
+- Browser fallback: https://pkmds.app (PKHeX.Core in the browser, edits Gen 3
+  saves, works offline as a PWA — no Showdown auto-legality though).
+
 ## Battle flow (same as original XDNetplay)
 
 Host: right-click XD → Host with Netplay → assign ports (host = pad 1 +
