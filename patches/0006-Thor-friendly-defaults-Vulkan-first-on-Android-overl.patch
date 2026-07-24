@@ -1,0 +1,62 @@
+From 3179801d202e1fa1d82447cc55ce48b30fb5808f Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 13:54:55 -0700
+Subject: [PATCH 6/7] Thor-friendly defaults: Vulkan first on Android, overlay
+ off, XD graphics preset
+
+Android now prefers the Vulkan backend like macOS does, the touch input
+overlay defaults to off (this fork targets handhelds with physical
+controls), and the XD game INI ships 2x internal resolution with hybrid
+ubershaders.
+---
+ Data/Sys/GameSettings/GXXE01.ini                              | 4 ++++
+ .../dolphinemu/features/settings/model/BooleanSetting.kt      | 3 ++-
+ Source/Core/VideoCommon/VideoBackendBase.cpp                  | 4 +++-
+ 3 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index e702301..b53f951 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -31,3 +31,7 @@ $XD OU Fixes
+ [AR_RetroAchievements_Verified]
+ $16:9 Widescreen
+ $60 FPS
++
++[Video_Settings]
++InternalResolution = 2
++ShaderCompilationMode = 2
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index cd6eee0..3c515fc 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -280,7 +280,8 @@ enum class BooleanSetting(
+         Settings.FILE_DOLPHIN,
+         Settings.SECTION_INI_ANDROID,
+         "ShowInputOverlay",
+-        true
++        // Off by default: this fork targets handhelds with physical controls.
++        false
+     ),
+     MAIN_DUAL_SCREEN_EXTERNAL_DISPLAY(
+         Settings.FILE_DOLPHIN,
+diff --git a/Source/Core/VideoCommon/VideoBackendBase.cpp b/Source/Core/VideoCommon/VideoBackendBase.cpp
+index 7eeefb7..e307d9d 100644
+--- a/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -212,9 +212,11 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
+     backends.push_back(std::make_unique<OGL::VideoBackend>());
+ #endif
+ #ifdef HAS_VULKAN
+-#ifdef __APPLE__
++#if defined(__APPLE__) || defined(ANDROID)
+     // Emplace the Vulkan backend at the beginning so it takes precedence over OpenGL.
+     // On macOS, we prefer Vulkan over OpenGL due to OpenGL support being deprecated by Apple.
++    // On Android, Vulkan is the better-performing backend on the Adreno-class GPUs this
++    // fork targets.
+     backends.emplace(backends.begin(), std::make_unique<Vulkan::VideoBackend>());
+ #else
+     backends.push_back(std::make_unique<Vulkan::VideoBackend>());
+-- 
+2.39.5 (Apple Git-154)
+

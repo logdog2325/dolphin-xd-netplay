@@ -1,0 +1,413 @@
+From c1af000cfedcc11de55077a54072ee92f7bc1037 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 13:26:59 -0700
+Subject: [PATCH 5/7] Android: add XD Netplay launcher home screen
+
+New launcher entry point: readiness checklist (XD ISO in the game
+list, Emerald ROM configured, bundled BIOS/rules), buttons into the
+netplay setup flow and the team editor, and escape hatches to full
+Dolphin and settings. The team editor screen is a placeholder for the
+Gen 3 save editor that lands next.
+---
+ .../Android/app/src/main/AndroidManifest.xml  |  13 +-
+ .../xdnetplay/ui/TeamEditorActivity.kt        |  67 +++++++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  94 +++++++++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 179 ++++++++++++++++++
+ 4 files changed, 352 insertions(+), 1 deletion(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+
+diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
+index 96876ac..0e6f7ac 100644
+--- a/Source/Android/app/src/main/AndroidManifest.xml
++++ b/Source/Android/app/src/main/AndroidManifest.xml
+@@ -53,8 +53,9 @@
+             tools:targetApi="29" />
+ 
+         <activity
+-            android:name=".ui.main.MainActivity"
++            android:name=".features.xdnetplay.ui.XDLauncherActivity"
+             android:exported="true"
++            android:label="XD Netplay"
+             android:theme="@style/Theme.Dolphin.Splash.Main">
+ 
+             <!-- This intentfilter marks this Activity as the one that gets launched from Home screen. -->
+@@ -65,6 +66,16 @@
+             </intent-filter>
+         </activity>
+ 
++        <activity
++            android:name=".features.xdnetplay.ui.TeamEditorActivity"
++            android:exported="false"
++            android:theme="@style/Theme.Dolphin.Main" />
++
++        <activity
++            android:name=".ui.main.MainActivity"
++            android:exported="true"
++            android:theme="@style/Theme.Dolphin.Splash.Main" />
++
+         <activity
+             android:name=".ui.main.TvMainActivity"
+             android:exported="true"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+new file mode 100644
+index 0000000..e539e80
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.appcompat.app.AppCompatActivity
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.unit.dp
++import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
++import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.ThemeHelper
++
++class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
++    override var themeId: Int = 0
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        ThemeHelper.setTheme(this)
++        enableEdgeToEdge()
++        super.onCreate(savedInstanceState)
++
++        setContent {
++            DolphinTheme {
++                Scaffold { padding ->
++                    Column(
++                        modifier = Modifier
++                            .fillMaxSize()
++                            .padding(padding)
++                            .padding(24.dp),
++                        horizontalAlignment = Alignment.CenterHorizontally
++                    ) {
++                        Spacer(Modifier.height(32.dp))
++                        Text(
++                            text = "Team Editor",
++                            style = MaterialTheme.typography.headlineMedium
++                        )
++                        Spacer(Modifier.height(12.dp))
++                        Text(
++                            text = "Build your team from Showdown sets and write it " +
++                                "straight into your Emerald save. Coming in the next build.",
++                            style = MaterialTheme.typography.bodyLarge
++                        )
++                    }
++                }
++            }
++        }
++    }
++
++    companion object {
++        @JvmStatic
++        fun launch(context: Context) {
++            context.startActivity(Intent(context, TeamEditorActivity::class.java))
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+new file mode 100644
+index 0000000..c20ffb1
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -0,0 +1,94 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import android.content.Context
++import android.content.Intent
++import android.os.Bundle
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
++import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.settings.ui.MenuTag
++import org.dolphinemu.dolphinemu.features.settings.ui.SettingsActivity
++import org.dolphinemu.dolphinemu.services.GameFileCacheManager
++import org.dolphinemu.dolphinemu.ui.main.MainActivity
++import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
++import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.AfterDirectoryInitializationRunner
++import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
++import org.dolphinemu.dolphinemu.utils.ThemeHelper
++
++class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
++    override var themeId: Int = 0
++
++    private var initialized by mutableStateOf(false)
++    private var xdGameFound by mutableStateOf(false)
++    private var emeraldRomSet by mutableStateOf(false)
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        installSplashScreen().setKeepOnScreenCondition {
++            !DirectoryInitialization.areDolphinDirectoriesReady()
++        }
++        ThemeHelper.setTheme(this)
++        enableEdgeToEdge()
++        super.onCreate(savedInstanceState)
++
++        DirectoryInitialization.start(this)
++        AfterDirectoryInitializationRunner().runWithLifecycle(this) {
++            initialized = true
++            refreshChecks()
++            GameFileCacheManager.startLoad()
++        }
++
++        GameFileCacheManager.getGameFiles().observe(this) {
++            xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
++        }
++
++        setContent {
++            DolphinTheme {
++                XDLauncherScreen(
++                    initialized = initialized,
++                    xdGameFound = xdGameFound,
++                    emeraldRomSet = emeraldRomSet,
++                    onTeamEditor = { TeamEditorActivity.launch(this) },
++                    onBattle = { NetplaySetupActivity.launch(this) },
++                    onOpenSettings = {
++                        SettingsActivity.launch(this, MenuTag.SETTINGS)
++                    },
++                    onOpenDolphin = {
++                        startActivity(Intent(this, MainActivity::class.java))
++                    }
++                )
++            }
++        }
++    }
++
++    override fun onResume() {
++        super.onResume()
++        if (DirectoryInitialization.areDolphinDirectoriesReady()) {
++            initialized = true
++            refreshChecks()
++        }
++    }
++
++    private fun refreshChecks() {
++        emeraldRomSet = StringSetting.MAIN_GBA_ROM_2.string.isNotEmpty() ||
++            StringSetting.MAIN_GBA_ROM_3.string.isNotEmpty()
++        xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
++    }
++
++    companion object {
++        const val XD_GAME_ID = "GXXE01"
++
++        @JvmStatic
++        fun launch(context: Context) {
++            context.startActivity(Intent(context, XDLauncherActivity::class.java))
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+new file mode 100644
+index 0000000..2a85a04
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -0,0 +1,179 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Check
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
++import androidx.compose.material3.Scaffold
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++
++@Composable
++fun XDLauncherScreen(
++    initialized: Boolean,
++    xdGameFound: Boolean,
++    emeraldRomSet: Boolean,
++    onTeamEditor: () -> Unit,
++    onBattle: () -> Unit,
++    onOpenSettings: () -> Unit,
++    onOpenDolphin: () -> Unit
++) {
++    Scaffold { padding ->
++        Column(
++            modifier = Modifier
++                .fillMaxSize()
++                .padding(padding)
++                .verticalScroll(rememberScrollState())
++                .padding(horizontal = 24.dp, vertical = 16.dp),
++            horizontalAlignment = Alignment.CenterHorizontally
++        ) {
++            Spacer(Modifier.height(24.dp))
++            Text(
++                text = "XD NETPLAY",
++                style = MaterialTheme.typography.displaySmall,
++                fontWeight = FontWeight.Bold,
++                color = MaterialTheme.colorScheme.primary
++            )
++            Text(
++                text = "Pokémon XD GBA link battles, online",
++                style = MaterialTheme.typography.bodyLarge,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++            Spacer(Modifier.height(28.dp))
++
++            if (!initialized) {
++                CircularProgressIndicator()
++                Spacer(Modifier.height(12.dp))
++                Text("Setting things up…", style = MaterialTheme.typography.bodyMedium)
++            } else {
++                ReadinessCard(
++                    xdGameFound = xdGameFound,
++                    emeraldRomSet = emeraldRomSet,
++                    onOpenSettings = onOpenSettings,
++                    onOpenDolphin = onOpenDolphin
++                )
++                Spacer(Modifier.height(24.dp))
++
++                FilledTonalButton(
++                    onClick = onTeamEditor,
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    Text("Team Editor", style = MaterialTheme.typography.titleMedium)
++                }
++                Spacer(Modifier.height(12.dp))
++                Button(
++                    onClick = onBattle,
++                    enabled = xdGameFound,
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    Text("Battle  —  Host or Join", style = MaterialTheme.typography.titleMedium)
++                }
++                Spacer(Modifier.height(24.dp))
++
++                Row {
++                    OutlinedButton(onClick = onOpenSettings) { Text("Settings") }
++                    Spacer(Modifier.width(12.dp))
++                    TextButton(onClick = onOpenDolphin) { Text("Full Dolphin") }
++                }
++            }
++            Spacer(Modifier.height(16.dp))
++        }
++    }
++}
++
++@Composable
++private fun ReadinessCard(
++    xdGameFound: Boolean,
++    emeraldRomSet: Boolean,
++    onOpenSettings: () -> Unit,
++    onOpenDolphin: () -> Unit
++) {
++    Card(modifier = Modifier.fillMaxWidth()) {
++        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
++            Text(
++                text = "Checklist",
++                style = MaterialTheme.typography.titleMedium,
++                fontWeight = FontWeight.SemiBold
++            )
++            CheckRow(
++                ok = xdGameFound,
++                okText = "Pokémon XD found",
++                missingText = "Pokémon XD not found — add your ISO folder in Full Dolphin",
++                onFix = onOpenDolphin
++            )
++            CheckRow(
++                ok = emeraldRomSet,
++                okText = "Emerald ROM configured",
++                missingText = "Emerald ROM not set — pick it in Settings → GBA",
++                onFix = onOpenSettings
++            )
++            CheckRow(
++                ok = true,
++                okText = "GBA BIOS + XD OU rules bundled",
++                missingText = "",
++                onFix = null
++            )
++        }
++    }
++}
++
++@Composable
++private fun CheckRow(
++    ok: Boolean,
++    okText: String,
++    missingText: String,
++    onFix: (() -> Unit)?
++) {
++    Row(verticalAlignment = Alignment.CenterVertically) {
++        Icon(
++            imageVector = if (ok) Icons.Default.Check else Icons.Default.Close,
++            contentDescription = null,
++            tint = if (ok) {
++                MaterialTheme.colorScheme.primary
++            } else {
++                MaterialTheme.colorScheme.error
++            },
++            modifier = Modifier.size(20.dp)
++        )
++        Spacer(Modifier.width(10.dp))
++        Column(modifier = Modifier.fillMaxWidth()) {
++            Text(
++                text = if (ok) okText else missingText,
++                style = MaterialTheme.typography.bodyMedium
++            )
++            if (!ok && onFix != null) {
++                TextButton(
++                    onClick = onFix,
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
++                ) {
++                    Text("Fix")
++                }
++            }
++        }
++    }
++}
+-- 
+2.39.5 (Apple Git-154)
+

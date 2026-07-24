@@ -1,0 +1,2366 @@
+From dc9a6c471728175589589496f695259473c488af Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 13:54:55 -0700
+Subject: [PATCH 7/7] Android: Gen 3 team editor with Showdown and Pokepaste
+ import
+
+Ports the validated Emerald save library to Kotlin (sections, checksums,
+party PK3 encode with substructure crypto), bundles vanilla Gen 3 data
+tables generated from the pokeemerald decompilation, and adds a team
+editor in the Pokemon Box-style theme: import a Showdown paste or a
+pokepast.es link, build the party into the save Dolphin uses for
+netplay, verify every write independently with automatic backups, and
+share the save to the session host. Bundled template saves let it work
+before any game has been played.
+---
+ .../Android/app/src/main/AndroidManifest.xml  |  10 +
+ .../features/xdnetplay/gen3/Gen3Data.kt       | 201 ++++++++++
+ .../features/xdnetplay/gen3/Gen3Mon.kt        | 339 +++++++++++++++++
+ .../features/xdnetplay/gen3/Gen3Save.kt       | 307 ++++++++++++++++
+ .../features/xdnetplay/gen3/Gen3Text.kt       |  92 +++++
+ .../features/xdnetplay/gen3/MonFactory.kt     | 295 +++++++++++++++
+ .../features/xdnetplay/gen3/SaveNaming.kt     |  50 +++
+ .../features/xdnetplay/gen3/ShowdownParser.kt | 176 +++++++++
+ .../xdnetplay/ui/TeamEditorActivity.kt        | 309 ++++++++++++++--
+ .../features/xdnetplay/ui/TeamEditorScreen.kt | 344 ++++++++++++++++++
+ .../features/xdnetplay/ui/XDTheme.kt          |  92 +++++
+ .../app/src/main/res/xml/xd_share_paths.xml   |   5 +
+ 12 files changed, 2188 insertions(+), 32 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Data.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Mon.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveNaming.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/ShowdownParser.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDTheme.kt
+ create mode 100644 Source/Android/app/src/main/res/xml/xd_share_paths.xml
+
+diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
+index 0e6f7ac..d70af29 100644
+--- a/Source/Android/app/src/main/AndroidManifest.xml
++++ b/Source/Android/app/src/main/AndroidManifest.xml
+@@ -71,6 +71,16 @@
+             android:exported="false"
+             android:theme="@style/Theme.Dolphin.Main" />
+ 
++        <provider
++            android:name="androidx.core.content.FileProvider"
++            android:authorities="${applicationId}.xdshare"
++            android:exported="false"
++            android:grantUriPermissions="true">
++            <meta-data
++                android:name="android.support.FILE_PROVIDER_PATHS"
++                android:resource="@xml/xd_share_paths" />
++        </provider>
++
+         <activity
+             android:name=".ui.main.MainActivity"
+             android:exported="true"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Data.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Data.kt
+new file mode 100644
+index 0000000..10141ad
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Data.kt
+@@ -0,0 +1,201 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++import android.content.Context
++import java.io.InputStream
++import org.json.JSONArray
++import org.json.JSONObject
++
++/**
++ * Static Gen 3 (Emerald) game data loaded from the bundled asset
++ * "xdnetplay/gen3data.json".
++ *
++ * Schema (verified against the generated file):
++ *   species:   { name: { id, natDex, baseStats [hp,atk,def,speed,spatk,spdef],
++ *                        abilities [a1,a2], genderRatio, expGroup, types } }
++ *   moves:     { name: id }
++ *   items:     { name: id }
++ *   abilities: { name: id }
++ *   natures:   { name: { id, plus, minus } }   plus/minus: -1 = neutral,
++ *              else stat index 0=atk 1=def 2=speed 3=spatk 4=spdef
++ *   expTables: { group: { max, cumulative [101] } }  cumulative indexed by level
++ *              (a plain 101-element array is also accepted for compatibility
++ *              with the originally specified schema)
++ *   charset:   { char: byte }  (pokeemerald charmap; note it maps '$' to 0xFF
++ *              because '$' is the EOS marker in pokeemerald source strings —
++ *              use Gen3Text for actual name encoding)
++ *   typeNames: { typeId: name }  (optional)
++ *
++ * All name keys are normalized: lowercase with non-alphanumerics stripped.
++ * The lookup helpers apply the same normalization to their inputs.
++ */
++class Gen3Data private constructor(
++    val species: Map<String, Species>,
++    val moves: Map<String, Int>,
++    val items: Map<String, Int>,
++    val abilities: Map<String, Int>,
++    val natures: Map<String, Nature>,
++    val expTables: Map<String, IntArray>,
++    val charset: Map<Char, Int>,
++    val typeNames: Map<Int, String>
++) {
++    data class Species(
++        val name: String,
++        val id: Int,          // internal (Hoenn) species id used in save data
++        val natDex: Int,      // National Dex number
++        val baseStats: IntArray,  // hp, atk, def, speed, spatk, spdef
++        val abilities: IntArray,  // slot 1, slot 2 (0 = none)
++        val genderRatio: Int, // 0 = always male, 254 = always female,
++                              // 255 = genderless, else female iff (PID & 0xFF) < ratio
++        val expGroup: String,
++        val types: IntArray
++    )
++
++    data class Nature(
++        val name: String,
++        val id: Int,
++        val plus: Int,   // -1 = neutral, else 0=atk 1=def 2=speed 3=spatk 4=spdef
++        val minus: Int
++    )
++
++    // -- lookup helpers (input names are normalized) -------------------------
++
++    fun species(name: String): Species? = species[normalizeName(name)]
++
++    fun moveId(name: String): Int? = moves[normalizeName(name)]
++
++    fun itemId(name: String): Int? = items[normalizeName(name)]
++
++    fun abilityId(name: String): Int? = abilities[normalizeName(name)]
++
++    fun nature(name: String): Nature? = natures[normalizeName(name)]
++
++    /**
++     * Total experience at [level] (1..100) for growth group [expGroup]
++     * (e.g. "MEDIUM_SLOW"), from the cumulative table.
++     */
++    fun expForLevel(expGroup: String, level: Int): Int {
++        val table = expTables[expGroup]
++            ?: throw IllegalArgumentException("unknown experience group: $expGroup")
++        require(level in 1..100) { "level out of range: $level" }
++        return table[level]
++    }
++
++    companion object {
++        const val ASSET_PATH = "xdnetplay/gen3data.json"
++
++        /** Load the bundled asset. */
++        fun load(context: Context): Gen3Data =
++            context.assets.open(ASSET_PATH).use { load(it) }
++
++        fun load(stream: InputStream): Gen3Data =
++            fromJson(stream.readBytes().toString(Charsets.UTF_8))
++
++        /**
++         * Normalize a display name to a lookup key: lowercase, ASCII letters
++         * and digits only ("Mr. Mime" -> "mrmime", "Nidoran-F" -> "nidoranf").
++         */
++        fun normalizeName(name: String): String {
++            val sb = StringBuilder(name.length)
++            for (c in name.lowercase()) {
++                if (c in 'a'..'z' || c in '0'..'9') {
++                    sb.append(c)
++                }
++            }
++            return sb.toString()
++        }
++
++        fun fromJson(text: String): Gen3Data {
++            val root = JSONObject(text)
++
++            val species = HashMap<String, Species>()
++            val speciesObj = root.getJSONObject("species")
++            for (key in speciesObj.keys()) {
++                val s = speciesObj.getJSONObject(key)
++                val name = normalizeName(key)
++                species[name] = Species(
++                    name = name,
++                    id = s.getInt("id"),
++                    natDex = s.getInt("natDex"),
++                    baseStats = intArray(s.getJSONArray("baseStats")),
++                    abilities = intArray(s.getJSONArray("abilities")),
++                    genderRatio = s.getInt("genderRatio"),
++                    expGroup = s.getString("expGroup"),
++                    types = intArray(s.getJSONArray("types"))
++                )
++            }
++
++            val expTables = HashMap<String, IntArray>()
++            val expObj = root.getJSONObject("expTables")
++            for (key in expObj.keys()) {
++                // Actual generated shape: { "max": n, "cumulative": [101] }.
++                // Also accept a bare [101] array (the originally stated schema).
++                val value = expObj.get(key)
++                val cumulative = when (value) {
++                    is JSONObject -> value.getJSONArray("cumulative")
++                    is JSONArray -> value
++                    else -> throw IllegalArgumentException("bad expTables entry: $key")
++                }
++                expTables[key] = intArray(cumulative)
++            }
++
++            val natures = HashMap<String, Nature>()
++            val naturesObj = root.getJSONObject("natures")
++            for (key in naturesObj.keys()) {
++                val n = naturesObj.getJSONObject(key)
++                val name = normalizeName(key)
++                natures[name] = Nature(
++                    name = name,
++                    id = n.getInt("id"),
++                    plus = n.getInt("plus"),
++                    minus = n.getInt("minus")
++                )
++            }
++
++            val charset = HashMap<Char, Int>()
++            val charsetObj = root.getJSONObject("charset")
++            for (key in charsetObj.keys()) {
++                if (key.length == 1) {
++                    charset[key[0]] = charsetObj.getInt(key)
++                }
++            }
++
++            val typeNames = HashMap<Int, String>()
++            val typeNamesObj = root.optJSONObject("typeNames")
++            if (typeNamesObj != null) {
++                for (key in typeNamesObj.keys()) {
++                    val id = key.toIntOrNull() ?: continue
++                    typeNames[id] = typeNamesObj.getString(key)
++                }
++            }
++
++            return Gen3Data(
++                species = species,
++                moves = idMap(root.getJSONObject("moves")),
++                items = idMap(root.getJSONObject("items")),
++                abilities = idMap(root.getJSONObject("abilities")),
++                natures = natures,
++                expTables = expTables,
++                charset = charset,
++                typeNames = typeNames
++            )
++        }
++
++        private fun intArray(arr: JSONArray): IntArray {
++            val out = IntArray(arr.length())
++            for (i in 0 until arr.length()) {
++                out[i] = arr.getInt(i)
++            }
++            return out
++        }
++
++        private fun idMap(obj: JSONObject): Map<String, Int> {
++            val out = HashMap<String, Int>()
++            for (key in obj.keys()) {
++                out[normalizeName(key)] = obj.getInt(key)
++            }
++            return out
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Mon.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Mon.kt
+new file mode 100644
+index 0000000..95ea8fe
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Mon.kt
+@@ -0,0 +1,339 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * Fully decoded Gen 3 party Pokemon (100-byte struct).
++ *
++ * Ported 1:1 from the empirically validated Python reference
++ * (gen3save.py PartyPokemon; see VALIDATION.md). fromBytes()/encode()
++ * round-trip byte-identically.
++ *
++ * Box portion (80 bytes):
++ *   0x00 u32  personality (PID)
++ *   0x04 u32  OT ID (low u16 public, high u16 secret)
++ *   0x08 10B  nickname (Gen 3 charset)
++ *   0x12 u16  language (0x0202 = English)
++ *   0x14 7B   OT name
++ *   0x1B u8   markings
++ *   0x1C u16  checksum (u16-sum of DECRYPTED 48-byte data block)
++ *   0x1E u16  unknown/padding (preserved verbatim)
++ *   0x20 48B  encrypted data: four 12-byte substructures, order = PID % 24,
++ *             each u32 XORed with key = PID ^ OTID
++ * Party-only portion (20 bytes):
++ *   0x50 u32 status, 0x54 u8 level, 0x55 u8 pokerus days, 0x56 u16 curHP,
++ *   0x58 u16 maxHP, 0x5A atk, 0x5C def, 0x5E spe, 0x60 spa, 0x62 spd
++ */
++class Gen3Mon {
++    // Box header
++    var pid = 0                       // raw u32 bit pattern
++    var otId = 0                      // raw u32 bit pattern
++    var nicknameRaw = ByteArray(10)   // raw bytes (kept for exact round-trip)
++    var language = 0x0202
++    var otNameRaw = ByteArray(7)
++    var markings = 0
++    var unknown1E = 0
++
++    // Growth substructure
++    var species = 0
++    var heldItem = 0
++    var experience = 0
++    var ppBonuses = 0
++    var friendship = 0
++    var growthUnknown = 0
++
++    // Attacks substructure
++    var moves = IntArray(4)
++    var pp = IntArray(4)
++
++    // EVs substructure (+ contest stats)
++    var evs = IntArray(6)             // hp, atk, def, speed, spatk, spdef
++    var contest = IntArray(6)         // cool, beauty, cute, smart, tough, feel
++
++    // Misc substructure
++    var pokerus = 0
++    var metLocation = 0
++    var origins = 0                   // bits: 0-6 level met, 7-10 game, 11-14 ball, 15 OT gender
++    var ivEggAbility = 0              // bits: 6x5-bit IVs, 30 is_egg, 31 ability slot
++    var ribbons = 0
++
++    // Party-only portion
++    var status = 0
++    var level = 0
++    var pokerusDays = 0
++    var currentHp = 0
++    var maxHp = 0
++    var attack = 0
++    var defense = 0
++    var speed = 0
++    var spAttack = 0
++    var spDefense = 0
++
++    // -- derived accessors ---------------------------------------------------
++
++    val nickname: String
++        get() = Gen3Text.decode(nicknameRaw, 0, 10)
++
++    val otName: String
++        get() = Gen3Text.decode(otNameRaw, 0, 7)
++
++    /** Nature index 0..24 = unsigned PID % 25. */
++    val nature: Int
++        get() = unsignedMod(pid, 25)
++
++    val natureName: String
++        get() = NATURES[nature]
++
++    /** IVs as (hp, atk, def, speed, spatk, spdef), 5 bits each. */
++    fun ivs(): IntArray {
++        val out = IntArray(6)
++        for (i in 0..5) {
++            out[i] = (ivEggAbility ushr (5 * i)) and 0x1F
++        }
++        return out
++    }
++
++    /** Set IVs from (hp, atk, def, speed, spatk, spdef). */
++    fun setIvs(ivs: IntArray) {
++        var v = ivEggAbility and 0x3FFFFFFF.inv()
++        for (i in 0..5) {
++            v = v or ((ivs[i] and 0x1F) shl (5 * i))
++        }
++        ivEggAbility = v
++    }
++
++    val isEgg: Int
++        get() = (ivEggAbility ushr 30) and 1
++
++    val abilitySlot: Int
++        get() = (ivEggAbility ushr 31) and 1
++
++    fun setAbilitySlot(slot: Int) {
++        ivEggAbility = (ivEggAbility and 0x7FFFFFFF) or ((slot and 1) shl 31)
++    }
++
++    fun isEmpty(): Boolean = pid == 0 && species == 0
++
++    // -- encode --------------------------------------------------------------
++
++    /**
++     * Rebuild the 100-byte struct from decoded fields (re-encrypts and
++     * recomputes the substructure checksum).
++     */
++    fun encode(): ByteArray {
++        require(nicknameRaw.size == 10) { "nicknameRaw must be 10 bytes" }
++        require(otNameRaw.size == 7) { "otNameRaw must be 7 bytes" }
++        val buf = ByteArray(SIZE)
++        Gen3Bytes.writeU32(buf, 0x00, pid)
++        Gen3Bytes.writeU32(buf, 0x04, otId)
++        nicknameRaw.copyInto(buf, 0x08)
++        Gen3Bytes.writeU16(buf, 0x12, language)
++        otNameRaw.copyInto(buf, 0x14)
++        Gen3Bytes.writeU8(buf, 0x1B, markings)
++        Gen3Bytes.writeU16(buf, 0x1E, unknown1E)
++
++        val g = ByteArray(12)
++        Gen3Bytes.writeU16(g, 0, species)
++        Gen3Bytes.writeU16(g, 2, heldItem)
++        Gen3Bytes.writeU32(g, 4, experience)
++        Gen3Bytes.writeU8(g, 8, ppBonuses)
++        Gen3Bytes.writeU8(g, 9, friendship)
++        Gen3Bytes.writeU16(g, 10, growthUnknown)
++
++        val a = ByteArray(12)
++        for (i in 0..3) {
++            Gen3Bytes.writeU16(a, 2 * i, moves[i])
++            Gen3Bytes.writeU8(a, 8 + i, pp[i])
++        }
++
++        val e = ByteArray(12)
++        for (i in 0..5) {
++            Gen3Bytes.writeU8(e, i, evs[i])
++            Gen3Bytes.writeU8(e, 6 + i, contest[i])
++        }
++
++        val m = ByteArray(12)
++        Gen3Bytes.writeU8(m, 0, pokerus)
++        Gen3Bytes.writeU8(m, 1, metLocation)
++        Gen3Bytes.writeU16(m, 2, origins)
++        Gen3Bytes.writeU32(m, 4, ivEggAbility)
++        Gen3Bytes.writeU32(m, 8, ribbons)
++
++        val order = SUBSTRUCT_ORDER[unsignedMod(pid, 24)]
++        val decrypted = ByteArray(48)
++        for (slot in 0..3) {
++            val sub = when (order[slot]) {
++                'G' -> g
++                'A' -> a
++                'E' -> e
++                else -> m
++            }
++            sub.copyInto(decrypted, slot * 12)
++        }
++
++        Gen3Bytes.writeU16(buf, 0x1C, dataChecksum(decrypted))
++        val key = pid xor otId
++        xorBlockInPlace(decrypted, key)
++        decrypted.copyInto(buf, 0x20)
++
++        Gen3Bytes.writeU32(buf, 0x50, status)
++        Gen3Bytes.writeU8(buf, 0x54, level)
++        Gen3Bytes.writeU8(buf, 0x55, pokerusDays)
++        Gen3Bytes.writeU16(buf, 0x56, currentHp)
++        Gen3Bytes.writeU16(buf, 0x58, maxHp)
++        Gen3Bytes.writeU16(buf, 0x5A, attack)
++        Gen3Bytes.writeU16(buf, 0x5C, defense)
++        Gen3Bytes.writeU16(buf, 0x5E, speed)
++        Gen3Bytes.writeU16(buf, 0x60, spAttack)
++        Gen3Bytes.writeU16(buf, 0x62, spDefense)
++        return buf
++    }
++
++    override fun toString(): String {
++        val iv = ivs()
++        return "Gen3Mon(species=$species item=$heldItem lv=$level exp=$experience " +
++            "nature=$natureName abilitySlot=$abilitySlot nick=$nickname ot=$otName " +
++            "moves=${moves.toList()} evs=${evs.toList()} ivs=${iv.toList()} " +
++            "hp=$currentHp/$maxHp atk=$attack def=$defense spe=$speed spa=$spAttack spd=$spDefense)"
++    }
++
++    companion object {
++        /** Size of a party Pokemon struct in bytes. */
++        const val SIZE = 100
++
++        /**
++         * Substructure order by PID % 24. G=Growth A=Attacks E=EVs M=Misc.
++         * Entry i gives, in storage order, which substructure occupies each
++         * of the four 12-byte slots.
++         */
++        val SUBSTRUCT_ORDER = arrayOf(
++            "GAEM", "GAME", "GEAM", "GEMA", "GMAE", "GMEA",
++            "AGEM", "AGME", "AEGM", "AEMG", "AMGE", "AMEG",
++            "EGAM", "EGMA", "EAGM", "EAMG", "EMGA", "EMAG",
++            "MGAE", "MGEA", "MAGE", "MAEG", "MEGA", "MEAG"
++        )
++
++        val NATURES = arrayOf(
++            "Hardy", "Lonely", "Brave", "Adamant", "Naughty",
++            "Bold", "Docile", "Relaxed", "Impish", "Lax",
++            "Timid", "Hasty", "Serious", "Jolly", "Naive",
++            "Modest", "Mild", "Quiet", "Bashful", "Rash",
++            "Calm", "Gentle", "Sassy", "Careful", "Quirky"
++        )
++
++        /**
++         * Unsigned [value] % [modulus]. The PID is stored as a raw Int bit
++         * pattern which may be negative; Kotlin's % on a negative Int would
++         * give a different residue than Python's % on the unsigned value.
++         */
++        fun unsignedMod(value: Int, modulus: Int): Int =
++            ((value.toLong() and 0xFFFFFFFFL) % modulus.toLong()).toInt()
++
++        /** XOR each little-endian u32 of the 48-byte block with key (symmetric). */
++        private fun xorBlockInPlace(block48: ByteArray, key: Int) {
++            var i = 0
++            while (i < 48) {
++                Gen3Bytes.writeU32(block48, i, Gen3Bytes.readU32(block48, i) xor key)
++                i += 4
++            }
++        }
++
++        /** u16 sum of the decrypted 48-byte block taken as 24 u16 words. */
++        private fun dataChecksum(decrypted48: ByteArray): Int {
++            var total = 0
++            var i = 0
++            while (i < 48) {
++                total = (total + Gen3Bytes.readU16(decrypted48, i)) and 0xFFFF
++                i += 2
++            }
++            return total
++        }
++
++        /** An unused party slot is all zeroes (PID 0, OTID 0, checksum 0). */
++        fun isEmptySlotBytes(buf: ByteArray, off: Int): Boolean {
++            for (i in 0 until SIZE) {
++                if (buf[off + i].toInt() != 0) {
++                    return false
++                }
++            }
++            return true
++        }
++
++        /**
++         * Decode a 100-byte party struct at [off]. Verifies the substructure
++         * checksum for non-empty slots.
++         *
++         * @throws IllegalArgumentException on checksum mismatch.
++         */
++        fun fromBytes(buf: ByteArray, off: Int = 0): Gen3Mon {
++            val mon = Gen3Mon()
++            mon.pid = Gen3Bytes.readU32(buf, off + 0x00)
++            mon.otId = Gen3Bytes.readU32(buf, off + 0x04)
++            mon.nicknameRaw = buf.copyOfRange(off + 0x08, off + 0x12)
++            mon.language = Gen3Bytes.readU16(buf, off + 0x12)
++            mon.otNameRaw = buf.copyOfRange(off + 0x14, off + 0x1B)
++            mon.markings = Gen3Bytes.readU8(buf, off + 0x1B)
++            val storedChecksum = Gen3Bytes.readU16(buf, off + 0x1C)
++            mon.unknown1E = Gen3Bytes.readU16(buf, off + 0x1E)
++
++            val key = mon.pid xor mon.otId
++            val decrypted = buf.copyOfRange(off + 0x20, off + 0x50)
++            xorBlockInPlace(decrypted, key)
++
++            if (!isEmptySlotBytes(buf, off)) {
++                val calc = dataChecksum(decrypted)
++                if (calc != storedChecksum) {
++                    throw IllegalArgumentException(
++                        "substructure checksum mismatch: stored=0x%04X calc=0x%04X"
++                            .format(storedChecksum, calc)
++                    )
++                }
++            }
++
++            val order = SUBSTRUCT_ORDER[unsignedMod(mon.pid, 24)]
++            val subs = HashMap<Char, ByteArray>()
++            for (slot in 0..3) {
++                subs[order[slot]] = decrypted.copyOfRange(slot * 12, (slot + 1) * 12)
++            }
++
++            val g = subs.getValue('G')
++            mon.species = Gen3Bytes.readU16(g, 0)
++            mon.heldItem = Gen3Bytes.readU16(g, 2)
++            mon.experience = Gen3Bytes.readU32(g, 4)
++            mon.ppBonuses = Gen3Bytes.readU8(g, 8)
++            mon.friendship = Gen3Bytes.readU8(g, 9)
++            mon.growthUnknown = Gen3Bytes.readU16(g, 10)
++
++            val a = subs.getValue('A')
++            for (i in 0..3) {
++                mon.moves[i] = Gen3Bytes.readU16(a, 2 * i)
++                mon.pp[i] = Gen3Bytes.readU8(a, 8 + i)
++            }
++
++            val e = subs.getValue('E')
++            for (i in 0..5) {
++                mon.evs[i] = Gen3Bytes.readU8(e, i)
++                mon.contest[i] = Gen3Bytes.readU8(e, 6 + i)
++            }
++
++            val m = subs.getValue('M')
++            mon.pokerus = Gen3Bytes.readU8(m, 0)
++            mon.metLocation = Gen3Bytes.readU8(m, 1)
++            mon.origins = Gen3Bytes.readU16(m, 2)
++            mon.ivEggAbility = Gen3Bytes.readU32(m, 4)
++            mon.ribbons = Gen3Bytes.readU32(m, 8)
++
++            mon.status = Gen3Bytes.readU32(buf, off + 0x50)
++            mon.level = Gen3Bytes.readU8(buf, off + 0x54)
++            mon.pokerusDays = Gen3Bytes.readU8(buf, off + 0x55)
++            mon.currentHp = Gen3Bytes.readU16(buf, off + 0x56)
++            mon.maxHp = Gen3Bytes.readU16(buf, off + 0x58)
++            mon.attack = Gen3Bytes.readU16(buf, off + 0x5A)
++            mon.defense = Gen3Bytes.readU16(buf, off + 0x5C)
++            mon.speed = Gen3Bytes.readU16(buf, off + 0x5E)
++            mon.spAttack = Gen3Bytes.readU16(buf, off + 0x60)
++            mon.spDefense = Gen3Bytes.readU16(buf, off + 0x62)
++            return mon
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+new file mode 100644
+index 0000000..1d94823
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+@@ -0,0 +1,307 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * Little-endian byte helpers.
++ *
++ * Kotlin Byte is signed: every read masks with 0xFF before widening.
++ * u32 values are handled as raw Int bit patterns (may be negative); use
++ * [readU32Long] when unsigned arithmetic or comparison is needed.
++ */
++internal object Gen3Bytes {
++    fun readU8(buf: ByteArray, off: Int): Int = buf[off].toInt() and 0xFF
++
++    fun readU16(buf: ByteArray, off: Int): Int =
++        (buf[off].toInt() and 0xFF) or ((buf[off + 1].toInt() and 0xFF) shl 8)
++
++    /** Returns the raw 32-bit pattern; may be negative as a Kotlin Int. */
++    fun readU32(buf: ByteArray, off: Int): Int =
++        (buf[off].toInt() and 0xFF) or
++            ((buf[off + 1].toInt() and 0xFF) shl 8) or
++            ((buf[off + 2].toInt() and 0xFF) shl 16) or
++            ((buf[off + 3].toInt() and 0xFF) shl 24)
++
++    /** u32 as a non-negative Long (for unsigned arithmetic/comparisons). */
++    fun readU32Long(buf: ByteArray, off: Int): Long =
++        readU32(buf, off).toLong() and 0xFFFFFFFFL
++
++    fun writeU8(buf: ByteArray, off: Int, value: Int) {
++        buf[off] = (value and 0xFF).toByte()
++    }
++
++    fun writeU16(buf: ByteArray, off: Int, value: Int) {
++        buf[off] = (value and 0xFF).toByte()
++        buf[off + 1] = ((value ushr 8) and 0xFF).toByte()
++    }
++
++    fun writeU32(buf: ByteArray, off: Int, value: Int) {
++        buf[off] = (value and 0xFF).toByte()
++        buf[off + 1] = ((value ushr 8) and 0xFF).toByte()
++        buf[off + 2] = ((value ushr 16) and 0xFF).toByte()
++        buf[off + 3] = ((value ushr 24) and 0xFF).toByte()
++    }
++}
++
++/** One section whose stored footer checksum does not match the computed one. */
++data class ChecksumMismatch(
++    val block: Int,
++    val slot: Int,
++    val sectionId: Int,
++    val stored: Int,
++    val calculated: Int
++)
++
++/**
++ * Pokemon Emerald (Gen 3) save file: 131072 bytes of flash plus any trailing
++ * bytes (e.g. the 16-byte mGBA RTC footer), which are preserved verbatim.
++ *
++ * Ported 1:1 from the empirically validated Python reference
++ * (gen3save.py EmeraldSave; see VALIDATION.md):
++ *  - Flash holds two 57344-byte game-save blocks of 14 rotating 4096-byte
++ *    sections each; the physical slot of logical section N shifts every save.
++ *  - Section footer at +0x0FF4: u16 section id, u16 checksum,
++ *    u32 signature (0x08012025), u32 save index (shared by the block).
++ *  - Active block = the fully valid block with the higher save index.
++ *  - Section checksum: sum of the section's data bytes as little-endian u32s
++ *    over that section's data length, folded to u16 as
++ *    ((sum & 0xFFFF) + (sum >> 16)) & 0xFFFF.
++ */
++class EmeraldSave(raw: ByteArray) {
++    private val raw: ByteArray
++    val activeBlock: Int
++    private val sectionOffsets: IntArray
++
++    init {
++        require(raw.size >= 2 * BLOCK_SIZE) { "file too small for an Emerald save" }
++        this.raw = raw.copyOf()
++        activeBlock = findActiveBlock()
++        sectionOffsets = mapSections(activeBlock)
++    }
++
++    /** Bytes after the two game-save blocks (Hall of Fame area, emulator RTC
++     *  footer, ...). Preserved verbatim; exposed for inspection only. */
++    val extraBytes: ByteArray
++        get() = raw.copyOfRange(2 * BLOCK_SIZE, raw.size)
++
++    /** The full file image (flash + any trailing bytes), reflecting all edits. */
++    fun toBytes(): ByteArray = raw.copyOf()
++
++    // -- block/section discovery ---------------------------------------------
++
++    /**
++     * Returns (saveIndex, allValid) for a block; the index is taken from any
++     * valid section (all 14 share it). saveIndex is -1 if no section was valid.
++     */
++    private fun blockIndexAndValid(block: Int): Pair<Long, Boolean> {
++        var idx = -1L
++        var valid = true
++        val seen = BooleanArray(SECTIONS_PER_BLOCK)
++        var seenCount = 0
++        for (slot in 0 until SECTIONS_PER_BLOCK) {
++            val off = block * BLOCK_SIZE + slot * SECTION_SIZE
++            val sid = Gen3Bytes.readU16(raw, off + SECTION_FOOTER_OFFSET)
++            val sig = Gen3Bytes.readU32(raw, off + SECTION_FOOTER_OFFSET + 4)
++            val sidx = Gen3Bytes.readU32Long(raw, off + SECTION_FOOTER_OFFSET + 8)
++            if (sig != SAVE_SIGNATURE || sid >= SECTIONS_PER_BLOCK) {
++                valid = false
++                continue
++            }
++            if (!seen[sid]) {
++                seen[sid] = true
++                seenCount++
++            }
++            if (idx == -1L) {
++                idx = sidx
++            } else if (sidx != idx) {
++                valid = false
++            }
++        }
++        if (seenCount != SECTIONS_PER_BLOCK) {
++            valid = false
++        }
++        return Pair(idx, valid)
++    }
++
++    private fun findActiveBlock(): Int {
++        val (idx0, ok0) = blockIndexAndValid(0)
++        val (idx1, ok1) = blockIndexAndValid(1)
++        if (ok0 && ok1) {
++            return if (idx1 > idx0) 1 else 0
++        }
++        if (ok1) {
++            return 1
++        }
++        if (ok0) {
++            return 0
++        }
++        throw IllegalArgumentException("no valid save block found")
++    }
++
++    /** Map logical section id -> absolute file offset of its 4096-byte slot. */
++    private fun mapSections(block: Int): IntArray {
++        val offsets = IntArray(SECTIONS_PER_BLOCK)
++        for (slot in 0 until SECTIONS_PER_BLOCK) {
++            val off = block * BLOCK_SIZE + slot * SECTION_SIZE
++            val sid = Gen3Bytes.readU16(raw, off + SECTION_FOOTER_OFFSET)
++            if (sid < SECTIONS_PER_BLOCK) {
++                offsets[sid] = off
++            }
++        }
++        return offsets
++    }
++
++    // -- section access ------------------------------------------------------
++
++    /** Copy of the 4096-byte physical section holding logical [sectionId]. */
++    fun sectionBytes(sectionId: Int): ByteArray {
++        val off = sectionOffsets[sectionId]
++        return raw.copyOfRange(off, off + SECTION_SIZE)
++    }
++
++    /**
++     * Check every section footer checksum in BOTH blocks. Returns the list of
++     * mismatches (empty when the file is fully consistent).
++     */
++    fun verifyAllChecksums(): List<ChecksumMismatch> {
++        val bad = ArrayList<ChecksumMismatch>()
++        for (block in 0..1) {
++            for (slot in 0 until SECTIONS_PER_BLOCK) {
++                val off = block * BLOCK_SIZE + slot * SECTION_SIZE
++                val sid = Gen3Bytes.readU16(raw, off + SECTION_FOOTER_OFFSET)
++                val stored = Gen3Bytes.readU16(raw, off + SECTION_FOOTER_OFFSET + 2)
++                if (sid >= SECTIONS_PER_BLOCK) {
++                    continue
++                }
++                val calc = sectionChecksum(raw, off, EMERALD_SECTION_DATA_LENGTHS[sid])
++                if (calc != stored) {
++                    bad.add(ChecksumMismatch(block, slot, sid, stored, calc))
++                }
++            }
++        }
++        return bad
++    }
++
++    fun updateSectionChecksum(sectionId: Int) {
++        val off = sectionOffsets[sectionId]
++        val calc = sectionChecksum(raw, off, EMERALD_SECTION_DATA_LENGTHS[sectionId])
++        Gen3Bytes.writeU16(raw, off + SECTION_FOOTER_OFFSET + 2, calc)
++    }
++
++    // -- trainer info (logical section 0) ------------------------------------
++
++    val trainerName: String
++        get() = Gen3Text.decode(raw, sectionOffsets[0] + TRAINER_NAME_OFFSET, TRAINER_NAME_LEN)
++
++    /** Raw u32: low u16 = public (visible) trainer ID, high u16 = secret ID. */
++    val trainerId: Int
++        get() = Gen3Bytes.readU32(raw, sectionOffsets[0] + TRAINER_ID_OFFSET)
++
++    val trainerPublicId: Int
++        get() = trainerId and 0xFFFF
++
++    val trainerSecretId: Int
++        get() = (trainerId ushr 16) and 0xFFFF
++
++    val trainerGender: Int
++        get() = Gen3Bytes.readU8(raw, sectionOffsets[0] + TRAINER_GENDER_OFFSET)
++
++    // -- party (logical section 1) -------------------------------------------
++
++    /**
++     * Stored party count, clamped to 0..6. (The Python reference trusted the
++     * raw u32; the clamp is a defensive addition so a corrupt count cannot
++     * drive reads past the party area.)
++     */
++    val partyCount: Int
++        get() {
++            val off = sectionOffsets[1]
++            val count = Gen3Bytes.readU32Long(raw, off + PARTY_COUNT_OFFSET)
++            return count.coerceIn(0L, PARTY_MAX.toLong()).toInt()
++        }
++
++    fun readParty(): List<Gen3Mon> {
++        val off = sectionOffsets[1]
++        val mons = ArrayList<Gen3Mon>()
++        for (i in 0 until partyCount) {
++            mons.add(Gen3Mon.fromBytes(raw, off + PARTY_DATA_OFFSET + i * Gen3Mon.SIZE))
++        }
++        return mons
++    }
++
++    /**
++     * Serialize [mons] into section 1, zero unused slots, fix the count and
++     * the section checksum.
++     */
++    fun writeParty(mons: List<Gen3Mon>) {
++        require(mons.size <= PARTY_MAX) { "party larger than $PARTY_MAX" }
++        val off = sectionOffsets[1]
++        Gen3Bytes.writeU32(raw, off + PARTY_COUNT_OFFSET, mons.size)
++        for (i in 0 until PARTY_MAX) {
++            val slotOff = off + PARTY_DATA_OFFSET + i * Gen3Mon.SIZE
++            val bytes = if (i < mons.size) mons[i].encode() else ByteArray(Gen3Mon.SIZE)
++            bytes.copyInto(raw, slotOff)
++        }
++        updateSectionChecksum(1)
++    }
++
++    /** Re-encode the current party over itself (round-trip identity helper). */
++    fun rewritePartyInPlace() {
++        writeParty(readParty())
++    }
++
++    companion object {
++        const val SECTION_SIZE = 4096
++        const val SECTION_FOOTER_OFFSET = 0x0FF4
++        const val SECTIONS_PER_BLOCK = 14
++        const val BLOCK_SIZE = SECTION_SIZE * SECTIONS_PER_BLOCK // 57344
++        const val SAVE_SIGNATURE = 0x08012025
++
++        // Section 1 (Team/Items) offsets - Emerald.
++        const val PARTY_COUNT_OFFSET = 0x0234 // u32
++        const val PARTY_DATA_OFFSET = 0x0238  // 6 * 100 bytes
++        const val PARTY_MAX = 6
++
++        // Section 0 (Trainer Info) offsets - Emerald.
++        const val TRAINER_NAME_OFFSET = 0x0000 // 7 bytes + 0xFF
++        const val TRAINER_NAME_LEN = 7
++        const val TRAINER_GENDER_OFFSET = 0x0008
++        const val TRAINER_ID_OFFSET = 0x000A   // u32: low u16 public, high u16 secret
++
++        /**
++         * Per-section valid data length used by the checksum (Emerald).
++         * Index = logical section ID. Empirically confirmed: with these exact
++         * lengths every section checksum in the test saves matches.
++         */
++        val EMERALD_SECTION_DATA_LENGTHS = intArrayOf(
++            3884, // 0  Trainer info
++            3968, // 1  Team / items
++            3968, // 2  Game state
++            3968, // 3  Misc data
++            3848, // 4  Rival info
++            3968, // 5  PC buffer A
++            3968, // 6  PC buffer B
++            3968, // 7  PC buffer C
++            3968, // 8  PC buffer D
++            3968, // 9  PC buffer E
++            3968, // 10 PC buffer F
++            3968, // 11 PC buffer G
++            3968, // 12 PC buffer H
++            2000  // 13 PC buffer I
++        )
++
++        /**
++         * Sum [dataLength] bytes starting at [base] as little-endian u32s
++         * (mod 2^32), then fold to u16: ((sum & 0xFFFF) + (sum >> 16)) & 0xFFFF.
++         */
++        fun sectionChecksum(buf: ByteArray, base: Int, dataLength: Int): Int {
++            var total = 0L
++            var i = 0
++            while (i < dataLength) {
++                total = (total + Gen3Bytes.readU32Long(buf, base + i)) and 0xFFFFFFFFL
++                i += 4
++            }
++            return (((total and 0xFFFFL) + (total ushr 16)) and 0xFFFFL).toInt()
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
+new file mode 100644
+index 0000000..3fdb410
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * Gen 3 western (International) character set encode/decode.
++ *
++ * Ported 1:1 from the empirically validated Python reference (gen3save.py);
++ * all byte values were confirmed against real Emerald saves (VALIDATION.md).
++ * Strings are fixed-width, 0xFF-terminated; a string that fills the whole
++ * field carries no terminator, exactly like the games.
++ */
++object Gen3Text {
++    const val TERMINATOR = 0xFF
++
++    private val byteToChar = HashMap<Int, Char>()
++    private val charToByte = HashMap<Char, Int>()
++
++    private fun map(b: Int, c: Char) {
++        byteToChar[b] = c
++        charToByte[c] = b
++    }
++
++    init {
++        map(0x00, ' ')
++        // Digits 0-9: 0xA1..0xAA
++        for (i in 0..9) {
++            map(0xA1 + i, '0' + i)
++        }
++        map(0xAB, '!')
++        map(0xAC, '?')
++        map(0xAD, '.')
++        map(0xAE, '-')
++        map(0xAF, '・')
++        map(0xB0, '…')
++        map(0xB1, '“')
++        map(0xB2, '”')
++        map(0xB3, '‘')
++        map(0xB4, '’')
++        map(0xB5, '♂')
++        map(0xB6, '♀')
++        map(0xB7, '$')
++        map(0xB8, ',')
++        map(0xB9, '×')
++        map(0xBA, '/')
++        // A-Z: 0xBB..0xD4, a-z: 0xD5..0xEE
++        for (i in 0..25) {
++            map(0xBB + i, 'A' + i)
++            map(0xD5 + i, 'a' + i)
++        }
++    }
++
++    /** True if [c] has a Gen 3 byte value in this charset. */
++    fun canEncode(c: Char): Boolean = charToByte.containsKey(c)
++
++    /**
++     * Decode up to [maxLen] bytes of Gen 3 text starting at [off].
++     * Unknown bytes decode as '?', mirroring the Python reference.
++     */
++    fun decode(buf: ByteArray, off: Int, maxLen: Int): String {
++        val sb = StringBuilder()
++        for (i in 0 until maxLen) {
++            // Kotlin Byte is signed: mask to 0..255 before any comparison.
++            val b = buf[off + i].toInt() and 0xFF
++            if (b == TERMINATOR) {
++                break
++            }
++            sb.append(byteToChar[b] ?: '?')
++        }
++        return sb.toString()
++    }
++
++    /**
++     * Encode [text] to exactly [maxLen] bytes, 0xFF-terminated/padded.
++     * Text longer than [maxLen] is truncated (as in the Python reference).
++     *
++     * @throws IllegalArgumentException if a character cannot be encoded.
++     */
++    fun encode(text: String, maxLen: Int): ByteArray {
++        val out = ByteArray(maxLen) { TERMINATOR.toByte() }
++        val n = minOf(text.length, maxLen)
++        for (i in 0 until n) {
++            val ch = text[i]
++            val b = charToByte[ch]
++                ?: throw IllegalArgumentException(
++                    "character '$ch' not encodable in Gen 3 charset"
++                )
++            out[i] = b.toByte()
++        }
++        return out
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+new file mode 100644
+index 0000000..d2e87a1
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+@@ -0,0 +1,295 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * Builds a Gen3Mon from a parsed Showdown set, mirroring the defaults the
++ * validated Python injector (gen3save.py make_party_mon) used for its
++ * in-game-verified injected mon:
++ *
++ *  - language English (0x0202), friendship 70
++ *  - origins: met level = current level, game of origin 3 (Emerald),
++ *    ball 4 (Poke Ball), OT gender male, met location 0
++ *  - PP = 35 for every non-empty move slot, 0 otherwise, PP bonuses 0
++ *    (the Python used exactly this constant; there is no per-move base-PP
++ *    table in the data JSON, and the game clamps PP on use)
++ *  - contest stats, ribbons, status, pokerus all 0
++ *
++ * The PID is chosen deterministically to satisfy, in priority order:
++ * nature (unsigned PID % 25), ability slot (PID & 1), gender (PID low byte
++ * vs the species gender ratio, when the set requests a gender the species
++ * can actually have), and shininess ((TID^SID^PIDhigh^PIDlow) < 8). Shiny is
++ * relaxed first if the combination is unsatisfiable; the search is bounded,
++ * never infinite.
++ */
++object MonFactory {
++    private const val LANGUAGE_ENGLISH = 0x0202
++    private const val DEFAULT_FRIENDSHIP = 70
++    private const val DEFAULT_PP = 35        // mirrors the Python injector
++    private const val GAME_EMERALD = 3
++    private const val BALL_POKE = 4          // the Python injector's default ball
++    private const val OT_GENDER_MALE = 0
++    private const val SHINY_THRESHOLD = 8
++
++    // Gender ratio sentinel values (never PID-dependent).
++    private const val RATIO_ALWAYS_MALE = 0
++    private const val RATIO_ALWAYS_FEMALE = 254
++    private const val RATIO_GENDERLESS = 255
++
++    /**
++     * Build a party-ready [Gen3Mon] owned by [trainerName]/[trainerId]
++     * (raw u32: low u16 public ID, high u16 secret ID, as read from the save).
++     *
++     * @throws IllegalArgumentException for unknown species/move/item/ability/
++     * nature names.
++     */
++    fun build(set: ShowdownSet, data: Gen3Data, trainerName: String, trainerId: Int): Gen3Mon {
++        val species = data.species(set.species)
++            ?: throw IllegalArgumentException("unknown species: ${set.species}")
++
++        val level = set.level.coerceIn(1, 100)
++
++        // Nature: default Hardy (neutral) when the set omits it, so the
++        // stats we store match the nature the PID encodes.
++        val nature = if (set.nature != null) {
++            data.nature(set.nature)
++                ?: throw IllegalArgumentException("unknown nature: ${set.nature}")
++        } else {
++            data.nature("hardy") ?: Gen3Data.Nature("hardy", 0, -1, -1)
++        }
++
++        // Ability slot: 1 only when the requested ability is the species'
++        // distinct second ability; otherwise 0.
++        val abilitySlot = if (set.ability != null) {
++            val abilityId = data.abilityId(set.ability)
++                ?: throw IllegalArgumentException("unknown ability: ${set.ability}")
++            if (abilityId == species.abilities[1] &&
++                species.abilities[1] != 0 &&
++                species.abilities[1] != species.abilities[0]
++            ) 1 else 0
++        } else {
++            0
++        }
++
++        val pid = choosePid(
++            natureId = nature.id,
++            abilitySlot = abilitySlot,
++            genderRatio = species.genderRatio,
++            wantedGender = set.gender,
++            shiny = set.shiny,
++            trainerId = trainerId
++        )
++
++        // Remap hp/atk/def/spa/spd/spe (Showdown order) to
++        // hp/atk/def/speed/spatk/spdef (Gen 3 save order).
++        val evs = showdownToGen3Order(set.evs)
++        val ivs = showdownToGen3Order(set.ivs)
++        for (i in 0..5) {
++            ivs[i] = ivs[i].coerceIn(0, 31)
++            evs[i] = evs[i].coerceIn(0, 255)
++        }
++
++        val moveIds = IntArray(4)
++        for (i in 0 until minOf(set.moves.size, 4)) {
++            moveIds[i] = resolveMoveId(set.moves[i], data)
++        }
++
++        val heldItem = if (set.item != null) {
++            data.itemId(set.item)
++                ?: throw IllegalArgumentException("unknown item: ${set.item}")
++        } else {
++            0
++        }
++
++        val stats = computeStats(species, level, ivs, evs, nature)
++
++        val mon = Gen3Mon()
++        mon.pid = pid
++        mon.otId = trainerId
++        mon.nicknameRaw = Gen3Text.encode(
++            sanitizeText(set.nickname ?: set.species.uppercase()), 10
++        )
++        mon.language = LANGUAGE_ENGLISH
++        mon.otNameRaw = Gen3Text.encode(sanitizeText(trainerName), 7)
++        mon.species = species.id
++        mon.heldItem = heldItem
++        mon.experience = data.expForLevel(species.expGroup, level)
++        mon.ppBonuses = 0
++        mon.friendship = DEFAULT_FRIENDSHIP
++        mon.moves = moveIds
++        for (i in 0..3) {
++            mon.pp[i] = if (moveIds[i] != 0) DEFAULT_PP else 0
++        }
++        mon.evs = evs
++        mon.metLocation = 0
++        mon.origins = (level and 0x7F) or
++            ((GAME_EMERALD and 0xF) shl 7) or
++            ((BALL_POKE and 0xF) shl 11) or
++            ((OT_GENDER_MALE and 1) shl 15)
++        mon.setIvs(ivs)
++        mon.setAbilitySlot(abilitySlot)
++        mon.level = level
++        mon.maxHp = stats[0]
++        mon.currentHp = stats[0]
++        mon.attack = stats[1]
++        mon.defense = stats[2]
++        mon.speed = stats[3]
++        mon.spAttack = stats[4]
++        mon.spDefense = stats[5]
++        return mon
++    }
++
++    /** Remap hp/atk/def/spa/spd/spe -> hp/atk/def/speed/spatk/spdef. */
++    private fun showdownToGen3Order(sd: IntArray): IntArray =
++        intArrayOf(sd[0], sd[1], sd[2], sd[5], sd[3], sd[4])
++
++    /**
++     * Move name -> id. "Hidden Power [Ice]" / "Hidden Power Ice" resolve to
++     * plain Hidden Power (Gen 3 stores no HP type; it derives from IVs).
++     */
++    private fun resolveMoveId(name: String, data: Gen3Data): Int {
++        data.moveId(name)?.let { return it }
++        val normalized = Gen3Data.normalizeName(name)
++        if (normalized.startsWith("hiddenpower")) {
++            data.moveId("hiddenpower")?.let { return it }
++        }
++        throw IllegalArgumentException("unknown move: $name")
++    }
++
++    /**
++     * Make [text] Gen 3-encodable: straight ASCII quotes become the charset's
++     * curly forms, anything else unencodable is dropped.
++     */
++    private fun sanitizeText(text: String): String {
++        val sb = StringBuilder(text.length)
++        for (c in text) {
++            val mapped = when (c) {
++                '\'' -> '’'
++                '"' -> '”'
++                else -> c
++            }
++            if (Gen3Text.canEncode(mapped)) {
++                sb.append(mapped)
++            }
++        }
++        return sb.toString()
++    }
++
++    // -- stats ---------------------------------------------------------------
++
++    /**
++     * Gen 3 stat formula, integer division exactly as the game (and Python //):
++     *   HP     = (2*base + IV + EV/4) * level / 100 + level + 10   (Shedinja: 1)
++     *   others = ((2*base + IV + EV/4) * level / 100 + 5) * nature
++     * where the nature multiplier is *110/100 or *90/100 (integer division),
++     * with nature plus/minus indices 0=atk 1=def 2=speed 3=spatk 4=spdef.
++     * Arrays are in Gen 3 order: hp, atk, def, speed, spatk, spdef.
++     */
++    private fun computeStats(
++        species: Gen3Data.Species,
++        level: Int,
++        ivs: IntArray,
++        evs: IntArray,
++        nature: Gen3Data.Nature
++    ): IntArray {
++        val out = IntArray(6)
++        out[0] = if (species.name == "shedinja") {
++            1
++        } else {
++            (2 * species.baseStats[0] + ivs[0] + evs[0] / 4) * level / 100 + level + 10
++        }
++        for (i in 1..5) {
++            var v = (2 * species.baseStats[i] + ivs[i] + evs[i] / 4) * level / 100 + 5
++            val statIndex = i - 1  // nature indices skip HP
++            if (nature.plus == statIndex && nature.minus != statIndex) {
++                v = v * 110 / 100
++            } else if (nature.minus == statIndex && nature.plus != statIndex) {
++                v = v * 90 / 100
++            }
++            out[i] = v
++        }
++        return out
++    }
++
++    // -- PID selection -------------------------------------------------------
++
++    private fun isShinyPid(pid: Int, trainerId: Int): Boolean {
++        val tid = trainerId and 0xFFFF
++        val sid = (trainerId ushr 16) and 0xFFFF
++        val pidLow = pid and 0xFFFF
++        val pidHigh = (pid ushr 16) and 0xFFFF
++        return (tid xor sid xor pidHigh xor pidLow) < SHINY_THRESHOLD
++    }
++
++    private fun genderOk(pidLowByte: Int, genderRatio: Int, wantedGender: Char?): Boolean {
++        if (genderRatio == RATIO_GENDERLESS ||
++            genderRatio == RATIO_ALWAYS_FEMALE ||
++            genderRatio == RATIO_ALWAYS_MALE
++        ) {
++            // Gender is fixed by the species regardless of PID.
++            return true
++        }
++        return when (wantedGender) {
++            'F' -> pidLowByte < genderRatio   // female iff (PID & 0xFF) < ratio
++            'M' -> pidLowByte >= genderRatio
++            else -> true
++        }
++    }
++
++    /**
++     * Deterministic PID search. For shiny requests: enumerate the low u16
++     * (parity = ability slot, low byte satisfying gender), derive the eight
++     * shiny high u16 values, and take the first PID with the right nature.
++     * Non-shiny (or shiny-unsatisfiable, relaxed): start from the Python
++     * reference's nature-preserving base (0x12345678 rounded to the nature)
++     * and step by 25, which cycles the low u16 through every value, until
++     * parity + gender match and the PID is not accidentally shiny.
++     */
++    private fun choosePid(
++        natureId: Int,
++        abilitySlot: Int,
++        genderRatio: Int,
++        wantedGender: Char?,
++        shiny: Boolean,
++        trainerId: Int
++    ): Int {
++        val tid = trainerId and 0xFFFF
++        val sid = (trainerId ushr 16) and 0xFFFF
++
++        if (shiny) {
++            for (low in 0..0xFFFF) {
++                if ((low and 1) != abilitySlot) {
++                    continue
++                }
++                if (!genderOk(low and 0xFF, genderRatio, wantedGender)) {
++                    continue
++                }
++                for (r in 0 until SHINY_THRESHOLD) {
++                    val high = (tid xor sid xor low xor r) and 0xFFFF
++                    val pid = (high shl 16) or low
++                    if (Gen3Mon.unsignedMod(pid, 25) == natureId) {
++                        return pid
++                    }
++                }
++            }
++            // No shiny PID satisfies nature+ability+gender: relax shiny.
++        }
++
++        // Nature-preserving scan (mirrors find_pid_for_nature's base). No
++        // overflow: base + 25 * 0x20000 stays far below 2^31.
++        val base = 0x12345678
++        var pid = base - (base % 25) + natureId
++        for (step in 0 until 0x20000) {
++            if ((pid and 1) == abilitySlot &&
++                genderOk(pid and 0xFF, genderRatio, wantedGender) &&
++                !isShinyPid(pid, trainerId)
++            ) {
++                return pid
++            }
++            pid += 25
++        }
++        // Unreachable: the low u16 cycles through all values (gcd(25, 2^16)=1),
++        // so parity+gender always hit, and shininess excludes at most 8/65536.
++        throw IllegalStateException("no PID satisfies the requested constraints")
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveNaming.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveNaming.kt
+new file mode 100644
+index 0000000..0f8f280
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveNaming.kt
+@@ -0,0 +1,50 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * Replicates Dolphin's HW::GBA::Core::GetSavePath (Source/Core/Core/HW/GBACore.cpp)
++ * for the SavesInRomPath=false case, so the Android side derives exactly the
++ * same .sav filename the core will open.
++ */
++object SaveNaming {
++    /**
++     * Kotlin equivalent of:
++     *
++     *   save_path = fmt::format("{}-{}.sav",
++     *       rom_path.substr(0, rom_path.find_last_of('.')), device_number + 1);
++     *   save_path = gba_saves_dir + save_path.substr(save_path.find_last_of("/\\") + 1);
++     *
++     * Byte-for-byte string behavior is preserved, including the C++ npos edge
++     * cases (no '.' -> whole string kept; no separator -> whole string is the
++     * filename) and the quirk that a '.' in a directory component of an
++     * extensionless path truncates there. content:// URIs are treated as
++     * opaque strings: percent-encodings such as %2F are NOT decoded, matching
++     * the C++ core's byte-level handling.
++     *
++     * @param gbaSavesDir the GBA saves directory (with or without a trailing
++     *        separator; C++ File::GetUserPath returns it with one)
++     * @param romPath the ROM path/URI as passed to the core
++     * @param deviceNumber 0-based GBA device number (player index)
++     */
++    fun deriveSavePath(gbaSavesDir: String, romPath: String, deviceNumber: Int): String {
++        // rom_path.substr(0, rom_path.find_last_of('.')): with no '.',
++        // find_last_of returns npos and substr keeps the whole string.
++        val dot = romPath.lastIndexOf('.')
++        val stem = if (dot >= 0) romPath.substring(0, dot) else romPath
++        val savePath = stem + "-" + (deviceNumber + 1) + ".sav"
++
++        // save_path.substr(save_path.find_last_of("/\\") + 1): with no
++        // separator, npos + 1 wraps to 0 and the whole string is kept —
++        // lastIndexOf's -1 + 1 = 0 matches that exactly.
++        val sep = maxOf(savePath.lastIndexOf('/'), savePath.lastIndexOf('\\'))
++        val fileName = savePath.substring(sep + 1)
++
++        val dir = if (gbaSavesDir.endsWith("/") || gbaSavesDir.endsWith("\\")) {
++            gbaSavesDir
++        } else {
++            gbaSavesDir + "/"
++        }
++        return dir + fileName
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/ShowdownParser.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/ShowdownParser.kt
+new file mode 100644
+index 0000000..4121c4c
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/ShowdownParser.kt
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++/**
++ * One parsed set from a Pokemon Showdown team export.
++ *
++ * EV/IV arrays use Showdown's writing order: hp, atk, def, spa, spd, spe.
++ * (Note this differs from the Gen 3 save order hp/atk/def/speed/spatk/spdef;
++ * MonFactory remaps.)
++ */
++data class ShowdownSet(
++    val species: String,
++    val nickname: String? = null,
++    val gender: Char? = null,   // 'M' / 'F' from a "(M)"/"(F)" marker, if any
++    val item: String? = null,
++    val ability: String? = null,
++    val level: Int = 100,
++    val shiny: Boolean = false,
++    val nature: String? = null,
++    val evs: IntArray = IntArray(6),          // hp, atk, def, spa, spd, spe
++    val ivs: IntArray = IntArray(6) { 31 },   // hp, atk, def, spa, spd, spe
++    val moves: List<String> = emptyList()     // max 4
++)
++
++/**
++ * Parser for Showdown team-export text. Sets are separated by blank lines;
++ * lines that are not recognized (e.g. "Happiness:", "Tera Type:") are
++ * ignored gracefully.
++ */
++object ShowdownParser {
++    private const val MAX_MOVES = 4
++
++    // Showdown stat tokens -> index in the hp/atk/def/spa/spd/spe arrays.
++    private val STAT_INDEX = mapOf(
++        "hp" to 0,
++        "atk" to 1, "attack" to 1,
++        "def" to 2, "defense" to 2,
++        "spa" to 3, "spatk" to 3, "spatt" to 3, "spattack" to 3,
++        "spd" to 4, "spdef" to 4, "spdefense" to 4,
++        "spe" to 5, "speed" to 5
++    )
++
++    /** Parse a full export possibly containing multiple blank-line-separated sets. */
++    fun parseTeam(text: String): List<ShowdownSet> {
++        val sets = ArrayList<ShowdownSet>()
++        val block = ArrayList<String>()
++        for (rawLine in text.lines()) {
++            val line = rawLine.trimEnd('\r').trim()
++            if (line.isEmpty()) {
++                parseSet(block)?.let { sets.add(it) }
++                block.clear()
++            } else if (!line.startsWith("===")) {
++                // "=== [gen3ou] Team Name ===" headers from full exports are skipped.
++                block.add(line)
++            }
++        }
++        parseSet(block)?.let { sets.add(it) }
++        return sets
++    }
++
++    /** Parse one set from its (trimmed, non-blank) lines. Returns null if empty. */
++    fun parseSet(lines: List<String>): ShowdownSet? {
++        if (lines.isEmpty()) {
++            return null
++        }
++
++        // ---- header line: "Nickname (Species) (G) @ Item" with every part
++        // except the species optional.
++        var header = lines[0]
++        var item: String? = null
++        val atIdx = header.lastIndexOf(" @ ")
++        if (atIdx >= 0) {
++            item = header.substring(atIdx + 3).trim().ifEmpty { null }
++            header = header.substring(0, atIdx).trim()
++        }
++
++        var gender: Char? = null
++        if (header.endsWith("(M)")) {
++            gender = 'M'
++            header = header.dropLast(3).trim()
++        } else if (header.endsWith("(F)")) {
++            gender = 'F'
++            header = header.dropLast(3).trim()
++        }
++
++        var nickname: String? = null
++        var speciesName = header
++        if (header.endsWith(")")) {
++            val open = header.lastIndexOf('(')
++            if (open > 0) {
++                speciesName = header.substring(open + 1, header.length - 1).trim()
++                nickname = header.substring(0, open).trim().ifEmpty { null }
++            }
++        }
++        if (speciesName.isEmpty()) {
++            return null
++        }
++
++        // ---- body lines
++        var ability: String? = null
++        var level = 100
++        var shiny = false
++        var nature: String? = null
++        val evs = IntArray(6)
++        val ivs = IntArray(6) { 31 }
++        val moves = ArrayList<String>()
++
++        for (i in 1 until lines.size) {
++            val line = lines[i]
++            when {
++                line.startsWith("Ability:") -> {
++                    ability = line.substring("Ability:".length).trim().ifEmpty { null }
++                }
++                line.startsWith("Level:") -> {
++                    val n = line.substring("Level:".length).trim().toIntOrNull()
++                    if (n != null) {
++                        level = n
++                    }
++                }
++                line.startsWith("Shiny:") -> {
++                    shiny = line.substring("Shiny:".length).trim()
++                        .equals("Yes", ignoreCase = true)
++                }
++                line.startsWith("EVs:") -> {
++                    parseStatList(line.substring("EVs:".length), evs)
++                }
++                line.startsWith("IVs:") -> {
++                    parseStatList(line.substring("IVs:".length), ivs)
++                }
++                line.startsWith("-") -> {
++                    if (moves.size < MAX_MOVES) {
++                        val move = line.substring(1).trim()
++                        if (move.isNotEmpty()) {
++                            moves.add(move)
++                        }
++                    }
++                }
++                line.endsWith(" Nature") -> {
++                    val n = line.removeSuffix(" Nature").trim()
++                    if (n.isNotEmpty()) {
++                        nature = n
++                    }
++                }
++                // Anything else ("Happiness:", "Tera Type:", ...) is ignored.
++            }
++        }
++
++        return ShowdownSet(
++            species = speciesName,
++            nickname = nickname,
++            gender = gender,
++            item = item,
++            ability = ability,
++            level = level,
++            shiny = shiny,
++            nature = nature,
++            evs = evs,
++            ivs = ivs,
++            moves = moves
++        )
++    }
++
++    /** Parse "252 Atk / 4 Def / 252 Spe" into [out]; unknown tokens ignored. */
++    private fun parseStatList(text: String, out: IntArray) {
++        for (part in text.split("/")) {
++            val tokens = part.trim().split(Regex("\\s+"))
++            if (tokens.size < 2) {
++                continue
++            }
++            val value = tokens[0].toIntOrNull() ?: continue
++            val index = STAT_INDEX[tokens[1].lowercase()] ?: continue
++            out[index] = value
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index e539e80..7a0759d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -8,56 +8,134 @@ import android.os.Bundle
+ import androidx.activity.compose.setContent
+ import androidx.activity.enableEdgeToEdge
+ import androidx.appcompat.app.AppCompatActivity
+-import androidx.compose.foundation.layout.Column
+-import androidx.compose.foundation.layout.Spacer
+-import androidx.compose.foundation.layout.fillMaxSize
+-import androidx.compose.foundation.layout.height
+-import androidx.compose.foundation.layout.padding
+-import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Scaffold
+-import androidx.compose.material3.Text
+-import androidx.compose.ui.Alignment
+-import androidx.compose.ui.Modifier
+-import androidx.compose.ui.unit.dp
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import androidx.core.content.FileProvider
++import androidx.lifecycle.lifecycleScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Data
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.MonFactory
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveNaming
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.ShowdownParser
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
+ import org.dolphinemu.dolphinemu.utils.ThemeHelper
++import org.json.JSONObject
++import java.io.File
++import java.net.URL
+ 
+ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+     override var themeId: Int = 0
+ 
++    private lateinit var repo: TeamRepo
++    private var uiState by mutableStateOf(TeamEditorState())
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         ThemeHelper.setTheme(this)
+         enableEdgeToEdge()
+         super.onCreate(savedInstanceState)
+ 
++        repo = TeamRepo(this)
++        reload(TeamRole.HOST)
++
+         setContent {
+             DolphinTheme {
+-                Scaffold { padding ->
+-                    Column(
+-                        modifier = Modifier
+-                            .fillMaxSize()
+-                            .padding(padding)
+-                            .padding(24.dp),
+-                        horizontalAlignment = Alignment.CenterHorizontally
+-                    ) {
+-                        Spacer(Modifier.height(32.dp))
+-                        Text(
+-                            text = "Team Editor",
+-                            style = MaterialTheme.typography.headlineMedium
+-                        )
+-                        Spacer(Modifier.height(12.dp))
+-                        Text(
+-                            text = "Build your team from Showdown sets and write it " +
+-                                "straight into your Emerald save. Coming in the next build.",
+-                            style = MaterialTheme.typography.bodyLarge
+-                        )
+-                    }
+-                }
++                TeamEditorScreen(
++                    state = uiState,
++                    names = if (uiState.ready) repo.displayNames() else null,
++                    onRoleChange = { reload(it) },
++                    onSelect = { uiState = uiState.copy(selected = it) },
++                    onImport = { importShowdown(it) },
++                    onRemoveSelected = { removeSelected() },
++                    onSave = { saveTeam() },
++                    onShare = { shareSave() },
++                    onBack = { finish() }
++                )
+             }
+         }
+     }
+ 
++    private fun reload(role: TeamRole) {
++        uiState = try {
++            val loaded = repo.load(role)
++            TeamEditorState(
++                role = role,
++                ready = true,
++                trainer = loaded.trainerLabel,
++                party = loaded.party,
++                messages = loaded.messages
++            )
++        } catch (e: Exception) {
++            TeamEditorState(
++                role = role,
++                ready = false,
++                messages = listOf("Could not open a save: ${e.message ?: "unknown error"}")
++            )
++        }
++    }
++
++    private fun importShowdown(text: String) {
++        val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+")
++            .find(text.trim())?.value
++        if (pokepaste == null) {
++            applyImport(repo.importShowdown(text))
++            return
++        }
++        uiState = uiState.copy(messages = listOf("Fetching $pokepaste…"))
++        lifecycleScope.launch(Dispatchers.IO) {
++            val result = try {
++                repo.importShowdown(URL("$pokepaste/raw").readText())
++            } catch (e: Exception) {
++                listOf("Could not fetch paste: ${e.message ?: "network error"}")
++            }
++            withContext(Dispatchers.Main) { applyImport(result) }
++        }
++    }
++
++    private fun applyImport(result: List<String>) {
++        uiState = uiState.copy(
++            party = repo.party.toList(),
++            dirty = true,
++            selected = 0,
++            messages = result
++        )
++    }
++
++    private fun removeSelected() {
++        repo.removeAt(uiState.selected)
++        uiState = uiState.copy(
++            party = repo.party.toList(),
++            dirty = true,
++            selected = 0,
++            messages = listOf("Removed from party")
++        )
++    }
++
++    private fun saveTeam() {
++        val messages = repo.saveToDisk()
++        uiState = uiState.copy(dirty = false, messages = messages)
++    }
++
++    private fun shareSave() {
++        val uri = repo.shareUri() ?: run {
++            uiState = uiState.copy(messages = listOf("Save the team first, then share"))
++            return
++        }
++        val send = Intent(Intent.ACTION_SEND).apply {
++            type = "application/octet-stream"
++            putExtra(Intent.EXTRA_STREAM, uri)
++            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
++        }
++        startActivity(Intent.createChooser(send, "Send team save to the host"))
++    }
++
+     companion object {
+         @JvmStatic
+         fun launch(context: Context) {
+@@ -65,3 +143,170 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ }
++
++enum class TeamRole(val deviceNumber: Int, val label: String, val templateAsset: String) {
++    HOST(1, "Host (GBA 2)", "xdnetplay/EMERALD-2.sav"),
++    GUEST(2, "Guest (GBA 3)", "xdnetplay/EMERALD-3.sav")
++}
++
++data class TeamEditorState(
++    val role: TeamRole = TeamRole.HOST,
++    val ready: Boolean = false,
++    val trainer: String = "",
++    val party: List<Gen3Mon> = emptyList(),
++    val selected: Int = 0,
++    val dirty: Boolean = false,
++    val messages: List<String> = emptyList()
++)
++
++/** Loads, edits, verifies, and writes the Emerald save Dolphin uses for netplay. */
++class TeamRepo(private val context: Context) {
++    data class Loaded(val trainerLabel: String, val party: List<Gen3Mon>, val messages: List<String>)
++
++    private val data: Gen3Data by lazy { Gen3Data.load(context) }
++    private val names: DisplayNames by lazy { DisplayNames.load(context) }
++
++    private var save: EmeraldSave? = null
++    private var savePath: File? = null
++    var party: MutableList<Gen3Mon> = mutableListOf()
++        private set
++
++    private fun romPath(role: TeamRole): String? {
++        val preferred = when (role) {
++            TeamRole.HOST -> StringSetting.MAIN_GBA_ROM_2.string
++            TeamRole.GUEST -> StringSetting.MAIN_GBA_ROM_3.string
++        }
++        val fallback = when (role) {
++            TeamRole.HOST -> StringSetting.MAIN_GBA_ROM_3.string
++            TeamRole.GUEST -> StringSetting.MAIN_GBA_ROM_2.string
++        }
++        return listOf(preferred, fallback).firstOrNull { it.isNotEmpty() }
++    }
++
++    fun load(role: TeamRole): Loaded {
++        val rom = romPath(role)
++            ?: throw IllegalStateException("no Emerald ROM configured (Settings → GBA)")
++        val savesDir = File(DirectoryInitialization.getUserDirectory(), "GBA" + File.separator + "Saves")
++        savesDir.mkdirs()
++        val path = File(SaveNaming.deriveSavePath(savesDir.path, rom, role.deviceNumber))
++        savePath = path
++
++        val messages = mutableListOf<String>()
++        val bytes = if (path.exists()) {
++            messages += "Loaded ${path.name}"
++            path.readBytes()
++        } else {
++            messages += "No save yet — starting from the bundled template"
++            context.assets.open(role.templateAsset).use { it.readBytes() }
++        }
++
++        val parsed = EmeraldSave(bytes)
++        val mismatches = parsed.verifyAllChecksums()
++        if (mismatches.isNotEmpty()) {
++            messages += "Warning: ${mismatches.size} section checksum(s) invalid in source save"
++        }
++        save = parsed
++        party = parsed.readParty().filter { !it.isEmpty() }.toMutableList()
++        return Loaded("${parsed.trainerName}  ·  ${path.name}", party.toList(), messages)
++    }
++
++    fun importShowdown(text: String): List<String> {
++        val s = save ?: return listOf("No save loaded")
++        val messages = mutableListOf<String>()
++        val sets = ShowdownParser.parseTeam(text)
++        if (sets.isEmpty()) return listOf("Nothing recognizable in that paste")
++
++        val built = mutableListOf<Gen3Mon>()
++        for (set in sets) {
++            if (built.size == 6) {
++                messages += "Skipped ${set.species}: party is full"
++                continue
++            }
++            try {
++                built += MonFactory.build(set, data, s.trainerName, s.trainerId)
++            } catch (e: Exception) {
++                messages += "Skipped ${set.species}: ${e.message ?: "could not build"}"
++            }
++        }
++        if (built.isNotEmpty()) {
++            party = built
++            messages.add(0, "Imported ${built.size} Pokémon (replaced party)")
++        }
++        return messages
++    }
++
++    fun removeAt(index: Int) {
++        if (index in party.indices) party.removeAt(index)
++    }
++
++    fun saveToDisk(): List<String> {
++        val s = save ?: return listOf("No save loaded")
++        val path = savePath ?: return listOf("No save path")
++        val messages = mutableListOf<String>()
++        return try {
++            s.writeParty(party)
++            val out = s.toBytes()
++
++            // Independent verification of our own output before it touches disk.
++            val reparsed = EmeraldSave(out)
++            val bad = reparsed.verifyAllChecksums()
++            check(bad.isEmpty()) { "output failed checksum verification: $bad" }
++            check(reparsed.readParty().filter { !it.isEmpty() }.size == party.size) {
++                "output party did not round-trip"
++            }
++
++            if (path.exists()) {
++                path.copyTo(File(path.path + ".bak"), overwrite = true)
++                messages += "Backed up previous save to ${path.name}.bak"
++            }
++            val tmp = File(path.path + ".tmp")
++            tmp.writeBytes(out)
++            check(tmp.renameTo(path)) { "could not replace ${path.name}" }
++            messages.add(0, "Saved ${party.size} Pokémon to ${path.name} ✓ verified")
++            messages
++        } catch (e: Exception) {
++            listOf("NOT saved — ${e.message ?: "verification failed"}")
++        }
++    }
++
++    fun shareUri() = savePath?.takeIf { it.exists() }?.let {
++        FileProvider.getUriForFile(context, context.packageName + ".xdshare", it)
++    }
++
++    fun displayNames() = names
++}
++
++/** Reverse id → display-name maps, read straight from the bundled data asset. */
++class DisplayNames private constructor(
++    val species: Map<Int, String>,
++    val items: Map<Int, String>,
++    val moves: Map<Int, String>
++) {
++    companion object {
++        fun load(context: Context): DisplayNames {
++            val root = JSONObject(
++                context.assets.open("xdnetplay/gen3data.json").bufferedReader().readText()
++            )
++            fun reverse(key: String, idField: String?): Map<Int, String> {
++                val obj = root.getJSONObject(key)
++                val out = HashMap<Int, String>()
++                for (name in obj.keys()) {
++                    val id = if (idField == null) {
++                        obj.getInt(name)
++                    } else {
++                        obj.getJSONObject(name).getInt(idField)
++                    }
++                    if (!out.containsKey(id)) {
++                        out[id] = name.replaceFirstChar { it.uppercase() }
++                    }
++                }
++                return out
++            }
++            return DisplayNames(
++                species = reverse("species", "id"),
++                items = reverse("items", null),
++                moves = reverse("moves", null)
++            )
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+new file mode 100644
+index 0000000..2036903
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -0,0 +1,344 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.CircleShape
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Button
++import androidx.compose.material3.ButtonDefaults
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.OutlinedTextFieldDefaults
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
++
++@Composable
++fun TeamEditorScreen(
++    state: TeamEditorState,
++    names: DisplayNames?,
++    onRoleChange: (TeamRole) -> Unit,
++    onSelect: (Int) -> Unit,
++    onImport: (String) -> Unit,
++    onRemoveSelected: () -> Unit,
++    onSave: () -> Unit,
++    onShare: () -> Unit,
++    onBack: () -> Unit
++) {
++    var showImport by remember { mutableStateOf(false) }
++
++    SeaBackground {
++        Column(
++            modifier = Modifier
++                .fillMaxSize()
++                .verticalScroll(rememberScrollState())
++                .padding(16.dp)
++        ) {
++            // Title bar
++            SeaPanel(title = null) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text("XD NETPLAY", color = XDColors.TextAccent, fontWeight = FontWeight.Bold)
++                    Text("  ✦  ", color = XDColors.TextDim)
++                    Text("Team Editor", color = XDColors.TextPrimary)
++                    Spacer(Modifier.weight(1f))
++                    TextButton(onClick = onBack) { Text("Back", color = XDColors.TextDim) }
++                }
++            }
++            Spacer(Modifier.height(12.dp))
++
++            // Role selector
++            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
++                TeamRole.entries.forEach { role ->
++                    val selected = role == state.role
++                    Text(
++                        text = role.label,
++                        color = if (selected) XDColors.ChipText else XDColors.TextDim,
++                        fontSize = 13.sp,
++                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal,
++                        modifier = Modifier
++                            .background(
++                                if (selected) XDColors.Accent else XDColors.Panel,
++                                RoundedCornerShape(16.dp)
++                            )
++                            .border(1.dp, XDColors.PanelLight, RoundedCornerShape(16.dp))
++                            .clickable { onRoleChange(role) }
++                            .padding(horizontal = 14.dp, vertical = 6.dp)
++                    )
++                }
++            }
++            Spacer(Modifier.height(14.dp))
++
++            if (!state.ready) {
++                SeaPanel(title = "SETUP NEEDED") {
++                    state.messages.forEach { Text(it, color = XDColors.TextPrimary) }
++                    Text(
++                        "Set your Emerald ROM in Settings → GBA, then come back.",
++                        color = XDColors.TextDim
++                    )
++                }
++                return@Column
++            }
++
++            // Party panel
++            SeaPanel(title = "PARTY — ${state.trainer}") {
++                if (state.party.isEmpty()) {
++                    Text(
++                        "No Pokémon yet. Import a Showdown team or a pokepast.es link.",
++                        color = XDColors.TextDim
++                    )
++                }
++                state.party.forEachIndexed { i, mon ->
++                    MonRow(
++                        mon = mon,
++                        names = names,
++                        selected = i == state.selected,
++                        onClick = { onSelect(i) }
++                    )
++                }
++            }
++            Spacer(Modifier.height(14.dp))
++
++            // Detail panel
++            state.party.getOrNull(state.selected)?.let { mon ->
++                SeaPanel(title = "DETAIL") {
++                    MonDetail(mon = mon, names = names, onRemove = onRemoveSelected)
++                }
++                Spacer(Modifier.height(14.dp))
++            }
++
++            // Actions
++            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++                Button(
++                    onClick = { showImport = true },
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.Accent,
++                        contentColor = XDColors.ChipText
++                    ),
++                    modifier = Modifier.weight(1f)
++                ) { Text("Import") }
++                Button(
++                    onClick = onSave,
++                    enabled = state.dirty,
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.PanelLight,
++                        contentColor = XDColors.ChipText
++                    ),
++                    modifier = Modifier.weight(1f)
++                ) { Text(if (state.dirty) "Save •" else "Saved") }
++                Button(
++                    onClick = onShare,
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.PanelLight,
++                        contentColor = XDColors.ChipText
++                    ),
++                    modifier = Modifier.weight(1f)
++                ) { Text("Share") }
++            }
++            Spacer(Modifier.height(12.dp))
++
++            // Status / diagnostics — always honest, always visible
++            if (state.messages.isNotEmpty()) {
++                SeaPanel(title = "STATUS") {
++                    state.messages.forEach {
++                        val warn = it.startsWith("NOT") || it.startsWith("Warning") ||
++                            it.startsWith("Skipped") || it.startsWith("Could not")
++                        Text(
++                            text = it,
++                            color = if (warn) XDColors.Accent else XDColors.TextDim,
++                            fontSize = 13.sp
++                        )
++                    }
++                }
++            }
++        }
++    }
++
++    if (showImport) {
++        ImportDialog(
++            onDismiss = { showImport = false },
++            onImport = {
++                showImport = false
++                onImport(it)
++            }
++        )
++    }
++}
++
++@Composable
++private fun MonRow(mon: Gen3Mon, names: DisplayNames?, selected: Boolean, onClick: () -> Unit) {
++    val speciesName = names?.species?.get(mon.species) ?: "#${mon.species}"
++    val itemName = if (mon.heldItem == 0) "—" else names?.items?.get(mon.heldItem) ?: "#${mon.heldItem}"
++    val shiny = isShiny(mon)
++    Row(
++        verticalAlignment = Alignment.CenterVertically,
++        modifier = Modifier
++            .fillMaxWidth()
++            .background(
++                if (selected) XDColors.PanelLight.copy(alpha = 0.75f) else Color.Transparent,
++                RoundedCornerShape(10.dp)
++            )
++            .clickable(onClick = onClick)
++            .padding(horizontal = 8.dp, vertical = 6.dp)
++    ) {
++        // Monogram slot, pastel-tinted by species — gold-ringed and starred when shiny
++        Box(
++            contentAlignment = Alignment.Center,
++            modifier = Modifier
++                .size(40.dp)
++                .background(XDColors.pastelFor(mon.species), CircleShape)
++                .border(
++                    width = if (shiny) 2.dp else 1.dp,
++                    color = if (shiny) XDColors.Shiny else Color.White,
++                    shape = CircleShape
++                )
++        ) {
++            Text(
++                text = speciesName.take(1).uppercase(),
++                color = XDColors.ChipText,
++                fontWeight = FontWeight.Bold
++            )
++        }
++        Spacer(Modifier.width(12.dp))
++        Column(Modifier.weight(1f)) {
++            Row(verticalAlignment = Alignment.CenterVertically) {
++                Text(
++                    text = mon.nickname.ifEmpty { speciesName },
++                    color = if (selected) XDColors.TextAccent else XDColors.TextPrimary,
++                    fontWeight = FontWeight.SemiBold
++                )
++                if (shiny) Text("  ★", color = XDColors.Shiny)
++            }
++            Text(
++                text = "$speciesName · ${mon.natureName}",
++                color = XDColors.TextDim,
++                fontSize = 12.sp
++            )
++        }
++        Column(horizontalAlignment = Alignment.End) {
++            Text("Lv ${mon.level}", color = XDColors.TextPrimary, fontSize = 13.sp)
++            Text(itemName, color = XDColors.TextDim, fontSize = 12.sp)
++        }
++    }
++}
++
++@Composable
++private fun MonDetail(mon: Gen3Mon, names: DisplayNames?, onRemove: () -> Unit) {
++    val ivs = mon.ivs()
++    val evTotal = mon.evs.sum()
++    StatBlock(
++        labels = listOf("HP", "ATK", "DEF", "SPE", "SPA", "SPD"),
++        stats = listOf(mon.maxHp, mon.attack, mon.defense, mon.speed, mon.spAttack, mon.spDefense),
++        evs = listOf(mon.evs[0], mon.evs[1], mon.evs[2], mon.evs[3], mon.evs[4], mon.evs[5]),
++        ivs = listOf(ivs[0], ivs[1], ivs[2], ivs[3], ivs[4], ivs[5])
++    )
++    Spacer(Modifier.height(6.dp))
++    Text(
++        text = "EV total $evTotal / 510",
++        color = if (evTotal > 510) XDColors.Accent else XDColors.TextDim,
++        fontSize = 12.sp
++    )
++    Spacer(Modifier.height(8.dp))
++    Text("MOVES", color = XDColors.TextAccent, fontSize = 12.sp, fontWeight = FontWeight.Bold)
++    mon.moves.filter { it != 0 }.forEach { moveId ->
++        Text(
++            text = "· " + (names?.moves?.get(moveId) ?: "#$moveId"),
++            color = XDColors.TextPrimary,
++            fontSize = 14.sp
++        )
++    }
++    Spacer(Modifier.height(8.dp))
++    TextButton(onClick = onRemove) { Text("Remove from party", color = XDColors.Accent) }
++}
++
++@Composable
++private fun StatBlock(labels: List<String>, stats: List<Int>, evs: List<Int>, ivs: List<Int>) {
++    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
++        labels.forEachIndexed { i, label ->
++            Column(horizontalAlignment = Alignment.CenterHorizontally) {
++                Text(label, color = XDColors.TextAccent, fontSize = 11.sp, fontWeight = FontWeight.Bold)
++                Text("${stats[i]}", color = XDColors.TextPrimary, fontSize = 15.sp)
++                Text("${evs[i]}", color = XDColors.TextDim, fontSize = 10.sp)
++                Text("${ivs[i]}", color = XDColors.PanelLight, fontSize = 10.sp)
++            }
++        }
++    }
++    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
++        Text("stat / EV / IV", color = XDColors.TextDim, fontSize = 9.sp)
++    }
++}
++
++@Composable
++private fun ImportDialog(onDismiss: () -> Unit, onImport: (String) -> Unit) {
++    var text by remember { mutableStateOf("") }
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        containerColor = Color(0xFF183454),
++        title = { Text("Import team", color = XDColors.TextPrimary) },
++        text = {
++            Column {
++                Text(
++                    "Paste a Showdown team export or a pokepast.es link.",
++                    color = XDColors.TextDim,
++                    fontSize = 13.sp
++                )
++                Spacer(Modifier.height(8.dp))
++                OutlinedTextField(
++                    value = text,
++                    onValueChange = { text = it },
++                    minLines = 6,
++                    maxLines = 10,
++                    colors = OutlinedTextFieldDefaults.colors(
++                        focusedTextColor = XDColors.TextPrimary,
++                        unfocusedTextColor = XDColors.TextPrimary,
++                        focusedBorderColor = XDColors.Accent,
++                        unfocusedBorderColor = XDColors.PanelLight
++                    ),
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++        },
++        confirmButton = {
++            TextButton(onClick = { onImport(text) }, enabled = text.isNotBlank()) {
++                Text("Import", color = XDColors.Accent)
++            }
++        },
++        dismissButton = {
++            TextButton(onClick = onDismiss) { Text("Cancel", color = XDColors.TextDim) }
++        }
++    )
++}
++
++private fun isShiny(mon: Gen3Mon): Boolean {
++    val tid = mon.otId and 0xFFFF
++    val sid = (mon.otId ushr 16) and 0xFFFF
++    val pHi = (mon.pid ushr 16) and 0xFFFF
++    val pLo = mon.pid and 0xFFFF
++    return (tid xor sid xor pHi xor pLo) < 8
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDTheme.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDTheme.kt
+new file mode 100644
+index 0000000..b21ce16
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDTheme.kt
+@@ -0,0 +1,92 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.ColumnScope
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.offset
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.graphics.Brush
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++
++/**
++ * The Pokémon Box "Sea" design language, carried over from PokéBridge:
++ * blue-family palette, floating navy panels with title chips, and a single
++ * yellow accent reserved for selection, headings, warnings, and shiny.
++ */
++object XDColors {
++    val BgTop = Color(0xFF4488CC)
++    val BgBottom = Color(0xFF1E4D7B)
++    val Panel = Color(0xEB183454)
++    val PanelLight = Color(0xFF6FA3D1)
++    val Accent = Color(0xFFF4D858)
++    val TextPrimary = Color(0xFFFFFFFF)
++    val TextDim = Color(0xFFC8DDF5)
++    val TextAccent = Color(0xFFFFE872)
++    val Shiny = Color(0xFFFFD800)
++    val ChipText = Color(0xFF183454)
++
++    private val pastels = listOf(
++        Color(0xFF6FA3D1), Color(0xFFE56B6F), Color(0xFF88BB66), Color(0xFF77CCEE),
++        Color(0xFFFFD86B), Color(0xFFBB99DD), Color(0xFFCCBB99), Color(0xFFAA8855)
++    )
++
++    fun pastelFor(species: Int): Color = pastels[species.mod(pastels.size)]
++}
++
++@Composable
++fun SeaBackground(content: @Composable () -> Unit) {
++    Box(
++        modifier = Modifier
++            .fillMaxSize()
++            .background(Brush.verticalGradient(listOf(XDColors.BgTop, XDColors.BgBottom)))
++    ) {
++        content()
++    }
++}
++
++@Composable
++fun SeaPanel(
++    title: String?,
++    modifier: Modifier = Modifier,
++    content: @Composable ColumnScope.() -> Unit
++) {
++    Box(modifier = modifier.padding(top = if (title != null) 10.dp else 0.dp)) {
++        Column(
++            modifier = Modifier
++                .fillMaxWidth()
++                .background(XDColors.Panel, RoundedCornerShape(12.dp))
++                .border(1.dp, XDColors.PanelLight, RoundedCornerShape(12.dp))
++                .padding(start = 14.dp, end = 14.dp, top = if (title != null) 18.dp else 12.dp, bottom = 12.dp),
++            content = content
++        )
++        if (title != null) {
++            Text(
++                text = title.uppercase(),
++                color = XDColors.ChipText,
++                fontSize = 12.sp,
++                fontWeight = FontWeight.Bold,
++                textAlign = TextAlign.Center,
++                modifier = Modifier
++                    .align(Alignment.TopStart)
++                    .offset(x = 16.dp, y = (-10).dp)
++                    .background(XDColors.PanelLight, RoundedCornerShape(8.dp))
++                    .padding(horizontal = 10.dp, vertical = 3.dp)
++            )
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/res/xml/xd_share_paths.xml b/Source/Android/app/src/main/res/xml/xd_share_paths.xml
+new file mode 100644
+index 0000000..60920d7
+--- /dev/null
++++ b/Source/Android/app/src/main/res/xml/xd_share_paths.xml
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="utf-8"?>
++<paths>
++    <external-files-path name="user" path="." />
++    <files-path name="internal" path="." />
++</paths>
+-- 
+2.39.5 (Apple Git-154)
+
