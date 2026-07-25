@@ -1,7 +1,7 @@
 From 935b5fb085a499f928077385d98c52cae56685cd Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:28:44 -0700
-Subject: [PATCH 12/20] Android: show team-save install state in the launcher
+Subject: [PATCH 12/22] Android: show team-save install state in the launcher
  checklist
 
 XD refuses fresh GBA saves with an in-game 'save must be progressed'

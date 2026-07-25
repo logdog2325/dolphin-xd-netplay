@@ -1,7 +1,7 @@
 From e2e8b61a417c5a9117ca1db687a7dc7bd9508ed2 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:13:12 -0700
-Subject: [PATCH 10/20] Android: name the app XD Netplay
+Subject: [PATCH 10/22] Android: name the app XD Netplay
 
 ---
  Source/Android/app/build.gradle.kts | 4 ++--

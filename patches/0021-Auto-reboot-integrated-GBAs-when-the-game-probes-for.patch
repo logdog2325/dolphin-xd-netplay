@@ -1,0 +1,74 @@
+From 1422b4e19581c4fa21323a4ba164358fdc43c7e1 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 19:55:20 -0700
+Subject: [PATCH 21/22] Auto-reboot integrated GBAs when the game probes for
+ joybus
+
+Colosseum/XD detect a GBA only during the official BIOS's boot
+handshake, which is why desktop users must reset the GBA window at the
+connection screen. When a GC game probes a GBA port whose core never
+entered joybus mode, reset the core (10s cooldown) so detection works
+with no manual step. Local sessions only; netplay keeps explicit
+control.
+---
+ Source/Core/Core/HW/GBACore.h              |  1 +
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 18 ++++++++++++++++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  1 +
+ 3 files changed, 20 insertions(+)
+
+diff --git a/Source/Core/Core/HW/GBACore.h b/Source/Core/Core/HW/GBACore.h
+index 6b1934f..48372f1 100644
+--- a/Source/Core/Core/HW/GBACore.h
++++ b/Source/Core/Core/HW/GBACore.h
+@@ -74,6 +74,7 @@ public:
+   void Stop();
+   void Reset();
+   bool IsStarted() const;
++  bool IsLinkEnabled() const { return m_link_enabled; }
+   CoreInfo GetCoreInfo() const;
+ 
+   void SetHost(std::weak_ptr<GBAHostInterface> host);
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 3d5c196..ca51ddc 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -61,6 +61,24 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ #endif
+     m_last_cmd = static_cast<EBufferCommands>(buffer[0]);
+     m_timestamp_sent = m_system.GetCoreTiming().GetTicks();
++
++    // Colosseum/XD only detect a GBA during the official BIOS's joybus boot
++    // window (the desktop workflow is "reset the GBA at the connection
++    // screen"). When the game probes this port while the core never entered
++    // joybus mode, reboot the core so the BIOS handshake can happen without
++    // any manual ritual. Driven purely by emulated state, so netplay-safe.
++    if ((m_last_cmd == EBufferCommands::CMD_RESET ||
++         m_last_cmd == EBufferCommands::CMD_STATUS) &&
++        !m_core->IsLinkEnabled() && !NetPlay::IsNetPlayRunning())
++    {
++      const u64 cooldown =
++          static_cast<u64>(m_system.GetSystemTimers().GetTicksPerSecond()) * 10;
++      if (m_last_auto_reset == 0 || m_timestamp_sent - m_last_auto_reset > cooldown)
++      {
++        m_core->Reset();
++        m_last_auto_reset = m_timestamp_sent;
++      }
++    }
+     m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
+ 
+     auto& si = m_system.GetSerialInterface();
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 89a8473..96578c9 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -43,6 +43,7 @@ private:
+   NextAction m_next_action = NextAction::SendCommand;
+   EBufferCommands m_last_cmd{};
+   u64 m_timestamp_sent = 0;
++  u64 m_last_auto_reset = 0;
+   u16 m_keys = 0;
+ 
+   std::shared_ptr<HW::GBA::Core> m_core;
+-- 
+2.39.5 (Apple Git-154)
+

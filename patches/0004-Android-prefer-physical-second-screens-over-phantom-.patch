@@ -1,7 +1,7 @@
 From 81989a7e03854e7a79a6dcc4594fb15c6dcc3638 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:19:20 -0700
-Subject: [PATCH 04/20] Android: prefer physical second screens over phantom
+Subject: [PATCH 04/22] Android: prefer physical second screens over phantom
  displays
 
 Some handheld firmware (AYN Odin 2 / Thor) exposes a virtual
