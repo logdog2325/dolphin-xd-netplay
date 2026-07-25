@@ -1,7 +1,7 @@
 From 944b7775e2458b2a4f34172f0bad4bb7afdde76d Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 23:33:33 -0700
-Subject: [PATCH 25/25] Android: import Emerald ROM to a real file path (fixes
+Subject: [PATCH 25/26] Android: import Emerald ROM to a real file path (fixes
  GBA not loading)
 
 The launcher stored the picked ROM as a content:// URI, but mGBA
