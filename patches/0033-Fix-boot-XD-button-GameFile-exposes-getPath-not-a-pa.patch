@@ -1,0 +1,26 @@
+From 3edb4b3793633cb42c5675b85811b562263aa886 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 09:34:22 -0700
+Subject: [PATCH 33/33] Fix boot-XD button: GameFile exposes getPath(), not a
+ path property
+
+---
+ .../dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt      | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 62506b4..6b2c1e5 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -189,7 +189,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private fun bootXd() {
+         val xd = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID)
+         if (xd != null) {
+-            EmulationActivity.launch(this, xd.path, false)
++            EmulationActivity.launch(this, xd.getPath(), false)
+         } else {
+             statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
+         }
+-- 
+2.39.5 (Apple Git-154)
+

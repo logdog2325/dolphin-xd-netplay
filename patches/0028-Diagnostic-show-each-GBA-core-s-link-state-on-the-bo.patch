@@ -1,7 +1,7 @@
 From c0ba644baf556dbd67cded40a6e32cb74e5af023 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 02:37:11 -0700
-Subject: [PATCH 28/32] Diagnostic: show each GBA core's link state on the
+Subject: [PATCH 28/33] Diagnostic: show each GBA core's link state on the
  bottom screen
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

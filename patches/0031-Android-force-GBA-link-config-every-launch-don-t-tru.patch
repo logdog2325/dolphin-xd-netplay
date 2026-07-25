@@ -1,7 +1,7 @@
 From 1498eac5ac01f1d9058641e361acd609f4aaa90d Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 09:16:25 -0700
-Subject: [PATCH 31/32] Android: force GBA link config every launch (don't
+Subject: [PATCH 31/33] Android: force GBA link config every launch (don't
  trust settings persistence)
 
 The Dolphin settings for SIDevice1/2 and GBA Rom2/3 were observed

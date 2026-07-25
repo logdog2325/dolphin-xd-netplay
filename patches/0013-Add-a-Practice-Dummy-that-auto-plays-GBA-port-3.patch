@@ -1,7 +1,7 @@
 From 565593eebb4dc594655999b0b8a5b7ba9b019caf Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:48:51 -0700
-Subject: [PATCH 13/32] Add a Practice Dummy that auto-plays GBA port 3
+Subject: [PATCH 13/33] Add a Practice Dummy that auto-plays GBA port 3
 
 A toggle in GBA Link settings rhythmically presses A on the second
 integrated GBA when netplay is not running, so one player can run a

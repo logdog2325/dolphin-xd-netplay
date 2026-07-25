@@ -1,7 +1,7 @@
 From 1422b4e19581c4fa21323a4ba164358fdc43c7e1 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 19:55:20 -0700
-Subject: [PATCH 21/32] Auto-reboot integrated GBAs when the game probes for
+Subject: [PATCH 21/33] Auto-reboot integrated GBAs when the game probes for
  joybus
 
 Colosseum/XD detect a GBA only during the official BIOS's boot
