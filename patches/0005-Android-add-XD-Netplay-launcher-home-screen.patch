@@ -1,7 +1,7 @@
 From c1af000cfedcc11de55077a54072ee92f7bc1037 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:26:59 -0700
-Subject: [PATCH 05/34] Android: add XD Netplay launcher home screen
+Subject: [PATCH 05/35] Android: add XD Netplay launcher home screen
 
 New launcher entry point: readiness checklist (XD ISO in the game
 list, Emerald ROM configured, bundled BIOS/rules), buttons into the

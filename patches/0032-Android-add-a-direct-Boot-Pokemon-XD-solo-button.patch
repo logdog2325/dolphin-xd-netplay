@@ -1,7 +1,7 @@
 From a206622e2a24102c9cf7d044c9b36fe86c8e216f Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 09:24:27 -0700
-Subject: [PATCH 32/34] Android: add a direct 'Boot Pokemon XD (solo)' button
+Subject: [PATCH 32/35] Android: add a direct 'Boot Pokemon XD (solo)' button
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
