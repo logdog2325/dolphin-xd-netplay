@@ -1,0 +1,47 @@
+From d8bf45ad27737cf790428dc0f59695170cc4a697 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 15:19:15 -0700
+Subject: [PATCH 38/38] Android: solo enables BOTH GBA ports 2 and 3 (XD VS
+ mode needs two GBAs)
+
+XD's GBA-vs-GBA is a two-player battle and asks for a GBA on socket 2
+AND socket 3 (XD is the peer for both). The previous 'port 2 only'
+change left socket 3 empty, so after socket 2 linked (confirmed: Emerald
+booted, XD client 'Link standby' running) XD waited forever for socket
+3. Re-enable both; the user plays both sides locally by switching the
+visible GBA screen, like the desktop XDNetplay solo setup.
+---
+ .../features/xdnetplay/ui/XDLauncherActivity.kt    | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 62d1e5b..fc31279 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -298,16 +298,16 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (StringSetting.MAIN_GBA_ROM_3.string != romPath) {
+             StringSetting.MAIN_GBA_ROM_3.setString(NativeConfig.LAYER_BASE, romPath); changed = true
+         }
+-        // Port 2 (SIDevice1) = the local GBA, always on. Port 3 (SIDevice2) is
+-        // the opponent's GBA — only meaningful in a 2-player netplay session.
+-        // In solo it has no peer and would loop its own boot screen forever
+-        // (its auto-reset never links), stealing CPU, so leave it None here;
+-        // the netplay host flow enables it before a match.
++        // XD's GBA-vs-GBA mode is a two-player battle, so it wants a GBA on
++        // BOTH socket 2 (SIDevice1) and socket 3 (SIDevice2) — XD is the peer
++        // for both. Enable both; each links in turn (the not-yet-probed one
++        // just cycles its boot screen until XD asks for it). Solo = control
++        // both locally by switching the visible GBA screen.
+         if (IntSetting.MAIN_SI_DEVICE_1.int != 13) {
+             IntSetting.MAIN_SI_DEVICE_1.setInt(NativeConfig.LAYER_BASE, 13); changed = true
+         }
+-        if (IntSetting.MAIN_SI_DEVICE_2.int != 0) {
+-            IntSetting.MAIN_SI_DEVICE_2.setInt(NativeConfig.LAYER_BASE, 0); changed = true
++        if (IntSetting.MAIN_SI_DEVICE_2.int != 13) {
++            IntSetting.MAIN_SI_DEVICE_2.setInt(NativeConfig.LAYER_BASE, 13); changed = true
+         }
+         if (changed) {
+             NativeConfig.save(NativeConfig.LAYER_BASE)
+-- 
+2.39.5 (Apple Git-154)
+

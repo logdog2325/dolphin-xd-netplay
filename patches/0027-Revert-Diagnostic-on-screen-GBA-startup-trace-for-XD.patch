@@ -1,7 +1,7 @@
 From 1fc3f8ac80b3fa8ae9bf3936a931fe316a3a3eb8 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 02:36:58 -0700
-Subject: [PATCH 27/37] Revert "Diagnostic: on-screen GBA startup trace for XD"
+Subject: [PATCH 27/38] Revert "Diagnostic: on-screen GBA startup trace for XD"
 
 This reverts commit c4487738e6007add395a6e0424604ff412b2367f.
 ---

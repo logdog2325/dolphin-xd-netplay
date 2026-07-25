@@ -1,7 +1,7 @@
 From 8e26351cddd68fc67e13b7a6a5012d4f1bddc203 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 09:39:13 -0700
-Subject: [PATCH 34/37] Fix Android freeze: reset the GBA core asynchronously,
+Subject: [PATCH 34/38] Fix Android freeze: reset the GBA core asynchronously,
  not via CPU-thread Flush
 
 The edge-triggered auto-reset called Core::Reset() -> Flush() on the CPU

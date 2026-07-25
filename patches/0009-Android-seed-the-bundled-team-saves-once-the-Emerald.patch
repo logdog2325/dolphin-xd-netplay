@@ -1,7 +1,7 @@
 From a7cdf9040183a323d8d69b3c36c007858dca445e Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:12:55 -0700
-Subject: [PATCH 09/37] Android: seed the bundled team saves once the Emerald
+Subject: [PATCH 09/38] Android: seed the bundled team saves once the Emerald
  ROM is set
 
 When the launcher sees a configured Emerald ROM, it copies the two
