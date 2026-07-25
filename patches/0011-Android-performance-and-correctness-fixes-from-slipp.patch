@@ -1,7 +1,7 @@
 From 1c0ec3320da40febf55b193a75053d26fe06dc23 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:19:48 -0700
-Subject: [PATCH 11/33] Android performance and correctness fixes from
+Subject: [PATCH 11/34] Android performance and correctness fixes from
  slippi-android audit
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

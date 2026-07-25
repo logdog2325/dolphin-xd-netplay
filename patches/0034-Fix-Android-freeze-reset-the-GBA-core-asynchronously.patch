@@ -1,0 +1,96 @@
+From 8e26351cddd68fc67e13b7a6a5012d4f1bddc203 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 09:39:13 -0700
+Subject: [PATCH 34/34] Fix Android freeze: reset the GBA core asynchronously,
+ not via CPU-thread Flush
+
+The edge-triggered auto-reset called Core::Reset() -> Flush() on the CPU
+thread, blocking it until the GBA event thread drained its queue. On
+Android the event thread makes a synchronous JNI frame callback that can
+stall (Vulkan surface race), so Flush() never returned and the whole
+emulator froze (top screen black, GBA stuck 'waiting for frame'). Queue
+a RequestReset event instead, executed on the GBA event thread between
+events, so the CPU thread never blocks. Desktop was safe because its
+frame callback is async; Android's is not.
+---
+ Source/Core/Core/HW/GBACore.cpp            | 16 ++++++++++++++++
+ Source/Core/Core/HW/GBACore.h              |  5 +++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp |  6 +++++-
+ 3 files changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 8032462..86e8e51 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -569,12 +569,28 @@ void Core::PushEvent(SyncEvent event)
+   m_event_thread.Push(event);
+ }
+ 
++void Core::RequestReset(u64 gc_ticks)
++{
++  PushEvent({
++      .event_type = SyncEventType::RequestReset,
++      .keys = m_keys,
++      .run_until_ticks = gc_ticks,
++  });
++}
++
+ void Core::HandleEvent(SyncEvent event)
+ {
+   m_keys = event.keys;
+ 
+   RunUntil(event.run_until_ticks);
+ 
++  if (event.event_type == SyncEventType::RequestReset)
++  {
++    if (IsStarted())
++      m_core->reset(m_core);
++    return;
++  }
++
+   if (event.event_type != SyncEventType::RunCommand)
+     return;
+ 
+diff --git a/Source/Core/Core/HW/GBACore.h b/Source/Core/Core/HW/GBACore.h
+index 48372f1..df6ca6c 100644
+--- a/Source/Core/Core/HW/GBACore.h
++++ b/Source/Core/Core/HW/GBACore.h
+@@ -113,6 +113,7 @@ private:
+   {
+     TimeSync,
+     RunCommand,
++    RequestReset,
+   };
+   struct SyncEvent
+   {
+@@ -122,6 +123,10 @@ private:
+   };
+   void PushEvent(SyncEvent event);
+   void HandleEvent(SyncEvent event);
++  // Queue a reset to run on the core's own event thread, so the caller (the
++  // CPU thread) never blocks on Flush() while the event thread may be stuck
++  // in a synchronous host frame callback.
++  void RequestReset(u64 gc_ticks);
+ 
+   bool LoadBIOS(const char* bios_path);
+   bool LoadSave(const char* save_path);
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 881f668..4bc9823 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -87,7 +87,11 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           m_last_auto_reset == 0 || m_timestamp_sent - m_last_auto_reset > min_interval;
+       if (window_just_closed || cooldown_elapsed)
+       {
+-        m_core->Reset();
++        // Async: reset on the GBA's own event thread. Calling Reset() here
++        // would Flush() (block the CPU thread until the event thread drains),
++        // which deadlocks the whole emulator on Android where the event
++        // thread can stall in the synchronous frame callback.
++        m_core->RequestReset(m_timestamp_sent);
+         m_last_auto_reset = m_timestamp_sent;
+       }
+     }
+-- 
+2.39.5 (Apple Git-154)
+
