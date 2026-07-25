@@ -1,7 +1,7 @@
 From dc9a6c471728175589589496f695259473c488af Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:54:55 -0700
-Subject: [PATCH 07/30] Android: Gen 3 team editor with Showdown and Pokepaste
+Subject: [PATCH 07/31] Android: Gen 3 team editor with Showdown and Pokepaste
  import
 
 Ports the validated Emerald save library to Kotlin (sections, checksums,
