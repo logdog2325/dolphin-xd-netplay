@@ -1,7 +1,7 @@
 From a5e49ec27569c291068e52db5d660a5d91ef48f0 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 17:16:22 -0700
-Subject: [PATCH 19/26] Android: exclude foreign-ABI jniLibs from packaging
+Subject: [PATCH 19/28] Android: exclude foreign-ABI jniLibs from packaging
 
 Dependency AARs bundle armeabi-v7a (and x86) native libs; this app
 builds arm64-v8a only, so package only that ABI.

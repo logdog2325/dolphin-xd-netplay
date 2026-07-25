@@ -1,0 +1,100 @@
+From c0ba644baf556dbd67cded40a6e32cb74e5af023 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 02:37:11 -0700
+Subject: [PATCH 28/28] Diagnostic: show each GBA core's link state on the
+ bottom screen
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The OSD diagnostic fired at emulation boot and expired before the user
+reached VS mode. Instead, paint each GBA device's core state (rom
+loaded?, is-gba?, game title, plus the visible device) directly on the
+GBA screen's Android canvas, which always renders regardless of frame
+delivery. Reads GbaHostBridge.infos, which native populates via
+onGameChanged at core start — a live pass/fail readout of whether
+Emerald actually loaded, visible on-device with no OSD or ADB.
+---
+ .../features/dualscreen/GbaHostBridge.kt      |  4 +++
+ .../features/dualscreen/GbaScreenView.kt      | 35 ++++++++++++++++++-
+ 2 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+index bfedf56..c46b4f3 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+@@ -33,6 +33,10 @@ object GbaHostBridge {
+     private val mainHandler = Handler(Looper.getMainLooper())
+     private val infos = arrayOfNulls<CoreInfo>(DEVICE_COUNT)
+ 
++    /** Per-device core state, for the on-screen link diagnostic. */
++    fun snapshot(device: Int): CoreInfo? =
++        if (device in infos.indices) infos[device] else null
++
+     private val listeners = CopyOnWriteArraySet<Listener>()
+     private val frameLock = Any()
+     private var pendingFrame: Frame? = null
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index 5815f6d..20ce743 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -100,6 +100,8 @@ class GbaScreenView @JvmOverloads constructor(
+             drawStatusText(canvas)
+         }
+ 
++        drawLinkDiagnostic(canvas)
++
+         if (titleVisible && title.isNotEmpty()) {
+             canvas.drawText(title, width / 2f, sp(34f), textPaint)
+         }
+@@ -155,8 +157,9 @@ class GbaScreenView @JvmOverloads constructor(
+             if (bitmap != null) {
+                 scheduleTitleHide()
+             }
+-            invalidate()
+         }
++        // Always repaint so the link diagnostic reflects every core's state.
++        invalidate()
+     }
+ 
+     override fun onGbaVisibleDeviceChanged(deviceNumber: Int, info: GbaHostBridge.CoreInfo?) {
+@@ -397,6 +400,36 @@ class GbaScreenView @JvmOverloads constructor(
+         canvas.drawText(text, width / 2f, height / 2f, textPaint)
+     }
+ 
++    /**
++     * Always-visible readout of each GBA core's state, so a link failure is
++     * diagnosable on-device (OSD messages fire at boot and expire). Rendered
++     * on the plain Android canvas, independent of frame delivery.
++     */
++    private fun drawLinkDiagnostic(canvas: Canvas) {
++        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++            color = 0xFFFFEE55.toInt()
++            textSize = sp(13f)
++            textAlign = Paint.Align.LEFT
++        }
++        var y = sp(16f)
++        for (d in 0..3) {
++            val info = GbaHostBridge.snapshot(d)
++            val line = if (info == null) {
++                "GBA${d + 1}: no core"
++            } else {
++                "GBA${d + 1}: rom=${info.hasRom} gba=${info.isGba} \"${info.title}\""
++            }
++            canvas.drawText(line, sp(6f), y, paint)
++            y += sp(15f)
++        }
++        canvas.drawText(
++            "visible=${visibleDevice + 1}",
++            sp(6f),
++            y,
++            paint
++        )
++    }
++
+     private fun displayTitle(info: GbaHostBridge.CoreInfo?): String {
+         if (info == null || info.deviceNumber !in 0..3) {
+             return info?.title.orEmpty()
+-- 
+2.39.5 (Apple Git-154)
+

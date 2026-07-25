@@ -1,7 +1,7 @@
 From 45dce7fe5a5316beca60439fabfa62496b7f3b3e Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 14:02:17 -0700
-Subject: [PATCH 08/26] Android: pick XD folder and Emerald ROM straight from
+Subject: [PATCH 08/28] Android: pick XD folder and Emerald ROM straight from
  the launcher
 
 The checklist's fix actions now open system pickers: a folder picker
