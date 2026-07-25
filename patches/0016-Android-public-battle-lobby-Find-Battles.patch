@@ -1,7 +1,7 @@
 From fec395c16def8613ccc566a1cdf84e12adb47345 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 15:18:22 -0700
-Subject: [PATCH 16/28] Android: public battle lobby (Find Battles)
+Subject: [PATCH 16/30] Android: public battle lobby (Find Battles)
 
 Android counterpart of the desktop NetPlay Browser: a Sea-themed
 session list over Dolphin's public index server, filtered to Pokemon XD

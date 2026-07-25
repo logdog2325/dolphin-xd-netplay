@@ -1,7 +1,7 @@
 From 5470933deacfbccd1185fefe4eebcfa76fe91dc9 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 19:56:11 -0700
-Subject: [PATCH 22/28] Android: honest GBA BIOS check with picker
+Subject: [PATCH 22/30] Android: honest GBA BIOS check with picker
 
 The bundled open-source BIOS covers Game Boy Player but has no joybus
 code, so XD link detection requires the official GBA BIOS. The
