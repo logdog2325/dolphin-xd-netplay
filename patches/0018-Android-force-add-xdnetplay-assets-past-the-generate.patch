@@ -1,7 +1,7 @@
 From d51f3637f9fc49e2e930f3a3d3a83bf5196d2904 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 16:36:47 -0700
-Subject: [PATCH 17/23] Android: force-add xdnetplay assets past the
+Subject: [PATCH 18/25] Android: force-add xdnetplay assets past the
  generated-assets ignore
 
 The assets directory is gitignored because the Sys copy is generated at

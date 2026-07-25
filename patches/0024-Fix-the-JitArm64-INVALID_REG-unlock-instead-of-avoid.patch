@@ -1,7 +1,7 @@
 From 3b591b47daccefa3dc2fc6a1c8060bd6adf7822a Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 22:43:02 -0700
-Subject: [PATCH 23/23] Fix the JitArm64 INVALID_REG unlock instead of avoiding
+Subject: [PATCH 24/25] Fix the JitArm64 INVALID_REG unlock instead of avoiding
  the JIT
 
 Repairs the actual bug: UnlockRegister now no-ops on INVALID_REG (a

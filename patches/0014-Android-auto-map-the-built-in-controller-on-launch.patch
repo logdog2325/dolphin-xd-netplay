@@ -1,7 +1,7 @@
 From 592020e32bf52bb273d2a6511108406b6d376d9c Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 15:16:25 -0700
-Subject: [PATCH 13/23] Android: auto-map the built-in controller on launch
+Subject: [PATCH 14/25] Android: auto-map the built-in controller on launch
 
 The launcher detects the first physical gamepad and applies a standard
 template to GameCube pad 1 and GBA pads 2/3 (never overwriting an
