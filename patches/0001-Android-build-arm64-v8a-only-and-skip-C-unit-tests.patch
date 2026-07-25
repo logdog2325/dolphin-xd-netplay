@@ -1,7 +1,7 @@
 From e44233c05271d6316caa322fead1686d8e973545 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 13:00:27 -0700
-Subject: [PATCH 02/23] Android: build arm64-v8a only and skip C++ unit tests
+Subject: [PATCH 01/23] Android: build arm64-v8a only and skip C++ unit tests
 
 Trims CI build time; x86_64 and the test targets are not needed for
 device builds.

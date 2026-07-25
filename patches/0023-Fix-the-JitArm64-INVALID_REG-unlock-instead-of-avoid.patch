@@ -1,0 +1,55 @@
+From 3b591b47daccefa3dc2fc6a1c8060bd6adf7822a Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 22:43:02 -0700
+Subject: [PATCH 23/23] Fix the JitArm64 INVALID_REG unlock instead of avoiding
+ the JIT
+
+Repairs the actual bug: UnlockRegister now no-ops on INVALID_REG (a
+conditionally-allocated register that was never locked), matching
+ScopedARM64Reg. XD can run on the fast ARM64 recompiler again, so revert
+the CPUCore=5 (Cached Interpreter) workaround from the game INI. This
+also restores correct link timing that the slow interpreter broke.
+---
+ Data/Sys/GameSettings/GXXE01.ini                        | 9 +--------
+ Source/Core/Core/PowerPC/JitArm64/JitArm64_RegCache.cpp | 7 +++++++
+ 2 files changed, 8 insertions(+), 8 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index 5895961..6b10062 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -34,11 +34,4 @@ $60 FPS
+ 
+ [Video_Settings]
+ InternalResolution = 2
+-ShaderCompilationMode = 2
+-
+-[Core]
+-# The ARM64 JIT has an upstream register-allocator bug on XD's SI/JoyBus
+-# code paths (surfaces once GBA ports are active). The Cached Interpreter is
+-# a correct, JIT-free core that avoids it. Game-scoped so other titles keep
+-# the fast recompiler.
+-CPUCore = 5
++ShaderCompilationMode = 2
+\ No newline at end of file
+diff --git a/Source/Core/Core/PowerPC/JitArm64/JitArm64_RegCache.cpp b/Source/Core/Core/PowerPC/JitArm64/JitArm64_RegCache.cpp
+index de967cf..2004367 100644
+--- a/Source/Core/Core/PowerPC/JitArm64/JitArm64_RegCache.cpp
++++ b/Source/Core/Core/PowerPC/JitArm64/JitArm64_RegCache.cpp
+@@ -97,6 +97,13 @@ void Arm64RegCache::LockRegister(ARM64Reg host_reg)
+ 
+ void Arm64RegCache::UnlockRegister(ARM64Reg host_reg)
+ {
++  // A conditionally-allocated register can legitimately be INVALID_REG,
++  // meaning nothing was allocated and there is nothing to unlock. Treat it
++  // as a no-op, matching ScopedARM64Reg's behavior, instead of asserting.
++  // (Pokemon XD's SI/JoyBus code exercises such a path.)
++  if (host_reg == ARM64Reg::INVALID_REG)
++    return;
++
+   auto reg = std::ranges::find(m_host_registers, host_reg, &HostReg::GetReg);
+   ASSERT_MSG(DYNA_REC, reg != m_host_registers.end(),
+              "Don't try unlocking a register that isn't in the cache. Reg {}",
+-- 
+2.39.5 (Apple Git-154)
+
