@@ -1,7 +1,7 @@
 From 6644f3aa46d209707bbf16fd8864fc8c86757649 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 21:49:17 -0700
-Subject: [PATCH 23/36] Route Pokemon XD through the Cached Interpreter
+Subject: [PATCH 23/37] Route Pokemon XD through the Cached Interpreter
 
 XD's SI/JoyBus PowerPC code (active once GBA ports are enabled) trips an
 upstream JitArm64 register-allocator assertion (UnlockRegister on

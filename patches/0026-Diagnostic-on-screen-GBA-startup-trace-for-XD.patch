@@ -1,7 +1,7 @@
 From c4487738e6007add395a6e0424604ff412b2367f Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 00:57:59 -0700
-Subject: [PATCH 26/36] Diagnostic: on-screen GBA startup trace for XD
+Subject: [PATCH 26/37] Diagnostic: on-screen GBA startup trace for XD
 
 Temporary instrumentation: GBACore::Start posts big on-screen messages
 for each step (ROM path, OpenROM result, BIOS presence, loadROM result,
