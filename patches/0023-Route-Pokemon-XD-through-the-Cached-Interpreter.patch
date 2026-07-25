@@ -1,0 +1,34 @@
+From 6644f3aa46d209707bbf16fd8864fc8c86757649 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 21:49:17 -0700
+Subject: [PATCH 23/23] Route Pokemon XD through the Cached Interpreter
+
+XD's SI/JoyBus PowerPC code (active once GBA ports are enabled) trips an
+upstream JitArm64 register-allocator assertion (UnlockRegister on
+INVALID_REG), which hard-crashes to a black screen. Pin GXXE01 to the
+Cached Interpreter (CPUCore=5) via its game INI: a correct, JIT-free
+core that cannot reach the buggy allocator, scoped so no other game is
+slowed. Real JIT fix (finding the opcode handler that unlocks
+INVALID_REG) is follow-up work.
+---
+ Data/Sys/GameSettings/GXXE01.ini | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index b53f951..5895961 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -35,3 +35,10 @@ $60 FPS
+ [Video_Settings]
+ InternalResolution = 2
+ ShaderCompilationMode = 2
++
++[Core]
++# The ARM64 JIT has an upstream register-allocator bug on XD's SI/JoyBus
++# code paths (surfaces once GBA ports are active). The Cached Interpreter is
++# a correct, JIT-free core that avoids it. Game-scoped so other titles keep
++# the fast recompiler.
++CPUCore = 5
+-- 
+2.39.5 (Apple Git-154)
+
