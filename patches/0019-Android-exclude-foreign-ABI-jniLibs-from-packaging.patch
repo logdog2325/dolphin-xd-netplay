@@ -1,0 +1,34 @@
+From a5e49ec27569c291068e52db5d660a5d91ef48f0 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 24 Jul 2026 17:16:22 -0700
+Subject: [PATCH 19/19] Android: exclude foreign-ABI jniLibs from packaging
+
+Dependency AARs bundle armeabi-v7a (and x86) native libs; this app
+builds arm64-v8a only, so package only that ABI.
+---
+ Source/Android/app/build.gradle.kts | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/Source/Android/app/build.gradle.kts b/Source/Android/app/build.gradle.kts
+index 9f5af98..95e55bc 100644
+--- a/Source/Android/app/build.gradle.kts
++++ b/Source/Android/app/build.gradle.kts
+@@ -94,6 +94,15 @@ android {
+             version = "3.22.1+"
+         }
+     }
++
++    packaging {
++        jniLibs {
++            // arm64-only app: drop foreign-ABI libs that dependencies' AARs bundle.
++            excludes += "**/armeabi-v7a/**"
++            excludes += "**/x86/**"
++            excludes += "**/x86_64/**"
++        }
++    }
+     namespace = "org.dolphinemu.dolphinemu"
+ 
+     defaultConfig {
+-- 
+2.39.5 (Apple Git-154)
+
