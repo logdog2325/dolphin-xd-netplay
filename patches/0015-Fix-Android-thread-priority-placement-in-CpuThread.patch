@@ -1,7 +1,7 @@
 From c3e4c23d93d3e1aee7ad8b3e5a779fc1f7163fea Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 15:18:22 -0700
-Subject: [PATCH 15/31] Fix Android thread-priority placement in CpuThread
+Subject: [PATCH 15/32] Fix Android thread-priority placement in CpuThread
 
 The setpriority block landed between an if and its else, which only
 became real code on Android builds. Move it after the complete

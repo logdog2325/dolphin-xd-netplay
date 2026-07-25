@@ -1,0 +1,86 @@
+From a206622e2a24102c9cf7d044c9b36fe86c8e216f Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 09:24:27 -0700
+Subject: [PATCH 32/32] Android: add a direct 'Boot Pokemon XD (solo)' button
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Boots XD by game ID (GXXE01) instead of the game picker, which defaulted
+to whatever ISO sorts first in the folder (e.g. a GameCube game), forcing
+the user to hand-switch to XD — an error-prone step that also risks
+triggering netplay's game-change/config-reset path. One tap now launches
+XD offline with the GBA cores already configured for a clean link test.
+---
+ .../features/xdnetplay/ui/XDLauncherActivity.kt     | 13 +++++++++++++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt       |  9 +++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index ef7acf8..62506b4 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -24,6 +24,7 @@ import org.dolphinemu.dolphinemu.features.xdnetplay.input.AutoMapper
+ import org.dolphinemu.dolphinemu.features.settings.ui.MenuTag
+ import org.dolphinemu.dolphinemu.features.settings.ui.SettingsActivity
+ import org.dolphinemu.dolphinemu.model.GameFileCache
++import org.dolphinemu.dolphinemu.activities.EmulationActivity
+ import org.dolphinemu.dolphinemu.services.GameFileCacheManager
+ import org.dolphinemu.dolphinemu.ui.main.MainActivity
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+@@ -169,6 +170,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     onPickGbaBios = { pickGbaBios.launch(arrayOf("*/*")) },
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
++                    onPlayXd = { bootXd() },
+                     onBattle = { NetplaySetupActivity.launch(this) },
+                     onFindBattles = { FindBattlesActivity.launch(this) },
+                     onOpenSettings = {
+@@ -182,6 +184,17 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ 
++    /** Boot Pokemon XD directly by game ID, bypassing the game picker (which
++     * would otherwise default to whatever ISO sorts first in the folder). */
++    private fun bootXd() {
++        val xd = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID)
++        if (xd != null) {
++            EmulationActivity.launch(this, xd.path, false)
++        } else {
++            statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
++        }
++    }
++
+     override fun onResume() {
+         super.onResume()
+         if (DirectoryInitialization.areDolphinDirectoriesReady()) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 666359b..30f2cb4 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -46,6 +46,7 @@ fun XDLauncherScreen(
+     onPickGbaBios: () -> Unit,
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
++    onPlayXd: () -> Unit,
+     onBattle: () -> Unit,
+     onFindBattles: () -> Unit,
+     onOpenSettings: () -> Unit,
+@@ -107,6 +108,14 @@ fun XDLauncherScreen(
+                     Text("Team Editor", style = MaterialTheme.typography.titleMedium)
+                 }
+                 Spacer(Modifier.height(12.dp))
++                Button(
++                    onClick = onPlayXd,
++                    enabled = xdGameFound,
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    Text("Boot Pokémon XD (solo)", style = MaterialTheme.typography.titleMedium)
++                }
++                Spacer(Modifier.height(12.dp))
+                 Button(
+                     onClick = onBattle,
+                     enabled = xdGameFound,
+-- 
+2.39.5 (Apple Git-154)
+
