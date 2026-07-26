@@ -1,0 +1,74 @@
+From d2bca79d033edd9c1f37e50e99f7c84909c9fbee Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 16:59:43 -0700
+Subject: [PATCH 40/41] Enable the $XD OU Fixes cheat to match the stable
+ XDNetplay bundle
+
+The 2-year-stable papajefe Windows build enables $XD OU Fixes (ActionReplay),
+with Core/EnableCheats=True and NetPlay/SyncCodes=True. Its four NOPs patch
+XD's battle-setup code and the conditional at 0x80BC0E04 keys the battle mode
+off 0x80475580 -- the OU GBA-vs-GBA format depends on it, and the config the
+original ships expects it. Our bundle only defined the code without enabling it.
+
+Enable it by default in the Sys game ini (respected because LoadCodes marks
+codes enabled in the global/Sys layer as default_enabled), and force
+Core/EnableCheats on in the launcher for both solo boot and hosting. Only this
+code is enabled, not the cosmetic 60 FPS / widescreen, since 60 FPS changes
+game timing and would break netplay determinism.
+---
+ Data/Sys/GameSettings/GXXE01.ini                      | 11 +++++++++++
+ .../features/xdnetplay/ui/XDLauncherActivity.kt       |  9 +++++++++
+ 2 files changed, 20 insertions(+)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index 6b10062..f53ccb8 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -12,6 +12,17 @@ $Allow Memory Card saving with Savestates
+ [Patches_RetroAchievements_Verified]
+ $Allow Memory Card saving with Savestates
+ 
++# Match the 2-year-stable papajefe XDNetplay Windows bundle: the $XD OU Fixes
++# AR code is ENABLED by default (its four NOPs patch XD's battle-setup code and
++# the conditional at 0x80BC0E04 keys the battle mode off 0x80475580). This is
++# required for the OU GBA-vs-GBA format to behave correctly, and the config the
++# original ships EXPECTS it. Only this code is enabled (not the cosmetic 60 FPS
++# / widescreen), because 60 FPS changes game timing and would break netplay
++# determinism. Cheats must also be globally on (Core/EnableCheats=True, set by
++# the launcher) and SyncCodes=True so the guest receives the same enabled set.
++[ActionReplay_Enabled]
++$XD OU Fixes
++
+ [ActionReplay]
+ $16:9 Widescreen
+ 044ED860 3FC962F9
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index fc31279..eefb2b6 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -16,6 +16,7 @@ import androidx.compose.runtime.setValue
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
+ import java.io.File
+ import java.security.MessageDigest
++import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+@@ -309,6 +310,14 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (IntSetting.MAIN_SI_DEVICE_2.int != 13) {
+             IntSetting.MAIN_SI_DEVICE_2.setInt(NativeConfig.LAYER_BASE, 13); changed = true
+         }
++        // The 2-year-stable papajefe XDNetplay bundle runs with cheats ON so the
++        // $XD OU Fixes AR code (enabled in the bundled GXXE01.ini) actually
++        // applies -- it patches XD's battle-setup code and the OU GBA-vs-GBA
++        // format depends on it. Match that for both solo boot and hosting; in
++        // netplay the host's EnableCheats + SyncCodes carry it to the guest.
++        if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
++            BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
++        }
+         if (changed) {
+             NativeConfig.save(NativeConfig.LAYER_BASE)
+         }
+-- 
+2.39.5 (Apple Git-154)
+

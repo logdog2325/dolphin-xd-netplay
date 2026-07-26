@@ -1,7 +1,7 @@
 From 81e2829826ea33d03dc7cf40c1ca70115b3cc8f5 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 02:52:09 -0700
-Subject: [PATCH 30/38] Android: re-arm GBA auto-reset on joybus window close,
+Subject: [PATCH 30/41] Android: re-arm GBA auto-reset on joybus window close,
  not a 10s timer
 
 The link window is Emerald's copyright screen (its cartridge code opens
