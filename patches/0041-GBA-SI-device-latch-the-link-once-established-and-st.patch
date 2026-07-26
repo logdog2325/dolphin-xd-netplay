@@ -1,7 +1,7 @@
 From 4a63dfa045f838abcc93e6792b5639a8b1168dc1 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 16:59:43 -0700
-Subject: [PATCH 41/43] GBA SI device: latch the link once established, and
+Subject: [PATCH 41/44] GBA SI device: latch the link once established, and
  step the practice cursor
 
 Latch: once the joybus link is up and real READ/WRITE data has flowed (party

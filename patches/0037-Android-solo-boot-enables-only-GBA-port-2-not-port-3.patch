@@ -1,7 +1,7 @@
 From 1a7f880d947cd59b7f8ef14e179e2c088cb9e28f Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 10:35:34 -0700
-Subject: [PATCH 37/43] Android: solo boot enables only GBA port 2, not port 3
+Subject: [PATCH 37/44] Android: solo boot enables only GBA port 2, not port 3
 
 Port 3 is the opponent's GBA; in a solo link test it has no peer, never
 links, and its auto-reset loops it forever (looping boot screen +

@@ -1,0 +1,577 @@
+From 65ba42c8b0e80a2f84975a5117f7d195229ed98e Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 26 Jul 2026 10:45:00 -0700
+Subject: [PATCH 44/44] Android: add PBR online mode + a hub to pick XD or PBR
+ (XD launcher untouched)
+
+PokemonHubActivity is the new app entry: pick XD or PBR. Each button opens that
+mode's own launcher, which force-applies only that mode's config, so the two
+never collide -- and the XD launcher's code is completely unchanged (it's just
+opened from the hub now instead of being the home activity; only its manifest
+intent-filter moved).
+
+PBR mode (PbrLauncherActivity/Screen) targets the UPA private-server route:
+import the UPA nand.bin (NAND + appended keys), register the pre-patched RPBE01
+ISO, and boot -- no SSL certs, no DNS change, no activation wait. ensurePbrConfig
+turns the emulated-GBA SI ports OFF (the XD launcher flips them back to 13 when
+opened, so XD is unaffected) and enables cheats so RPBE01.ini's bundled on-frame
+black-screen fix + EFB graphics fix apply. Adds MAIN_WIRELESS_MAC (no Android UI
+exposed it) for a future Wiimmfi route.
+---
+ Data/Sys/GameSettings/RPBE01.ini              |   9 +
+ .../Android/app/src/main/AndroidManifest.xml  |  16 +-
+ .../features/settings/model/StringSetting.kt  |   4 +
+ .../xdnetplay/ui/PbrLauncherActivity.kt       | 177 ++++++++++++++++++
+ .../xdnetplay/ui/PbrLauncherScreen.kt         | 176 +++++++++++++++++
+ .../xdnetplay/ui/PokemonHubActivity.kt        |  99 ++++++++++
+ 6 files changed, 479 insertions(+), 2 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
+
+diff --git a/Data/Sys/GameSettings/RPBE01.ini b/Data/Sys/GameSettings/RPBE01.ini
+index 88cfdd1..c4e4969 100644
+--- a/Data/Sys/GameSettings/RPBE01.ini
++++ b/Data/Sys/GameSettings/RPBE01.ini
+@@ -9,5 +9,14 @@ $Fix black screen effects
+ 0x80244A94:dword:0x39080000
+ 0x80244A9C:dword:0x38030000
+ 
++[OnFrame_Enabled]
++$Fix black screen effects
++
++[Video_Hacks]
++# Battle-pass trainer avatars render invisible when EFB copies go to texture
++# only; the UPA and Restorer PBR packs both note turning this off. Force it off
++# for PBR so the passes display. (XD Netplay PBR mode.)
++EFBToTextureEnable = False
++
+ [Patches_RetroAchievements_Verified]
+ $Fix black screen effects
+diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
+index de9e6a1..c9bd51b 100644
+--- a/Source/Android/app/src/main/AndroidManifest.xml
++++ b/Source/Android/app/src/main/AndroidManifest.xml
+@@ -52,13 +52,14 @@
+             android:shell="true"
+             tools:targetApi="29" />
+ 
++        <!-- App entry hub: pick XD or PBR. Each mode's own launcher (below) is
++             opened from here and force-applies its own config. -->
+         <activity
+-            android:name=".features.xdnetplay.ui.XDLauncherActivity"
++            android:name=".features.xdnetplay.ui.PokemonHubActivity"
+             android:exported="true"
+             android:label="XD Netplay"
+             android:theme="@style/Theme.Dolphin.Splash.Main">
+ 
+-            <!-- This intentfilter marks this Activity as the one that gets launched from Home screen. -->
+             <intent-filter>
+                 <action android:name="android.intent.action.MAIN" />
+ 
+@@ -66,6 +67,17 @@
+             </intent-filter>
+         </activity>
+ 
++        <!-- XD launcher (unchanged) -- now opened from the hub, not the home screen. -->
++        <activity
++            android:name=".features.xdnetplay.ui.XDLauncherActivity"
++            android:exported="false"
++            android:theme="@style/Theme.Dolphin.Splash.Main" />
++
++        <activity
++            android:name=".features.xdnetplay.ui.PbrLauncherActivity"
++            android:exported="false"
++            android:theme="@style/Theme.Dolphin.Splash.Main" />
++
+         <activity
+             android:name=".features.xdnetplay.ui.TeamEditorActivity"
+             android:exported="false"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+index e0cb5d9..df98372 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+@@ -15,6 +15,10 @@ enum class StringSetting(
+     MAIN_DEFAULT_ISO(Settings.FILE_DOLPHIN, Settings.SECTION_INI_CORE, "DefaultISO", ""),
+     MAIN_BBA_MAC(Settings.FILE_DOLPHIN, Settings.SECTION_INI_CORE, "BBA_MAC", ""),
+     MAIN_BBA_XLINK_IP(Settings.FILE_DOLPHIN, Settings.SECTION_INI_CORE, "BBA_XLINK_IP", ""),
++    // The Wii's wireless MAC (Dolphin.ini [General] WirelessMac). No Android UI
++    // exposes it; the PBR mode sets it to the real console MAC before the first
++    // online connect (a wrong/empty MAC breaks the WFC/Wiimmfi console identity).
++    MAIN_WIRELESS_MAC(Settings.FILE_DOLPHIN, Settings.SECTION_INI_GENERAL, "WirelessMac", ""),
+ 
+     // Schthack PSO Server - https://schtserv.com/
+     MAIN_BBA_BUILTIN_DNS(
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+new file mode 100644
+index 0000000..866ed0b
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+@@ -0,0 +1,177 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import android.content.Context
++import android.content.Intent
++import android.net.Uri
++import android.os.Bundle
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.activity.result.contract.ActivityResultContracts
++import androidx.appcompat.app.AppCompatActivity
++import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.setValue
++import java.io.File
++import org.dolphinemu.dolphinemu.R
++import org.dolphinemu.dolphinemu.activities.EmulationActivity
++import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
++import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
++import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
++import org.dolphinemu.dolphinemu.model.GameFileCache
++import org.dolphinemu.dolphinemu.services.GameFileCacheManager
++import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
++import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.AfterDirectoryInitializationRunner
++import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
++import org.dolphinemu.dolphinemu.utils.ThemeHelper
++import org.dolphinemu.dolphinemu.utils.ThreadUtil
++import org.dolphinemu.dolphinemu.utils.WiiUtils
++
++/**
++ * Pokémon Battle Revolution online mode (UPA private server). Fully separate
++ * from the XD launcher: it drives a different game (RPBE01) and its own config
++ * only. The XD launcher force-applies its own setup every time it opens, so
++ * nothing here can degrade XD -- see ensurePbrConfig().
++ */
++class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
++    override var themeId: Int = 0
++
++    private var initialized by mutableStateOf(false)
++    private var nandImported by mutableStateOf(false)
++    private var pbrFound by mutableStateOf(false)
++    private var statusMessage by mutableStateOf<String?>(null)
++
++    private val pickPbrFolder =
++        registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
++            if (uri != null) {
++                contentResolver.takePersistableUriPermission(
++                    uri, Intent.FLAG_GRANT_READ_URI_PERMISSION
++                )
++                GameFileCache.addGameFolder(uri.toString())
++                GameFileCacheManager.startRescan()
++            }
++        }
++
++    private val pickNand =
++        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
++            if (uri != null) importNand(uri)
++        }
++
++    /** Imports the UPA-provided nand.bin (NAND + appended keys) into the app's
++     *  Wii/ dir on a background thread. Success is silent; the native side pops
++     *  a panic on failure. */
++    private fun importNand(uri: Uri) {
++        ThreadUtil.runOnThreadAndShowResult(
++            this, R.string.import_in_progress, R.string.do_not_close_app,
++            {
++                WiiUtils.importNANDBin(uri.toString())
++                runOnUiThread { refreshChecks() }
++                null
++            }
++        )
++    }
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        installSplashScreen().setKeepOnScreenCondition {
++            !DirectoryInitialization.areDolphinDirectoriesReady()
++        }
++        ThemeHelper.setTheme(this)
++        enableEdgeToEdge()
++        super.onCreate(savedInstanceState)
++
++        DirectoryInitialization.start(this)
++        AfterDirectoryInitializationRunner().runWithLifecycle(this) {
++            initialized = true
++            refreshChecks()
++            GameFileCacheManager.startLoad()
++        }
++
++        GameFileCacheManager.getGameFiles().observe(this) {
++            pbrFound = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID) != null
++        }
++
++        setContent {
++            DolphinTheme {
++                PbrLauncherScreen(
++                    initialized = initialized,
++                    nandImported = nandImported,
++                    pbrFound = pbrFound,
++                    statusMessage = statusMessage,
++                    onImportNand = { pickNand.launch("*/*") },
++                    onPickPbrFolder = { pickPbrFolder.launch(null) },
++                    onPlayPbr = { bootPbr() },
++                    onBack = { finish() }
++                )
++            }
++        }
++    }
++
++    override fun onResume() {
++        super.onResume()
++        if (DirectoryInitialization.areDolphinDirectoriesReady()) {
++            initialized = true
++            refreshChecks()
++        }
++    }
++
++    private fun refreshChecks() {
++        ensurePbrConfig()
++        nandImported = checkNandImported()
++        pbrFound = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID) != null
++    }
++
++    private fun checkNandImported(): Boolean = try {
++        File(DirectoryInitialization.getUserDirectory(), "Wii/title").listFiles()?.isNotEmpty() == true
++    } catch (_: Exception) {
++        false
++    }
++
++    /**
++     * Config for PBR mode. Deliberately isolated from XD:
++     *  - Turn the emulated-GBA SI ports OFF (XD sets them to 13 for its GBA-vs-
++     *    GBA link; PBR is a Wii game and must not spin up Emerald cores). The XD
++     *    launcher flips them back to 13 whenever it opens, so XD is unaffected.
++     *  - Cheats on so RPBE01.ini's on-frame black-screen fix applies (same flag
++     *    XD already forces, so no conflict). RPBE01.ini also forces the EFB
++     *    graphics fix so battle-pass avatars render.
++     * The UPA route needs no SSL certs, no DNS change, and no activation wait --
++     * the patched ISO reaches the server directly.
++     */
++    private fun ensurePbrConfig() {
++        var changed = false
++        if (IntSetting.MAIN_SI_DEVICE_1.int != 0) {
++            IntSetting.MAIN_SI_DEVICE_1.setInt(NativeConfig.LAYER_BASE, 0); changed = true
++        }
++        if (IntSetting.MAIN_SI_DEVICE_2.int != 0) {
++            IntSetting.MAIN_SI_DEVICE_2.setInt(NativeConfig.LAYER_BASE, 0); changed = true
++        }
++        if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
++            BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
++        }
++        if (changed) {
++            NativeConfig.save(NativeConfig.LAYER_BASE)
++        }
++    }
++
++    private fun bootPbr() {
++        val pbr = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID)
++        if (pbr != null) {
++            EmulationActivity.launch(this, pbr.getPath(), false)
++        } else {
++            statusMessage =
++                "Patched Pokémon Battle Revolution (RPBE01) not found — choose the folder with your UPA ISO."
++        }
++    }
++
++    companion object {
++        const val PBR_GAME_ID = "RPBE01"
++
++        @JvmStatic
++        fun launch(context: Context) {
++            context.startActivity(Intent(context, PbrLauncherActivity::class.java))
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+new file mode 100644
+index 0000000..5a37812
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+@@ -0,0 +1,176 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material.icons.Icons
++import androidx.compose.material.icons.filled.Check
++import androidx.compose.material.icons.filled.Close
++import androidx.compose.material3.Button
++import androidx.compose.material3.Card
++import androidx.compose.material3.CircularProgressIndicator
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.Icon
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++
++@Composable
++fun PbrLauncherScreen(
++    initialized: Boolean,
++    nandImported: Boolean,
++    pbrFound: Boolean,
++    statusMessage: String?,
++    onImportNand: () -> Unit,
++    onPickPbrFolder: () -> Unit,
++    onPlayPbr: () -> Unit,
++    onBack: () -> Unit
++) {
++    Column(
++        modifier = Modifier
++            .fillMaxSize()
++            .verticalScroll(rememberScrollState())
++            .padding(horizontal = 24.dp, vertical = 16.dp),
++        horizontalAlignment = Alignment.CenterHorizontally
++    ) {
++        Spacer(Modifier.height(24.dp))
++        Text(
++            text = "PBR ONLINE",
++            style = MaterialTheme.typography.displaySmall,
++            fontWeight = FontWeight.Bold,
++            color = MaterialTheme.colorScheme.primary
++        )
++        Text(
++            text = "Pokémon Battle Revolution, online (UPA)",
++            style = MaterialTheme.typography.bodyLarge,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Spacer(Modifier.height(28.dp))
++
++        if (!initialized) {
++            CircularProgressIndicator()
++            Spacer(Modifier.height(12.dp))
++            Text("Setting things up…", style = MaterialTheme.typography.bodyMedium)
++        } else {
++            Card(modifier = Modifier.fillMaxWidth()) {
++                Column(
++                    modifier = Modifier.padding(16.dp),
++                    verticalArrangement = Arrangement.spacedBy(10.dp)
++                ) {
++                    Text(
++                        text = "Checklist",
++                        style = MaterialTheme.typography.titleMedium,
++                        fontWeight = FontWeight.SemiBold
++                    )
++                    CheckRow(
++                        ok = pbrFound,
++                        okText = "Patched PBR found (RPBE01)",
++                        missingText = "Patched PBR not found — choose the folder with your UPA ISO",
++                        fixLabel = "Choose folder…",
++                        onFix = onPickPbrFolder
++                    )
++                    CheckRow(
++                        ok = nandImported,
++                        okText = "Wii NAND imported",
++                        missingText = "Import the UPA nand.bin (has keys appended)",
++                        fixLabel = "Import NAND…",
++                        onFix = onImportNand
++                    )
++                    CheckRow(
++                        ok = true,
++                        okText = "Graphics + black-screen fixes bundled",
++                        missingText = "",
++                        fixLabel = "",
++                        onFix = null
++                    )
++                }
++            }
++
++            Spacer(Modifier.height(12.dp))
++            Text(
++                text = "No SSL certs, no DNS change, no 1-week wait — the UPA ISO connects directly. " +
++                    "For teams, drop the Restorer save's PbrSaveData in the game's Wii save folder " +
++                    "(or edit with PKHeX).",
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++
++            if (statusMessage != null) {
++                Spacer(Modifier.height(12.dp))
++                Text(
++                    text = statusMessage,
++                    color = MaterialTheme.colorScheme.error,
++                    style = MaterialTheme.typography.bodyMedium
++                )
++            }
++            Spacer(Modifier.height(24.dp))
++
++            FilledTonalButton(onClick = onImportNand, modifier = Modifier.fillMaxWidth()) {
++                Text("Import Wii NAND (nand.bin)", style = MaterialTheme.typography.titleMedium)
++            }
++            Spacer(Modifier.height(12.dp))
++            Button(
++                onClick = onPlayPbr,
++                enabled = pbrFound && nandImported,
++                modifier = Modifier.fillMaxWidth()
++            ) {
++                Text("Play PBR Online", style = MaterialTheme.typography.titleMedium)
++            }
++            Spacer(Modifier.height(24.dp))
++
++            Row {
++                TextButton(onClick = onBack) { Text("Back") }
++            }
++        }
++        Spacer(Modifier.height(16.dp))
++    }
++}
++
++@Composable
++private fun CheckRow(
++    ok: Boolean,
++    okText: String,
++    missingText: String,
++    fixLabel: String,
++    onFix: (() -> Unit)?
++) {
++    Row(verticalAlignment = Alignment.CenterVertically) {
++        Icon(
++            imageVector = if (ok) Icons.Default.Check else Icons.Default.Close,
++            contentDescription = null,
++            tint = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
++            modifier = Modifier.size(20.dp)
++        )
++        Spacer(Modifier.width(10.dp))
++        Column(modifier = Modifier.fillMaxWidth()) {
++            Text(
++                text = if (ok) okText else missingText,
++                style = MaterialTheme.typography.bodyMedium
++            )
++            if (!ok && onFix != null) {
++                TextButton(
++                    onClick = onFix,
++                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
++                ) {
++                    Text(fixLabel)
++                }
++            }
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
+new file mode 100644
+index 0000000..9e05fed
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
+@@ -0,0 +1,99 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import android.os.Bundle
++import androidx.activity.compose.setContent
++import androidx.activity.enableEdgeToEdge
++import androidx.appcompat.app.AppCompatActivity
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Spacer
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.dp
++import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
++import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
++import org.dolphinemu.dolphinemu.utils.ThemeHelper
++
++/**
++ * App entry hub: pick XD or PBR. Each button opens that mode's own launcher,
++ * which force-applies that mode's config -- so the two never step on each other
++ * and the XD launcher stays exactly as it was.
++ */
++class PokemonHubActivity : AppCompatActivity(), ThemeProvider {
++    override var themeId: Int = 0
++
++    override fun onCreate(savedInstanceState: Bundle?) {
++        ThemeHelper.setTheme(this)
++        enableEdgeToEdge()
++        super.onCreate(savedInstanceState)
++
++        // Start directory init here so whichever mode the user opens is ready.
++        DirectoryInitialization.start(this)
++
++        val ctx = this
++        setContent {
++            DolphinTheme {
++                PokemonHubScreen(
++                    onXd = { XDLauncherActivity.launch(ctx) },
++                    onPbr = { PbrLauncherActivity.launch(ctx) }
++                )
++            }
++        }
++    }
++}
++
++@Composable
++private fun PokemonHubScreen(onXd: () -> Unit, onPbr: () -> Unit) {
++    Column(
++        modifier = Modifier
++            .fillMaxSize()
++            .padding(horizontal = 24.dp, vertical = 16.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++        verticalArrangement = Arrangement.Center
++    ) {
++        Text(
++            text = "POKÉMON BATTLES",
++            style = MaterialTheme.typography.displaySmall,
++            fontWeight = FontWeight.Bold,
++            color = MaterialTheme.colorScheme.primary
++        )
++        Text(
++            text = "Choose a mode",
++            style = MaterialTheme.typography.bodyLarge,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Spacer(Modifier.height(48.dp))
++
++        Button(onClick = onXd, modifier = Modifier.fillMaxWidth()) {
++            Column(
++                modifier = Modifier.padding(vertical = 8.dp),
++                horizontalAlignment = Alignment.CenterHorizontally
++            ) {
++                Text("XD Netplay", style = MaterialTheme.typography.titleLarge)
++                Text("Pokémon XD GBA-link battles, online", style = MaterialTheme.typography.bodySmall)
++            }
++        }
++        Spacer(Modifier.height(16.dp))
++        Button(onClick = onPbr, modifier = Modifier.fillMaxWidth()) {
++            Column(
++                modifier = Modifier.padding(vertical = 8.dp),
++                horizontalAlignment = Alignment.CenterHorizontally
++            ) {
++                Text("PBR Online", style = MaterialTheme.typography.titleLarge)
++                Text("Pokémon Battle Revolution, online", style = MaterialTheme.typography.bodySmall)
++            }
++        }
++    }
++}
+-- 
+2.39.5 (Apple Git-154)
+

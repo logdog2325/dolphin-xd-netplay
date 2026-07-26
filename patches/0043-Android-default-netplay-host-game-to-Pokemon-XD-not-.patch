@@ -1,7 +1,7 @@
 From ecd2286bf01ebc7922d6946e9984b6fd9db8a0cb Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sun, 26 Jul 2026 09:46:39 -0700
-Subject: [PATCH 43/43] Android: default netplay host game to Pokemon XD, not
+Subject: [PATCH 43/44] Android: default netplay host game to Pokemon XD, not
  the first library entry
 
 When hosting, NetplayViewModel.setInitialGame() falls back to
