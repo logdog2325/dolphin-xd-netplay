@@ -1,7 +1,7 @@
 From d8bf45ad27737cf790428dc0f59695170cc4a697 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 15:19:15 -0700
-Subject: [PATCH 38/41] Android: solo enables BOTH GBA ports 2 and 3 (XD VS
+Subject: [PATCH 38/42] Android: solo enables BOTH GBA ports 2 and 3 (XD VS
  mode needs two GBAs)
 
 XD's GBA-vs-GBA is a two-player battle and asks for a GBA on socket 2

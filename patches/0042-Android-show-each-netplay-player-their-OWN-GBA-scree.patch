@@ -1,0 +1,140 @@
+From d7f9cf95b344b4b18f751982f118de3805b8322d Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 25 Jul 2026 23:42:45 -0700
+Subject: [PATCH 42/42] Android: show each netplay player their OWN GBA screen
+ (host port 2, joiner port 3)
+
+The bottom-screen GBA was chosen by "first core with a ROM" with no netplay
+ownership awareness, so both players saw port 2 -- the joiner watched the host's
+GBA instead of their own (inputs were routed correctly, but you couldn't see
+your own screen). Thread each core's ownership from native
+(NetPlay::GetPadDetails(device).is_local; device_number is the SI channel /
+pad index) through onGameChanged into CoreInfo, and make refreshVisibleDevice
+prefer the local GBA.
+
+Two load-bearing guards: only query the 4-slot pad map for device_number < 4
+(the GB Player pseudo-device is index 4 and would index pad_map[4] out of
+bounds), and keep the first-with-ROM fallback so solo (every core local) and
+any mistimed edge degrade to today's behavior, never a black screen. The
+bottom-screen link diagnostic now also shows loc= per device.
+---
+ .../features/dualscreen/GbaHostBridge.kt         | 13 +++++++++++--
+ .../features/dualscreen/GbaScreenView.kt         |  2 +-
+ Source/Android/jni/AndroidCommon/IDCache.cpp     |  2 +-
+ Source/Android/jni/GBA/AndroidGBAHost.cpp        | 16 +++++++++++++++-
+ 4 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+index c46b4f3..fa766e7 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+@@ -21,6 +21,7 @@ object GbaHostBridge {
+         val height: Int,
+         val isGba: Boolean,
+         val hasRom: Boolean,
++        val isLocal: Boolean,
+         val title: String
+     )
+ 
+@@ -76,10 +77,17 @@ object GbaHostBridge {
+         if (visibleDeviceNumber in infos.indices) infos[visibleDeviceNumber] else null
+ 
+     private fun refreshVisibleDevice() {
++        // In netplay, prefer the GBA WE own (isLocal) so each player sees their
++        // own bottom screen -- host port 2, joiner port 3. The fallbacks are
++        // load-bearing: in solo every core is local (native passes isLocal=true
++        // outside netplay) so the first clause is identical to the old
++        // first-with-ROM pick, and a mistimed/edge case degrades to showing *a*
++        // GBA rather than a black screen. Never select a non-local GBA outright.
+         val nextDevice = when {
+             frameConsumerCount == 0 -> NO_DEVICE
+             infos[GB_PLAYER_DEVICE]?.hasRom == true -> GB_PLAYER_DEVICE
+-            else -> LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true }
++            else -> LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true && infos[it]?.isLocal == true }
++                ?: LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true }
+                 ?: LINK_DEVICE_RANGE.firstOrNull { infos[it]?.isGba == true }
+                 ?: NO_DEVICE
+         }
+@@ -102,10 +110,11 @@ object GbaHostBridge {
+         height: Int,
+         isGba: Boolean,
+         hasRom: Boolean,
++        isLocal: Boolean,
+         title: String
+     ) {
+         mainHandler.post {
+-            val info = CoreInfo(deviceNumber, width, height, isGba, hasRom, title)
++            val info = CoreInfo(deviceNumber, width, height, isGba, hasRom, isLocal, title)
+             infos[deviceNumber] = info
+             refreshVisibleDevice()
+             for (listener in listeners) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index 20ce743..52f956b 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -417,7 +417,7 @@ class GbaScreenView @JvmOverloads constructor(
+             val line = if (info == null) {
+                 "GBA${d + 1}: no core"
+             } else {
+-                "GBA${d + 1}: rom=${info.hasRom} gba=${info.isGba} \"${info.title}\""
++                "GBA${d + 1}: rom=${info.hasRom} gba=${info.isGba} loc=${info.isLocal} \"${info.title}\""
+             }
+             canvas.drawText(line, sp(6f), y, paint)
+             y += sp(15f)
+diff --git a/Source/Android/jni/AndroidCommon/IDCache.cpp b/Source/Android/jni/AndroidCommon/IDCache.cpp
+index bc35235..b2c55b6 100644
+--- a/Source/Android/jni/AndroidCommon/IDCache.cpp
++++ b/Source/Android/jni/AndroidCommon/IDCache.cpp
+@@ -778,7 +778,7 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved)
+       env->FindClass("org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge");
+   s_gba_host_bridge_class = reinterpret_cast<jclass>(env->NewGlobalRef(gba_host_bridge_class));
+   s_gba_host_bridge_on_game_changed = env->GetStaticMethodID(
+-      s_gba_host_bridge_class, "onGameChanged", "(IIIZZLjava/lang/String;)V");
++      s_gba_host_bridge_class, "onGameChanged", "(IIIZZZLjava/lang/String;)V");
+   s_gba_host_bridge_on_core_stopped =
+       env->GetStaticMethodID(s_gba_host_bridge_class, "onCoreStopped", "(I)V");
+   s_gba_host_bridge_on_frame =
+diff --git a/Source/Android/jni/GBA/AndroidGBAHost.cpp b/Source/Android/jni/GBA/AndroidGBAHost.cpp
+index 1a83560..b2c1997 100644
+--- a/Source/Android/jni/GBA/AndroidGBAHost.cpp
++++ b/Source/Android/jni/GBA/AndroidGBAHost.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "Common/CommonTypes.h"
+ #include "Core/HW/GBACore.h"
++#include "Core/NetPlayProto.h"
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+ 
+@@ -68,6 +69,18 @@ public:
+       return;
+ 
+     const HW::GBA::CoreInfo info = core->GetCoreInfo();
++
++    // In netplay each player must see only the GBA they own on the bottom screen
++    // (host = port 2, joiner = port 3). device_number is the SI channel, i.e. the
++    // pad index NetPlay::GetPadDetails() indexes. Guard the query to the 4-slot
++    // pad map -- the GB Player pseudo-device is index 4 and would index
++    // pad_map[4] out of bounds -- and treat every core as local outside netplay
++    // so the solo path is unchanged.
++    const bool is_local =
++        (info.device_number < 0 || info.device_number >= 4 || !NetPlay::IsNetPlayRunning()) ?
++            true :
++            NetPlay::GetPadDetails(info.device_number).is_local;
++
+     JNIEnv* env = IDCache::GetEnvForThread();
+     jstring title = ToJString(env, info.game_title);
+     if (env->ExceptionCheck())
+@@ -80,7 +93,8 @@ public:
+                               IDCache::GetGbaHostBridgeOnGameChanged(),
+                               static_cast<jint>(info.device_number), static_cast<jint>(info.width),
+                               static_cast<jint>(info.height), static_cast<jboolean>(info.is_gba),
+-                              static_cast<jboolean>(info.has_rom), title);
++                              static_cast<jboolean>(info.has_rom),
++                              static_cast<jboolean>(is_local), title);
+     env->DeleteLocalRef(title);
+     ClearPendingException(env, "GbaHostBridge.onGameChanged");
+   }
+-- 
+2.39.5 (Apple Git-154)
+

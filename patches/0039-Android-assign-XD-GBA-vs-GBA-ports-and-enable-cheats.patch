@@ -1,7 +1,7 @@
 From 9f081bcdbf888d0932f5254d4a5cf48cd2fef65a Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 16:59:42 -0700
-Subject: [PATCH 39/41] Android: assign XD GBA-vs-GBA ports and enable cheats
+Subject: [PATCH 39/42] Android: assign XD GBA-vs-GBA ports and enable cheats
  at netplay start
 
 Netplay's config loader rebuilds every SI channel and GBA ROM path from the
