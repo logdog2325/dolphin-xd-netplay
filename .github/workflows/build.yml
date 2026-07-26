@@ -9,6 +9,10 @@ on:
         description: "Also build the Windows desktop client"
         type: boolean
         default: false
+      build_macos:
+        description: "Also build the macOS (arm64) desktop client"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -122,3 +126,60 @@ jobs:
         with:
           name: dolphin-xd-netplay-win64
           path: Binary/x64/
+
+  macos:
+    # arm64 desktop client so a second player on an Apple Silicon Mac (same
+    # architecture as the AYN Thor) can netplay the Thor build. Netplay only
+    # connects between identical Dolphin revisions, so this MUST come from the
+    # same prepare/reconstruct as the Android APK in the same run -- release the
+    # macOS .app and the APK from one workflow_dispatch as a matched pair.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos }}
+    needs: prepare
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install deps
+        # Qt6 + Ninja only. Deliberately NO ffmpeg: linking Homebrew's ffmpeg
+        # would make the .app depend on dylibs the tester doesn't have (frame
+        # dumping auto-disables when it's absent), same choice OrreLink made.
+        run: brew install qt ninja
+      - name: Configure
+        # Flags mirror BuildMacOSUniversalBinary.py (proven) for a single arm64
+        # build. USE_MGBA=ON keeps the integrated-GBA support XD needs;
+        # ENABLE_AUTOUPDATE=OFF because this fork has no update server;
+        # POSTPROCESS_BUNDLE=ON copies Qt into the .app so it is self-contained;
+        # code signing stays at the default ad-hoc "-" identity.
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix qt)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 \
+            -DENABLE_AUTOUPDATE=OFF \
+            -DENABLE_TESTS=OFF \
+            -DUSE_MGBA=ON \
+            -DUSE_SYSTEM_LIBS=OFF \
+            -DUSE_SYSTEM_ICONV=ON \
+            -DUSE_SYSTEM_BZIP2=ON \
+            -DUSE_SYSTEM_CURL=ON \
+            -DPOSTPROCESS_BUNDLE=ON \
+            -DDISTRIBUTOR=xd-netplay
+      - name: Build
+        run: cmake --build build --target dolphin-emu
+      - name: Package .app
+        run: |
+          set -euo pipefail
+          APP="$(find build -maxdepth 3 -name 'Dolphin.app' -type d | head -1)"
+          if [ -z "$APP" ]; then echo "Dolphin.app not found:" >&2; find build -maxdepth 3 -name '*.app' >&2; exit 1; fi
+          echo "Packaging $APP"
+          mkdir -p out
+          ditto -c -k --keepParent "$APP" "out/dolphin-xd-netplay-macos-arm64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-macos
+          path: out/*.zip
