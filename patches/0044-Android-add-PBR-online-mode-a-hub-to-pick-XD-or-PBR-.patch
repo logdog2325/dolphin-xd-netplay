@@ -1,4 +1,4 @@
-From 65ba42c8b0e80a2f84975a5117f7d195229ed98e Mon Sep 17 00:00:00 2001
+From 8f83848269b0cd3e4204f6a1d63bb96c19f7edb5 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sun, 26 Jul 2026 10:45:00 -0700
 Subject: [PATCH 44/44] Android: add PBR online mode + a hub to pick XD or PBR
@@ -49,7 +49,7 @@ index 88cfdd1..c4e4969 100644
  [Patches_RetroAchievements_Verified]
  $Fix black screen effects
 diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
-index de9e6a1..c9bd51b 100644
+index de9e6a1..f95c19a 100644
 --- a/Source/Android/app/src/main/AndroidManifest.xml
 +++ b/Source/Android/app/src/main/AndroidManifest.xml
 @@ -52,13 +52,14 @@
@@ -73,7 +73,7 @@ index de9e6a1..c9bd51b 100644
              </intent-filter>
          </activity>
  
-+        <!-- XD launcher (unchanged) -- now opened from the hub, not the home screen. -->
++        <!-- XD launcher (code unchanged); now opened from the hub. -->
 +        <activity
 +            android:name=".features.xdnetplay.ui.XDLauncherActivity"
 +            android:exported="false"
