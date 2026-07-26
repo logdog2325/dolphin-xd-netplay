@@ -1,7 +1,7 @@
 From d7f9cf95b344b4b18f751982f118de3805b8322d Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 23:42:45 -0700
-Subject: [PATCH 42/42] Android: show each netplay player their OWN GBA screen
+Subject: [PATCH 42/43] Android: show each netplay player their OWN GBA screen
  (host port 2, joiner port 3)
 
 The bottom-screen GBA was chosen by "first core with a ROM" with no netplay

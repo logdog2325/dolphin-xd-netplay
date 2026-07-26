@@ -1,7 +1,7 @@
 From f1e9484d821bfead09d400de279edd93b08201c5 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Fri, 24 Jul 2026 19:21:30 -0700
-Subject: [PATCH 20/42] Android: auto-configure GBA ports for XD link battles
+Subject: [PATCH 20/43] Android: auto-configure GBA ports for XD link battles
 
 Zero-config missed the SI device type: ports 2 and 3 defaulted to
 Disabled, so XD sat on its GBA-connection instruction screen forever.

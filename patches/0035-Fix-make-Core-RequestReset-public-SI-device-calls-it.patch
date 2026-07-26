@@ -1,7 +1,7 @@
 From cf616cc11c0fc47e2ea111f47c9bc31e5c0ca3fc Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sat, 25 Jul 2026 09:56:45 -0700
-Subject: [PATCH 35/42] Fix: make Core::RequestReset public (SI device calls
+Subject: [PATCH 35/43] Fix: make Core::RequestReset public (SI device calls
  it)
 
 ---

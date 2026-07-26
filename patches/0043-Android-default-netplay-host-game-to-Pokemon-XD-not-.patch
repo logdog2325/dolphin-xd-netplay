@@ -1,0 +1,37 @@
+From ecd2286bf01ebc7922d6946e9984b6fd9db8a0cb Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 26 Jul 2026 09:46:39 -0700
+Subject: [PATCH 43/43] Android: default netplay host game to Pokemon XD, not
+ the first library entry
+
+When hosting, NetplayViewModel.setInitialGame() falls back to
+gameFiles.firstOrNull() whenever NETPLAY_GAME doesn't match a library game, so
+the host landed on whatever GameCube game sorts first (e.g. Call of Duty)
+instead of XD. Pin NETPLAY_GAME to GXXE01 in the launcher force-config so
+hosting auto-selects Pokemon XD; the lobby's game row can still change it.
+---
+ .../features/xdnetplay/ui/XDLauncherActivity.kt           | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index eefb2b6..711f9a8 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -318,6 +318,14 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
+             BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
+         }
++        // When hosting, netplay defaults its game to the FIRST entry in the
++        // GameCube library (setInitialGame -> gameFiles.firstOrNull()), which is
++        // whatever sorts first (e.g. Call of Duty), not XD. Pin the netplay game
++        // to Pokemon XD so the host lands on it automatically; the lobby's game
++        // row can still change it.
++        if (StringSetting.NETPLAY_GAME.string != XD_GAME_ID) {
++            StringSetting.NETPLAY_GAME.setString(NativeConfig.LAYER_BASE, XD_GAME_ID); changed = true
++        }
+         if (changed) {
+             NativeConfig.save(NativeConfig.LAYER_BASE)
+         }
+-- 
+2.39.5 (Apple Git-154)
+
