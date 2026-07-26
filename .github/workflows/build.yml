@@ -135,7 +135,10 @@ jobs:
     # macOS .app and the APK from one workflow_dispatch as a matched pair.
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_macos }}
     needs: prepare
-    runs-on: macos-14
+    # macos-15 (Xcode 16 / Apple clang 16). macos-14's Apple clang 15 lacks
+    # C++20 parenthesized aggregate initialization (P0960), which Dolphin's
+    # HookableEvent relies on -- it fails to compile ControllerInterface.cpp.
+    runs-on: macos-15
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
