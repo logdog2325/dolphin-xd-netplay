@@ -176,12 +176,15 @@ jobs:
         run: cmake --build build --target dolphin-emu
       - name: Package .app
         run: |
-          set -euo pipefail
-          APP="$(find build -maxdepth 3 -name 'Dolphin.app' -type d | head -1)"
-          if [ -z "$APP" ]; then echo "Dolphin.app not found:" >&2; find build -maxdepth 3 -name '*.app' >&2; exit 1; fi
+          # On macOS the DolphinQt target sets OUTPUT_NAME "DolphinQt", so the
+          # bundle is DolphinQt.app (at build/Binaries/), not Dolphin.app.
+          APP="$(find build -name 'DolphinQt.app' -type d 2>/dev/null | head -1)"
+          if [ -z "$APP" ]; then APP="$(find build -name '*.app' -type d 2>/dev/null | head -1)"; fi
+          if [ -z "$APP" ]; then echo "no .app produced; build/Binaries:" >&2; ls -la build/Binaries >&2 || true; exit 1; fi
           echo "Packaging $APP"
           mkdir -p out
           ditto -c -k --keepParent "$APP" "out/dolphin-xd-netplay-macos-arm64.zip"
+          ls -la out
       - uses: actions/upload-artifact@v4
         with:
           name: dolphin-xd-netplay-macos
