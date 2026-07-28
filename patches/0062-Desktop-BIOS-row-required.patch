@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 14:54:27 -0700
+Subject: [PATCH 3/3] Desktop launcher: required official-BIOS row with picker
+
+Same correction as the Android launcher: XD cannot detect an Emerald
+booted by the bundled open-source BIOS on this core, so the official dump
+is a hard requirement, not an optional nicety. The row shows red until an
+official BIOS is configured, the picker hash-validates the chosen file,
+and the existing folder auto-discovery still imports one silently when it
+sits next to the XD ISO.
+---
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 26 +++++++++++++++++++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  2 ++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   | 17 ++++++++++++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |  4 +++
+ 4 files changed, 49 insertions(+)
+
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 3fe6156..94d4540 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -158,6 +158,7 @@ void XDLauncherDialog::CreateMainLayout()
+   };
+   add_row(&m_game_row, tr("Pokémon XD (USA) — choose your XD ISO file"), tr("Choose ISO..."));
+   add_row(&m_rom_row, tr("Emerald ROM configured"), tr("Choose ROM..."));
++  add_row(&m_bios_row, tr("Official GBA BIOS"), tr("Choose BIOS..."));
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+   add_row(&m_gba_input_row, tr("GBA input"), tr("Controllers..."));
+@@ -207,6 +208,7 @@ void XDLauncherDialog::ConnectWidgets()
+ 
+   connect(m_game_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixGamePath);
+   connect(m_rom_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixEmeraldRom);
++  connect(m_bios_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixBios);
+   connect(m_team_saves_row.fix_button, &QPushButton::clicked, this,
+           &XDLauncherDialog::OnFixTeamSaves);
+   connect(m_vs_save_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixVsSave);
+@@ -252,6 +254,11 @@ void XDLauncherDialog::RefreshChecklist()
+ 
+   SetRowState(m_game_row.status, FindXdGame() != nullptr);
+   SetRowState(m_rom_row.status, EmeraldRomConfigured());
++  SetRowState(m_bios_row.status, XDNetplay::CheckOfficialBios(nullptr));
++  m_bios_row.description->setText(
++      XDNetplay::CheckOfficialBios(nullptr) ?
++          tr("Official GBA BIOS (XD can detect the GBA)") :
++          tr("Official GBA BIOS required — XD cannot detect the GBA without it"));
+   SetRowState(m_team_saves_row.status, TeamSavesInstalled());
+   SetRowState(m_vs_save_row.status, VsSaveInstalled());
+   // m_gba_input_row stays informational.
+@@ -332,6 +339,25 @@ void XDLauncherDialog::OnFixGamePath()
+   RefreshChecklist();
+ }
+ 
++
++void XDLauncherDialog::OnFixBios()
++{
++  const QString path = QFileDialog::getOpenFileName(this, tr("Select the official GBA BIOS"),
++                                                    QString(), tr("GBA BIOS (*.bin)"));
++  if (path.isEmpty())
++    return;
++
++  if (!XDNetplay::ImportOfficialBios(path.toStdString()))
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("That file is not the official GBA BIOS (16 KB, must match the known hash). "
++           "XD cannot detect the GBA without the official dump."));
++    return;
++  }
++  RefreshChecklist();
++}
++
+ void XDLauncherDialog::OnFixEmeraldRom()
+ {
+   const QString path = QFileDialog::getOpenFileName(this, tr("Select an Emerald ROM"), QString(),
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 8f1dabc..97369d9 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -64,6 +64,7 @@ private:
+ 
+   void OnFixGamePath();
+   void OnFixEmeraldRom();
++  void OnFixBios();
+   void OnFixTeamSaves();
+   void OnFixVsSave();
+   void OnGbaInputInfo();
+@@ -77,6 +78,7 @@ private:
+ 
+   ChecklistRow m_game_row;
+   ChecklistRow m_rom_row;
++  ChecklistRow m_bios_row;
+   ChecklistRow m_team_saves_row;
+   ChecklistRow m_vs_save_row;
+   ChecklistRow m_gba_input_row;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 488038a..58502e6 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -146,6 +146,23 @@ bool IsOfficialBiosFile(const std::string& path)
+   return Common::CaseInsensitiveEquals(digest, OFFICIAL_GBA_BIOS_SHA1);
+ }
+ 
++bool ImportOfficialBios(const std::string& path)
++{
++  if (!IsOfficialBiosFile(path))
++    return false;
++
++  const std::string destination = File::GetUserPath(D_GBAUSER_IDX) + GBA_BIOS;
++  if (path != destination)
++  {
++    File::CreateFullPath(destination);
++    if (!File::CopyRegularFile(path, destination))
++      return false;
++  }
++  Config::SetBaseOrCurrent(Config::MAIN_GBA_BIOS_PATH, destination);
++  Config::Save();
++  return true;
++}
++
+ bool AutoImportOfficialBios(const std::string& directory)
+ {
+   if (CheckOfficialBios(nullptr))
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index cbc109e..ff94cc1 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -53,6 +53,10 @@ bool IsOfficialBiosFile(const std::string& path);
+ // Returns true once an official BIOS is configured.
+ bool AutoImportOfficialBios(const std::string& directory);
+ 
++// Validates the given file as the official BIOS and installs it (copy into the
++// GBA user dir + config). Returns false if it is not the official dump.
++bool ImportOfficialBios(const std::string& path);
++
+ // Copy the bundled EMERALD-2/3.sav templates next to the imported Emerald
+ // dump's derived save paths for ports 2 and 3. Existing saves are never
+ // overwritten; missing Sys templates are tolerated.
+-- 
+2.39.5 (Apple Git-154)
+
