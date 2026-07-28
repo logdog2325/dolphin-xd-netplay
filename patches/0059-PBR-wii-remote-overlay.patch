@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 13:14:02 -0700
+Subject: [PATCH] PBR: show the Wii Remote overlay so the game is playable
+
+PBR is driven entirely by the Wii Remote pointer, but this fork ships the
+touch overlay off (patch "Thor-friendly defaults") because XD is played
+with the handheld's physical buttons. The result was PBR booting to menus
+with no controls on screen and nothing able to aim at them.
+
+PBR mode now enables the overlay, selects the Wii Remote layout, and makes
+sure Wiimote 1 is emulated. The XD launcher turns the overlay back off when
+that mode is opened, so each mode configures the input it needs and neither
+disturbs the other -- the same self-healing pattern the rest of the mode
+config already uses.
+---
+ .../xdnetplay/ui/PbrLauncherActivity.kt       | 21 +++++++++++++++++++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  6 ++++++
+ 2 files changed, 27 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+index a9f189a..e4a904d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+@@ -151,6 +151,23 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
+             BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
+         }
++        // PBR is driven by the Wii Remote pointer, and this fork ships the touch
++        // overlay off because XD is played with the handheld's physical buttons.
++        // Without it PBR boots to a menu nothing can aim at, so turn the overlay
++        // on and give it a Wii Remote to draw. The XD launcher turns it back off
++        // when that mode is opened, so each mode gets the input it needs.
++        if (!BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.boolean) {
++            BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.setBoolean(NativeConfig.LAYER_BASE, true)
++            changed = true
++        }
++        if (IntSetting.MAIN_OVERLAY_WII_CONTROLLER.int != OVERLAY_WIIMOTE) {
++            IntSetting.MAIN_OVERLAY_WII_CONTROLLER.setInt(NativeConfig.LAYER_BASE, OVERLAY_WIIMOTE)
++            changed = true
++        }
++        if (IntSetting.WIIMOTE_1_SOURCE.int != WIIMOTE_SOURCE_EMULATED) {
++            IntSetting.WIIMOTE_1_SOURCE.setInt(NativeConfig.LAYER_BASE, WIIMOTE_SOURCE_EMULATED)
++            changed = true
++        }
+         if (changed) {
+             NativeConfig.save(NativeConfig.LAYER_BASE)
+         }
+@@ -171,6 +188,10 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         // dumps are usually USA (RPBE01) -- accept every region's ID.
+         val PBR_GAME_IDS = listOf("RPBE01", "RPBP01", "RPBJ01")
+ 
++        // InputOverlay.OVERLAY_WIIMOTE / emulated Wiimote source.
++        private const val OVERLAY_WIIMOTE = 1
++        private const val WIIMOTE_SOURCE_EMULATED = 1
++
+         fun findPbrGame() =
+             PBR_GAME_IDS.firstNotNullOfOrNull { GameFileCacheManager.getGameFileByGameId(it) }
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 711f9a8..0764612 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -318,6 +318,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
+             BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
+         }
++        // PBR mode turns the touch overlay on for the Wii Remote pointer. XD is
++        // played with the handheld's physical buttons, so put it back.
++        if (BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.boolean) {
++            BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.setBoolean(NativeConfig.LAYER_BASE, false)
++            changed = true
++        }
+         // When hosting, netplay defaults its game to the FIRST entry in the
+         // GameCube library (setInitialGame -> gameFiles.firstOrNull()), which is
+         // whatever sorts first (e.g. Call of Duty), not XD. Pin the netplay game
+-- 
+2.39.5 (Apple Git-154)
+
