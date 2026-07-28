@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 00:53:18 -0700
+Subject: [PATCH] GBA auto-reset: raise the cooldown floor past the official
+ BIOS boot time
+
+The cooldown must exceed the slowest reset->link-window-open time, or a
+probe landing after the cooldown but before Emerald's window opens resets
+the core again and the window is never reached. Measured cycle-accurate:
+the bundled open-source BIOS reaches the window 2.35 s after reset, the
+official BIOS 4.78 s -- past the old 4 s floor, which made linking with a
+configured official BIOS probabilistic (it only worked when XD's probe
+cadence happened to leave a gap). 6 s clears the worst case with 1.2 s of
+margin. Steady-state reset cadence is unaffected: the window_just_closed
+edge drives it; the cooldown is only the bootstrap/missed-edge recovery.
+---
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 927ff1d..2f79ac4 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -122,7 +122,13 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         m_last_data_cmd != 0 && (m_timestamp_sent - m_last_data_cmd) < tps * 8;
+     if (probing && !link_now && !handshake_active && !m_link_established)
+     {
+-      const u64 min_interval = tps * 4;
++      // Must exceed the slowest reset->link-window-open time or the cooldown
++      // resets the core before Emerald's window ever opens (livelock).
++      // Measured: bundled open-source BIOS 2.35 s, official BIOS 4.78 s --
++      // 6 s clears the worst case with margin. Steady-state reset cadence is
++      // driven by the window_just_closed edge, so this only affects the
++      // bootstrap/missed-edge recovery path.
++      const u64 min_interval = tps * 6;
+       const bool window_just_closed = m_link_was_enabled;
+       const bool cooldown_elapsed =
+           m_last_auto_reset == 0 || m_timestamp_sent - m_last_auto_reset > min_interval;
+-- 
+2.39.5 (Apple Git-154)
+
