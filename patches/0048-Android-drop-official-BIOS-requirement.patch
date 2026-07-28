@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 00:03:06 -0700
+Subject: [PATCH] Android: drop the official-BIOS checklist requirement
+
+Field-verified: the bundled open-source GBA BIOS links with XD fine on
+both Android and desktop. The joybus handshake lives in the cartridge
+code, not the BIOS, so the old 'official BIOS needed for XD link' row
+(added when the BIOS was wrongly suspected) was pure setup friction.
+Replace it with an informational 'bundled, no setup needed' row. An
+official BIOS still loads if one is configured; the picker plumbing
+stays for a future optional-settings home.
+---
+ .../features/xdnetplay/ui/XDLauncherScreen.kt       | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 30f2cb4..29e3a79 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -191,12 +191,15 @@ private fun ReadinessCard(
+                 fixLabel = "Input settings…",
+                 onFix = onOpenSettings
+             )
++            // No BIOS row: the bundled open-source BIOS links fine (joybus lives
++            // in the cartridge, not the BIOS), so demanding an official dump was
++            // just setup friction. An official BIOS still loads if configured.
+             CheckRow(
+-                ok = biosLinkReady,
+-                okText = "Official GBA BIOS configured (link-ready)",
+-                missingText = "Official GBA BIOS needed for XD link — dump yours or copy from another emulator's system folder",
+-                fixLabel = "Choose BIOS…",
+-                onFix = onPickGbaBios
++                ok = true,
++                okText = "GBA BIOS bundled — no setup needed",
++                missingText = "",
++                fixLabel = "",
++                onFix = null
+             )
+             CheckRow(
+                 ok = true,
+-- 
+2.39.5 (Apple Git-154)
+
