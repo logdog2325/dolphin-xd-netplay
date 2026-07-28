@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 02:11:33 -0700
+Subject: [PATCH] PBR: recognize every region's disc and enable the PAL fixes
+
+The UPA server pack is built from the PAL disc -- its game ID is RPBP01,
+not the USA RPBE01 the launcher hard-required, so the checklist never
+recognized the ISO and Play refused to boot. Accept RPBE01/RPBP01/RPBJ01
+everywhere and drop the region from the user-facing messages.
+
+Also give RPBP01 the same treatment RPBE01 got: enable the black-screen
+OnFrame fix (PAL addresses already ship in Sys) and force EFB copies to
+RAM so battle-pass avatars render.
+---
+ Data/Sys/GameSettings/RPBP01.ini                  |  9 +++++++++
+ .../features/xdnetplay/ui/PbrLauncherActivity.kt  | 15 ++++++++++-----
+ .../features/xdnetplay/ui/PbrLauncherScreen.kt    |  2 +-
+ 3 files changed, 20 insertions(+), 6 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/RPBP01.ini b/Data/Sys/GameSettings/RPBP01.ini
+index c14a0d8..9244803 100644
+--- a/Data/Sys/GameSettings/RPBP01.ini
++++ b/Data/Sys/GameSettings/RPBP01.ini
+@@ -11,3 +11,12 @@ $Fix black screen effects
+ 
+ [Patches_RetroAchievements_Verified]
+ $Fix black screen effects
++
++[OnFrame_Enabled]
++$Fix black screen effects
++
++[Video_Hacks]
++# Battle-pass trainer avatars render invisible when EFB copies go to texture
++# only; the UPA and Restorer PBR packs both note turning this off. Force it off
++# for PBR so the passes display. (XD Netplay PBR mode.)
++EFBToTextureEnable = False
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+index 866ed0b..a9f189a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+@@ -90,7 +90,7 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+ 
+         GameFileCacheManager.getGameFiles().observe(this) {
+-            pbrFound = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID) != null
++            pbrFound = findPbrGame() != null
+         }
+ 
+         setContent {
+@@ -120,7 +120,7 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private fun refreshChecks() {
+         ensurePbrConfig()
+         nandImported = checkNandImported()
+-        pbrFound = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID) != null
++        pbrFound = findPbrGame() != null
+     }
+ 
+     private fun checkNandImported(): Boolean = try {
+@@ -157,17 +157,22 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+     }
+ 
+     private fun bootPbr() {
+-        val pbr = GameFileCacheManager.getGameFileByGameId(PBR_GAME_ID)
++        val pbr = findPbrGame()
+         if (pbr != null) {
+             EmulationActivity.launch(this, pbr.getPath(), false)
+         } else {
+             statusMessage =
+-                "Patched Pokémon Battle Revolution (RPBE01) not found — choose the folder with your UPA ISO."
++                "Pokémon Battle Revolution not found (any region) — choose the folder with your UPA ISO."
+         }
+     }
+ 
+     companion object {
+-        const val PBR_GAME_ID = "RPBE01"
++        // The UPA server pack is built from the PAL disc (RPBP01), while stock
++        // dumps are usually USA (RPBE01) -- accept every region's ID.
++        val PBR_GAME_IDS = listOf("RPBE01", "RPBP01", "RPBJ01")
++
++        fun findPbrGame() =
++            PBR_GAME_IDS.firstNotNullOfOrNull { GameFileCacheManager.getGameFileByGameId(it) }
+ 
+         @JvmStatic
+         fun launch(context: Context) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+index 5a37812..3bc7e16 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+@@ -80,7 +80,7 @@ fun PbrLauncherScreen(
+                     )
+                     CheckRow(
+                         ok = pbrFound,
+-                        okText = "Patched PBR found (RPBE01)",
++                        okText = "Patched PBR ISO found",
+                         missingText = "Patched PBR not found — choose the folder with your UPA ISO",
+                         fixLabel = "Choose folder…",
+                         onFix = onPickPbrFolder
+-- 
+2.39.5 (Apple Git-154)
+
