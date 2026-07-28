@@ -1,0 +1,116 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 02:40:11 -0700
+Subject: [PATCH] Harden the launcher startup, checklist refresh, and paste
+ fetch
+
+Four fixes from review of the launcher UX and team editor:
+
+- The startup launcher could appear over a game booted by double-clicking
+  a disc image in Finder: those boots arrive as a QFileOpenEvent after the
+  event loop starts, so m_pending_boot is still null when the timer is
+  armed. ShowXDLauncher now bails when a game is already running.
+- The XD checklist row stayed red after picking an ISO because the game
+  scan is asynchronous and nothing refreshed the dialog. Refresh on the
+  game list model's rowsInserted/modelReset.
+- The pokepaste worker captured a raw this and could call QueueOnObject on
+  a destroyed dialog if Dolphin quit mid-fetch. Capture a QPointer and
+  bail if it cleared.
+- pokepast.es answers the bare paste URL with a 301, which surfaced as a
+  network error because redirects are off by default. Follow them.
+---
+ Source/Core/DolphinQt/MainWindow.cpp          |  6 ++++++
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  | 20 ++++++++++++++-----
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  8 ++++++++
+ 3 files changed, 29 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
+index faa36ec693..eb9c4cfe23 100644
+--- a/Source/Core/DolphinQt/MainWindow.cpp
++++ b/Source/Core/DolphinQt/MainWindow.cpp
+@@ -1460,6 +1460,12 @@ void MainWindow::ShowNetPlayBrowser()
+ 
+ void MainWindow::ShowXDLauncher()
+ {
++  // Finder/Dock file-association boots arrive as a QFileOpenEvent after the
++  // event loop starts, so m_pending_boot is still null when the startup timer
++  // is armed. Bail if a game got going in the meantime.
++  if (!Core::IsUninitialized(m_system))
++    return;
++
+   m_xd_launcher->show();
+   m_xd_launcher->raise();
+   m_xd_launcher->activateWindow();
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index f793a9c459..7c590c4559 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -13,6 +13,7 @@
+ #include <QLabel>
+ #include <QListWidget>
+ #include <QPlainTextEdit>
++#include <QPointer>
+ #include <QPushButton>
+ #include <QRegularExpression>
+ #include <QShowEvent>
+@@ -283,17 +284,26 @@ void TeamEditorDialog::OnImport()
+   const std::string url = match.captured(0).toStdString() + "/raw";
+   SetMessages({tr("Fetching %1…").arg(match.captured(0))});
+   m_fetching = true;
+-  std::thread([this, url] {
++  // QPointer, not a raw this: the worker outlives the dialog if Dolphin quits
++  // mid-fetch, and QueueOnObject on a destroyed receiver is undefined.
++  QPointer<TeamEditorDialog> self(this);
++  std::thread([self, url] {
+     Common::HttpRequest request;
++    // pokepast.es answers the bare paste URL with a 301 to its canonical form.
++    request.FollowRedirects();
+     Common::HttpRequest::Response response = request.Get(url);
+-    QueueOnObject(this, [this, response = std::move(response)] {
+-      m_fetching = false;
++    if (!self)
++      return;
++    QueueOnObject(self, [self, response = std::move(response)] {
++      if (!self)
++        return;
++      self->m_fetching = false;
+       if (!response)
+       {
+-        SetMessages({tr("Could not fetch the paste (network error).")});
++        self->SetMessages({tr("Could not fetch the paste (network error).")});
+         return;
+       }
+-      ApplyImportText(std::string(response->begin(), response->end()));
++      self->ApplyImportText(std::string(response->begin(), response->end()));
+     });
+   }).detach();
+ }
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index eca276c6f9..3fe6156ab9 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <string_view>
+ 
++#include <QAbstractItemModel>
+ #include <QCheckBox>
+ #include <QFileDialog>
+ #include <QGridLayout>
+@@ -197,6 +198,13 @@ void XDLauncherDialog::CreateMainLayout()
+ 
+ void XDLauncherDialog::ConnectWidgets()
+ {
++  // The game scan is asynchronous: without this the XD row stays red until the
++  // user reopens the dialog, even though the pick succeeded.
++  connect(&m_game_list_model, &QAbstractItemModel::rowsInserted, this,
++          [this] { RefreshChecklist(); });
++  connect(&m_game_list_model, &QAbstractItemModel::modelReset, this,
++          [this] { RefreshChecklist(); });
++
+   connect(m_game_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixGamePath);
+   connect(m_rom_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixEmeraldRom);
+   connect(m_team_saves_row.fix_button, &QPushButton::clicked, this,
+-- 
+2.39.5 (Apple Git-154)
+
