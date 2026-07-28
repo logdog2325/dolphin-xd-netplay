@@ -1,0 +1,678 @@
+From 2438b7562a6e342cdea8c5fab52f75bf30d4aa6a Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 13:18:20 -0700
+Subject: [PATCH] Android: GBA link diagnostics and manual screen switch
+
+Socket 2 links to XD but socket 3 never does, and the Android bottom
+screen auto-picks one GBA with no way to look at the other, so there is
+currently no way to tell whether socket 3 is even resetting or whether
+its joybus window ever opens. Add both halves of that ground truth.
+
+Diagnostics: SI_DeviceGBAEmu publishes a per-SI-channel snapshot of the
+link state -- link open now, link-window open count, auto-resets issued,
+established/battle-locked latches, last joybus command byte, and how
+many polls XD spent probing this port. It is written from the existing
+poll and is strictly a tap: every change is an added counter or store,
+no threshold, condition or branch moved, so link and reset behaviour is
+bit-for-bit what it was. Reset counting covers all three paths that
+actually issue one (solo RequestReset, netplay Pad::SetGBAReset, and the
+X-button handler). The snapshot is atomic because the UI thread reads it
+while the emulation thread writes it.
+
+GbaHostBridge.getLinkDiag() hands one port's snapshot to Kotlin packed
+into a long -- allocation-free, since GbaScreenView repaints it every
+frame -- and the on-screen readout gains "lk/win/rst/prb/est/lck/cmd"
+per port. The diagnostic text now shrinks to fit the view instead of
+running off the edge, and its Paint/StringBuilder are hoisted out of
+the draw path.
+
+Screen switch: a long press on the GBA view cycles the bottom screen to
+the next GBA. It only arms on bare canvas, never on a touch button, so
+holding A for half a second still just holds A; a tap is byte-for-byte
+the old path. The cycled choice sticks until the core behind it goes
+away, then falls back to the automatic pick.
+
+The switch is local-GBAs-only, so it cannot be used to peek at an
+opponent's screen in netplay. Seeing the other player's handheld would
+expose their party and their move selection live, so it is blocked
+twice: a device is only cyclable if its CoreInfo.isLocal is true (that
+flag comes from NetPlay::GetPadDetails().is_local, and in a netplay
+battle exactly one link device is local), and the switch refuses
+outright while any netplay session exists. A manual pick is also
+re-validated on every core update and dropped the moment it stops being
+local or present. Input focus follows the same rule and is never
+requested for a GBA this player does not own.
+---
+ .../features/dualscreen/GbaHostBridge.kt      |  93 +++++++++
+ .../features/dualscreen/GbaScreenView.kt      | 194 ++++++++++++++++--
+ Source/Android/jni/GBA/AndroidGBAHost.cpp     |  46 +++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    |  40 ++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  42 ++++
+ 5 files changed, 396 insertions(+), 19 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+index fa766e7..b4418be 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaHostBridge.kt
+@@ -5,6 +5,7 @@ package org.dolphinemu.dolphinemu.features.dualscreen
+ import android.os.Handler
+ import android.os.Looper
+ import androidx.annotation.Keep
++import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import java.util.concurrent.CopyOnWriteArraySet
+ 
+ object GbaHostBridge {
+@@ -48,9 +49,40 @@ object GbaHostBridge {
+     var visibleDeviceNumber: Int = NO_DEVICE
+         private set
+ 
++    /**
++     * Manual bottom-screen override set by [cycleVisibleDevice], or [NO_DEVICE]
++     * for the automatic pick. Only ever holds a device this player owns; see
++     * [isSwitchable].
++     */
++    private var manualDevice: Int = NO_DEVICE
++
+     @JvmStatic
+     external fun setVisibleDevice(deviceNumber: Int)
+ 
++    /**
++     * Packed joybus link diagnostic for one SI channel, or 0 for a device that
++     * has none. See the bit layout in AndroidGBAHost.cpp; decode with the
++     * `LinkDiag*` helpers below.
++     */
++    @JvmStatic
++    external fun getLinkDiag(deviceNumber: Int): Long
++
++    // Decoders for the packed value above. `ushr` matters: probe_count occupies
++    // the top 16 bits, so a busy port makes the Long negative.
++    fun linkDiagLinkOpen(diag: Long): Boolean = (diag and 0x1L) != 0L
++
++    fun linkDiagEstablished(diag: Long): Boolean = (diag and 0x2L) != 0L
++
++    fun linkDiagLocked(diag: Long): Boolean = (diag and 0x4L) != 0L
++
++    fun linkDiagLastCommand(diag: Long): Int = ((diag ushr 8) and 0xFFL).toInt()
++
++    fun linkDiagResetCount(diag: Long): Int = ((diag ushr 16) and 0xFFFFL).toInt()
++
++    fun linkDiagWindowCount(diag: Long): Int = ((diag ushr 32) and 0xFFFFL).toInt()
++
++    fun linkDiagProbeCount(diag: Long): Int = ((diag ushr 48) and 0xFFFFL).toInt()
++
+     fun addListener(listener: Listener) {
+         listeners.add(listener)
+         listener.onGbaVisibleDeviceChanged(visibleDeviceNumber, getVisibleInfo())
+@@ -76,7 +108,67 @@ object GbaHostBridge {
+     private fun getVisibleInfo(): CoreInfo? =
+         if (visibleDeviceNumber in infos.indices) infos[visibleDeviceNumber] else null
+ 
++    /**
++     * Whether the manual switch is allowed to select [device].
++     *
++     * `isLocal` is the load-bearing term and is NOT optional: it is computed
++     * natively from `NetPlay::GetPadDetails(n).is_local` (true for everything
++     * outside netplay), so in a netplay battle exactly one link device passes
++     * this test -- the one this player owns. Being able to put a remote GBA on
++     * the bottom screen would show the opponent's party and their move choices
++     * live, which is a total cheat, so the switch must never be able to reach
++     * one. In solo every core is local and this reduces to "a core is here".
++     */
++    private fun isSwitchable(device: Int): Boolean {
++        if (device !in LINK_DEVICE_RANGE) {
++            return false
++        }
++        val info = infos[device] ?: return false
++        return (info.isGba || info.hasRom) && info.isLocal
++    }
++
++    /** True while a netplay session exists, lobby included. */
++    private fun isNetplayActive(): Boolean = NetplayManager.activeSession != null
++
++    /**
++     * Advance the bottom screen to the next GBA this player owns, wrapping.
++     * No-op if nothing else is switchable -- which is always the case in
++     * netplay, where the second belt below refuses outright.
++     */
++    fun cycleVisibleDevice() {
++        // Belt 2: never switch at all while netplay is up. Belt 1 (isSwitchable)
++        // already makes a remote GBA unreachable; this makes the whole feature
++        // inert in the only situation where peeking would matter.
++        if (isNetplayActive()) {
++            return
++        }
++
++        val deviceCount = LINK_DEVICE_RANGE.count()
++        val current = visibleDeviceNumber
++        val start = if (current in LINK_DEVICE_RANGE) {
++            current - LINK_DEVICE_RANGE.first
++        } else {
++            deviceCount - 1
++        }
++
++        for (step in 1..deviceCount) {
++            val candidate = LINK_DEVICE_RANGE.first + (start + step) % deviceCount
++            if (isSwitchable(candidate)) {
++                manualDevice = candidate
++                refreshVisibleDevice()
++                return
++            }
++        }
++    }
++
+     private fun refreshVisibleDevice() {
++        // Belt 3: a manual pick only survives while it stays a local, present
++        // core, and never into a netplay session. Anything else drops straight
++        // back to the automatic pick below.
++        if (isNetplayActive() || !isSwitchable(manualDevice)) {
++            manualDevice = NO_DEVICE
++        }
++
+         // In netplay, prefer the GBA WE own (isLocal) so each player sees their
+         // own bottom screen -- host port 2, joiner port 3. The fallbacks are
+         // load-bearing: in solo every core is local (native passes isLocal=true
+@@ -85,6 +177,7 @@ object GbaHostBridge {
+         // GBA rather than a black screen. Never select a non-local GBA outright.
+         val nextDevice = when {
+             frameConsumerCount == 0 -> NO_DEVICE
++            manualDevice != NO_DEVICE -> manualDevice
+             infos[GB_PLAYER_DEVICE]?.hasRom == true -> GB_PLAYER_DEVICE
+             else -> LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true && infos[it]?.isLocal == true }
+                 ?: LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index 52f956b..b5fecb9 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -13,8 +13,10 @@ import android.os.Handler
+ import android.os.Looper
+ import android.util.AttributeSet
+ import android.util.TypedValue
++import android.view.HapticFeedbackConstants
+ import android.view.MotionEvent
+ import android.view.View
++import android.view.ViewConfiguration
+ import androidx.core.graphics.createBitmap
+ import androidx.core.graphics.scale
+ import androidx.core.view.isVisible
+@@ -25,7 +27,9 @@ import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.overlay.InputOverlayDrawableButton
+ import org.dolphinemu.dolphinemu.overlay.InputOverlayDrawableDpad
++import kotlin.math.abs
+ import kotlin.math.floor
++import kotlin.math.max
+ 
+ class GbaScreenView @JvmOverloads constructor(
+     context: Context,
+@@ -44,6 +48,16 @@ class GbaScreenView @JvmOverloads constructor(
+         textSize = sp(22f)
+     }
+ 
++    // Hoisted out of drawLinkDiagnostic(): this view repaints every GBA frame,
++    // so the diagnostic must not allocate a Paint/StringBuilder 60 times a
++    // second. Only the finished line Strings are unavoidable.
++    private val diagPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
++        color = 0xFFFFEE55.toInt()
++        textAlign = Paint.Align.LEFT
++    }
++    private val diagBuilder = StringBuilder(96)
++    private val diagLines = arrayOfNulls<String>(DIAG_LINE_COUNT)
++
+     private var bitmap: Bitmap? = null
+     private var visibleDevice = GbaHostBridge.NO_DEVICE
+     private var visibleInfo: GbaHostBridge.CoreInfo? = null
+@@ -60,6 +74,21 @@ class GbaScreenView @JvmOverloads constructor(
+         invalidate()
+     }
+ 
++    private val touchSlop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
++    private var longPressArmed = false
++    private var longPressConsumed = false
++    private var longPressDownX = 0f
++    private var longPressDownY = 0f
++    private val longPressRunnable = Runnable {
++        longPressArmed = false
++        longPressConsumed = true
++        // Drop anything this finger was holding before the screen changes under
++        // it, so no control is left stuck on the outgoing device.
++        clearGbaInput()
++        performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
++        GbaHostBridge.cycleVisibleDevice()
++    }
++
+     override fun onAttachedToWindow() {
+         super.onAttachedToWindow()
+         GbaHostBridge.addListener(this)
+@@ -70,6 +99,8 @@ class GbaScreenView @JvmOverloads constructor(
+         setFrameConsumerEnabled(false)
+         clearGbaInput()
+         mainHandler.removeCallbacks(hideTitleRunnable)
++        cancelLongPress()
++        longPressConsumed = false
+         inputFocusRequested = false
+         GbaInputFocusManager.clearFocus(visibleDevice)
+         unregisterVisibleGba()
+@@ -112,10 +143,27 @@ class GbaScreenView @JvmOverloads constructor(
+     }
+ 
+     override fun onTouchEvent(event: MotionEvent): Boolean {
++        // Runs before the early return so the switch is reachable even when no
++        // GBA is on screen yet. It only ever arms on empty canvas (see
++        // canLongPressAt), so held buttons are untouched.
++        trackLongPress(event)
++
+         if (visibleDevice !in 0..3) {
+             return true
+         }
+ 
++        if (longPressConsumed) {
++            // A long press already switched screens; swallow the rest of this
++            // gesture so the same finger does not also press a button on the
++            // GBA that just appeared, and so no click is reported for it.
++            if (event.actionMasked == MotionEvent.ACTION_UP ||
++                event.actionMasked == MotionEvent.ACTION_CANCEL
++            ) {
++                clearGbaInput()
++            }
++            return true
++        }
++
+         when (event.actionMasked) {
+             MotionEvent.ACTION_DOWN,
+             MotionEvent.ACTION_POINTER_DOWN,
+@@ -149,6 +197,65 @@ class GbaScreenView @JvmOverloads constructor(
+         return true
+     }
+ 
++    /**
++     * Long-press-to-switch-GBA gesture, kept entirely separate from the button
++     * forwarding above so a tap behaves exactly as it always did.
++     *
++     * The timer only arms on a first finger that landed on bare screen: holding
++     * A for half a second is completely normal play and must never swap the
++     * display out from under the player.
++     */
++    private fun trackLongPress(event: MotionEvent) {
++        when (event.actionMasked) {
++            MotionEvent.ACTION_DOWN -> {
++                longPressConsumed = false
++                longPressDownX = event.x
++                longPressDownY = event.y
++                if (canLongPressAt(event.x, event.y)) {
++                    longPressArmed = true
++                    mainHandler.postDelayed(longPressRunnable, LONG_PRESS_MILLIS)
++                }
++            }
++
++            // A second finger means the player is using the pad, not gesturing.
++            MotionEvent.ACTION_POINTER_DOWN -> cancelLongPress()
++
++            MotionEvent.ACTION_MOVE -> {
++                if (longPressArmed &&
++                    (abs(event.x - longPressDownX) > touchSlop ||
++                            abs(event.y - longPressDownY) > touchSlop)
++                ) {
++                    cancelLongPress()
++                }
++            }
++
++            MotionEvent.ACTION_UP,
++            MotionEvent.ACTION_CANCEL -> cancelLongPress()
++        }
++    }
++
++    private fun canLongPressAt(x: Float, y: Float): Boolean {
++        if (!shouldDrawTouchButtons()) {
++            return true
++        }
++
++        for (rect in buttons.values) {
++            if (rect.contains(x, y)) {
++                return false
++            }
++        }
++        return true
++    }
++
++    /** Disarms the pending long press. Leaves [longPressConsumed] alone: it is
++     *  cleared on the next ACTION_DOWN, after the gesture has been swallowed. */
++    private fun cancelLongPress() {
++        if (longPressArmed) {
++            longPressArmed = false
++            mainHandler.removeCallbacks(longPressRunnable)
++        }
++    }
++
+     override fun onGbaGameChanged(info: GbaHostBridge.CoreInfo) {
+         if (info.deviceNumber == visibleDevice) {
+             visibleInfo = info
+@@ -406,30 +513,70 @@ class GbaScreenView @JvmOverloads constructor(
+      * on the plain Android canvas, independent of frame delivery.
+      */
+     private fun drawLinkDiagnostic(canvas: Canvas) {
+-        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+-            color = 0xFFFFEE55.toInt()
+-            textSize = sp(13f)
+-            textAlign = Paint.Align.LEFT
+-        }
+-        var y = sp(16f)
+         for (d in 0..3) {
+             val info = GbaHostBridge.snapshot(d)
+-            val line = if (info == null) {
+-                "GBA${d + 1}: no core"
++            val diag = GbaHostBridge.getLinkDiag(d)
++            diagBuilder.setLength(0)
++            diagBuilder.append("GBA").append(d + 1).append(':')
++            if (info == null) {
++                diagBuilder.append(" no core")
+             } else {
+-                "GBA${d + 1}: rom=${info.hasRom} gba=${info.isGba} loc=${info.isLocal} \"${info.title}\""
++                diagBuilder.append(" rom=").append(bit(info.hasRom))
++                    .append(" gba=").append(bit(info.isGba))
++                    .append(" loc=").append(bit(info.isLocal))
+             }
+-            canvas.drawText(line, sp(6f), y, paint)
+-            y += sp(15f)
+-        }
+-        canvas.drawText(
+-            "visible=${visibleDevice + 1}",
+-            sp(6f),
+-            y,
+-            paint
+-        )
++            // The link state is printed even without a CoreInfo: a port whose
++            // core never announced itself is exactly the case worth seeing.
++            diagBuilder.append(" lk=").append(bit(GbaHostBridge.linkDiagLinkOpen(diag)))
++                .append(" win=").append(GbaHostBridge.linkDiagWindowCount(diag))
++                .append(" rst=").append(GbaHostBridge.linkDiagResetCount(diag))
++                .append(" prb=").append(GbaHostBridge.linkDiagProbeCount(diag))
++                .append(" est=").append(bit(GbaHostBridge.linkDiagEstablished(diag)))
++                .append(" lck=").append(bit(GbaHostBridge.linkDiagLocked(diag)))
++                .append(" cmd=").append(
++                    Integer.toHexString(GbaHostBridge.linkDiagLastCommand(diag))
++                )
++            if (info != null && info.title.isNotEmpty()) {
++                diagBuilder.append(' ').append(truncate(info.title))
++            }
++            diagLines[d] = diagBuilder.toString()
++        }
++
++        diagBuilder.setLength(0)
++        diagBuilder.append("visible=")
++        if (visibleDevice in 0..3) {
++            diagBuilder.append(visibleDevice + 1)
++        } else {
++            diagBuilder.append('-')
++        }
++        diagBuilder.append("  (long-press to switch GBA)")
++        diagLines[DIAG_LINE_COUNT - 1] = diagBuilder.toString()
++
++        // These lines are long and the view can be narrow, so shrink to fit
++        // rather than run off the edge -- an unreadable diagnostic is no
++        // diagnostic. measureText() allocates nothing.
++        diagPaint.textSize = sp(DIAG_TEXT_SP)
++        var widest = 0f
++        for (line in diagLines) {
++            widest = max(widest, diagPaint.measureText(line ?: ""))
++        }
++        val available = width - sp(12f)
++        if (widest > available && available > 0f) {
++            diagPaint.textSize = max(sp(DIAG_TEXT_SP) * available / widest, sp(6f))
++        }
++
++        var y = diagPaint.textSize * 1.2f
++        for (line in diagLines) {
++            canvas.drawText(line ?: "", sp(6f), y, diagPaint)
++            y += diagPaint.textSize * 1.2f
++        }
+     }
+ 
++    private fun bit(value: Boolean): Char = if (value) '1' else '0'
++
++    private fun truncate(title: String): String =
++        if (title.length <= DIAG_TITLE_CHARS) title else title.substring(0, DIAG_TITLE_CHARS)
++
+     private fun displayTitle(info: GbaHostBridge.CoreInfo?): String {
+         if (info == null || info.deviceNumber !in 0..3) {
+             return info?.title.orEmpty()
+@@ -491,7 +638,10 @@ class GbaScreenView @JvmOverloads constructor(
+ 
+     private fun requestGbaInputFocus() {
+         inputFocusRequested = true
+-        if (visibleDevice in 0..3) {
++        // Never steer a GBA this player does not own. Outside netplay isLocal is
++        // always true, so solo is unchanged; in netplay the remote player's
++        // handheld stays theirs no matter what ends up on screen.
++        if (visibleDevice in 0..3 && visibleInfo?.isLocal != false) {
+             GbaInputFocusManager.requestFocus(visibleDevice)
+         }
+     }
+@@ -619,5 +769,11 @@ class GbaScreenView @JvmOverloads constructor(
+ 
+     companion object {
+         private const val TITLE_VISIBLE_MILLIS = 10_000L
++
++        // Four link ports plus the "visible=" footer.
++        private const val DIAG_LINE_COUNT = 5
++        private const val DIAG_TEXT_SP = 12f
++        private const val DIAG_TITLE_CHARS = 10
++        private val LONG_PRESS_MILLIS = ViewConfiguration.getLongPressTimeout().toLong()
+     }
+ }
+diff --git a/Source/Android/jni/GBA/AndroidGBAHost.cpp b/Source/Android/jni/GBA/AndroidGBAHost.cpp
+index b2c1997..e0fc274 100644
+--- a/Source/Android/jni/GBA/AndroidGBAHost.cpp
++++ b/Source/Android/jni/GBA/AndroidGBAHost.cpp
+@@ -14,6 +14,9 @@
+ #include "Common/CommonTypes.h"
+ #include "Core/HW/GBACore.h"
+ #include "Core/NetPlayProto.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/SI/SI_DeviceGBAEmu.h"
++#endif
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+ 
+@@ -164,4 +167,47 @@ Java_org_dolphinemu_dolphinemu_features_dualscreen_GbaHostBridge_setVisibleDevic
+ {
+   s_visible_device.store(static_cast<int>(device_number), std::memory_order_relaxed);
+ }
++
++// Packed per-port joybus link diagnostic, for the on-screen readout:
++//   bit  0      link window open now
++//   bit  1      link established
++//   bit  2      battle locked
++//   bits 8-15   last joybus command byte
++//   bits 16-31  auto-reset count   (saturated at 0xffff)
++//   bits 32-47  link window count  (saturated at 0xffff)
++//   bits 48-63  probe count        (saturated at 0xffff)
++// One long instead of a struct/array keeps this allocation-free on the draw
++// path. Returns 0 for a device that is not an SI channel.
++JNIEXPORT jlong JNICALL
++Java_org_dolphinemu_dolphinemu_features_dualscreen_GbaHostBridge_getLinkDiag(
++    JNIEnv*, jclass, jint device_number)
++{
++#ifdef HAS_LIBMGBA
++  const int device = static_cast<int>(device_number);
++  if (device < 0 || static_cast<size_t>(device) >= SerialInterface::g_gba_link_diag.size())
++    return 0;
++
++  const SerialInterface::GBALinkDiag& diag =
++      SerialInterface::g_gba_link_diag[static_cast<size_t>(device)];
++
++  const auto saturate16 = [](u32 value) -> u64 {
++    return value > 0xffff ? u64{0xffff} : static_cast<u64>(value);
++  };
++
++  u64 packed = 0;
++  if (diag.link.load(std::memory_order_relaxed))
++    packed |= u64{1} << 0;
++  if (diag.established.load(std::memory_order_relaxed))
++    packed |= u64{1} << 1;
++  if (diag.locked.load(std::memory_order_relaxed))
++    packed |= u64{1} << 2;
++  packed |= static_cast<u64>(diag.last_cmd.load(std::memory_order_relaxed)) << 8;
++  packed |= saturate16(diag.reset_count.load(std::memory_order_relaxed)) << 16;
++  packed |= saturate16(diag.window_count.load(std::memory_order_relaxed)) << 32;
++  packed |= saturate16(diag.probe_count.load(std::memory_order_relaxed)) << 48;
++  return static_cast<jlong>(packed);
++#else
++  return 0;
++#endif
++}
+ }
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 58b9d5e..5d2511b 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -5,6 +5,8 @@
+ 
+ #include "Core/HW/SI/SI_DeviceGBAEmu.h"
+ 
++#include <array>
++#include <atomic>
+ #include <vector>
+ 
+ #include "Common/ChunkFile.h"
+@@ -25,6 +27,20 @@
+ 
+ namespace SerialInterface
+ {
++static_assert(GBA_LINK_DIAG_CHANNELS == static_cast<size_t>(MAX_SI_CHANNELS),
++              "The link diagnostic needs one slot per SI channel");
++
++std::array<GBALinkDiag, GBA_LINK_DIAG_CHANNELS> g_gba_link_diag;
++
++// Read-only lookup for the diagnostic tap. Returns nullptr for anything that is
++// not a real SI channel, so no caller can index out of bounds.
++static GBALinkDiag* DiagSlot(int device_number)
++{
++  if (device_number < 0 || static_cast<size_t>(device_number) >= g_gba_link_diag.size())
++    return nullptr;
++  return &g_gba_link_diag[static_cast<size_t>(device_number)];
++}
++
+ static s64 GetSyncInterval(const SystemTimers::SystemTimersManager& timers)
+ {
+   return timers.GetTicksPerSecond() / 1000;
+@@ -189,6 +205,8 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           // which deadlocks the whole emulator on Android where the event
+           // thread can stall in the synchronous frame callback.
+           m_core->RequestReset(m_timestamp_sent);
++          if (GBALinkDiag* diag = DiagSlot(m_device_number))
++            diag->reset_count.fetch_add(1, std::memory_order_relaxed);
+         }
+         else if (const NetPlay::PadDetails details = NetPlay::GetPadDetails(m_device_number);
+                  details.is_local && details.local_pad < 4)
+@@ -200,11 +218,29 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           // to everyone, and every client resets this core at the same synced
+           // poll (the PAD_BUTTON_X handler below).
+           Pad::SetGBAReset(details.local_pad, true);
++          if (GBALinkDiag* diag = DiagSlot(m_device_number))
++            diag->reset_count.fetch_add(1, std::memory_order_relaxed);
+         }
+         m_last_auto_reset = m_timestamp_sent;
+         m_data_cmd_count = 0;
+       }
+     }
++    // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
++    // below this point reads any of it, and nothing above it was moved or
++    // changed. Placed here so it sees the final values of this poll.
++    if (GBALinkDiag* diag = DiagSlot(m_device_number))
++    {
++      if (link_now && !m_diag_prev_link)
++        diag->window_count.fetch_add(1, std::memory_order_relaxed);
++      if (probing)
++        diag->probe_count.fetch_add(1, std::memory_order_relaxed);
++      diag->link.store(link_now, std::memory_order_relaxed);
++      diag->established.store(m_link_established, std::memory_order_relaxed);
++      diag->locked.store(m_battle_locked, std::memory_order_relaxed);
++      diag->last_cmd.store(static_cast<u8>(m_last_cmd), std::memory_order_relaxed);
++    }
++    m_diag_prev_link = link_now;
++
+     m_link_was_enabled = link_now;
+     m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
+ 
+@@ -328,7 +364,11 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+   // (the core runs to the given GC timestamp before resetting), so every
+   // netplay client still resets this core at the same emulated time.
+   if (pad_status.button & PadButton::PAD_BUTTON_X)
++  {
+     m_core->RequestReset(m_timestamp_sent);
++    if (GBALinkDiag* diag = DiagSlot(m_device_number))
++      diag->reset_count.fetch_add(1, std::memory_order_relaxed);
++  }
+ 
+   return DataResponse::NoData;
+ }
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 321cb1d..2146d32 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -5,6 +5,9 @@
+ 
+ #ifdef HAS_LIBMGBA
+ 
++#include <array>
++#include <atomic>
++#include <cstddef>
+ #include <memory>
+ 
+ #include "Common/CommonTypes.h"
+@@ -19,6 +22,40 @@ class GBAHostInterface;
+ 
+ namespace SerialInterface
+ {
++// One entry per SI channel; must match MAX_SI_CHANNELS (static_assert in the
++// .cpp, which is where SI.h is included -- pulling SI.h in here would be
++// circular).
++constexpr size_t GBA_LINK_DIAG_CHANNELS = 4;
++
++// Purely observational snapshot of one GBA port's joybus link state, published
++// for the Android on-screen diagnostic (and anything else that wants ground
++// truth on why XD is or isn't detecting a socket). Written from the emulation
++// thread inside the existing poll, read from the UI thread, hence atomics --
++// the fields are independent counters, so a torn set across fields is fine.
++//
++// NOTHING here feeds back into the link/reset logic: this is a tap, not a
++// control input. Keep it that way.
++struct GBALinkDiag
++{
++  // Joybus link window currently open (Core::IsLinkEnabled()).
++  std::atomic<bool> link{false};
++  // Number of times the link window has opened (false -> true edges).
++  std::atomic<u32> window_count{0};
++  // Auto-resets actually issued for this port (solo + netplay + X-button).
++  std::atomic<u32> reset_count{0};
++  // m_link_established: XD handshake seen over a live link.
++  std::atomic<bool> established{false};
++  // m_battle_locked: sustained traffic latched the port against auto-reset.
++  std::atomic<bool> locked{false};
++  // Last joybus command byte XD sent (0xFF reset / 0x00 status / 0x14 read...).
++  std::atomic<u8> last_cmd{0};
++  // Polls where XD was probing (RESET/STATUS) -- i.e. XD is looking at us.
++  std::atomic<u32> probe_count{0};
++};
++
++// Defined once in SI_DeviceGBAEmu.cpp.
++extern std::array<GBALinkDiag, GBA_LINK_DIAG_CHANNELS> g_gba_link_diag;
++
+ class CSIDevice_GBAEmu final : public ISIDevice
+ {
+ public:
+@@ -55,6 +92,11 @@ private:
+   bool m_netplay_locality_cached = false;
+   u16 m_keys = 0;
+ 
++  // Diagnostic-only mirror of the previous poll's link state, so window_count
++  // can count open edges without reading (or perturbing) m_link_was_enabled,
++  // which the auto-reset guard above depends on.
++  bool m_diag_prev_link = false;
++
+   std::shared_ptr<HW::GBA::Core> m_core;
+   std::shared_ptr<GBAHostInterface> m_gbahost;
+ };
+-- 
+2.39.5 (Apple Git-154)
+
