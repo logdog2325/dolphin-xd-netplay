@@ -1,7 +1,7 @@
-From 2438b7562a6e342cdea8c5fab52f75bf30d4aa6a Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Tue, 28 Jul 2026 13:18:20 -0700
-Subject: [PATCH] Android: GBA link diagnostics and manual screen switch
+Subject: [PATCH 1/2] Android: GBA link diagnostics and manual screen switch
 
 Socket 2 links to XD but socket 3 never does, and the Android bottom
 screen auto-picks one GBA with no way to look at the other, so there is
@@ -180,7 +180,7 @@ index fa766e7..b4418be 100644
              else -> LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true && infos[it]?.isLocal == true }
                  ?: LINK_DEVICE_RANGE.firstOrNull { infos[it]?.hasRom == true }
 diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
-index 52f956b..b5fecb9 100644
+index 52f956b..cd165fc 100644
 --- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
 +++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
 @@ -13,8 +13,10 @@ import android.os.Handler
@@ -247,7 +247,7 @@ index 52f956b..b5fecb9 100644
          setFrameConsumerEnabled(false)
          clearGbaInput()
          mainHandler.removeCallbacks(hideTitleRunnable)
-+        cancelLongPress()
++        cancelSwitchLongPress()
 +        longPressConsumed = false
          inputFocusRequested = false
          GbaInputFocusManager.clearFocus(visibleDevice)
@@ -305,19 +305,19 @@ index 52f956b..b5fecb9 100644
 +            }
 +
 +            // A second finger means the player is using the pad, not gesturing.
-+            MotionEvent.ACTION_POINTER_DOWN -> cancelLongPress()
++            MotionEvent.ACTION_POINTER_DOWN -> cancelSwitchLongPress()
 +
 +            MotionEvent.ACTION_MOVE -> {
 +                if (longPressArmed &&
 +                    (abs(event.x - longPressDownX) > touchSlop ||
 +                            abs(event.y - longPressDownY) > touchSlop)
 +                ) {
-+                    cancelLongPress()
++                    cancelSwitchLongPress()
 +                }
 +            }
 +
 +            MotionEvent.ACTION_UP,
-+            MotionEvent.ACTION_CANCEL -> cancelLongPress()
++            MotionEvent.ACTION_CANCEL -> cancelSwitchLongPress()
 +        }
 +    }
 +
@@ -336,7 +336,7 @@ index 52f956b..b5fecb9 100644
 +
 +    /** Disarms the pending long press. Leaves [longPressConsumed] alone: it is
 +     *  cleared on the next ACTION_DOWN, after the gesture has been swallowed. */
-+    private fun cancelLongPress() {
++    private fun cancelSwitchLongPress() {
 +        if (longPressArmed) {
 +            longPressArmed = false
 +            mainHandler.removeCallbacks(longPressRunnable)
