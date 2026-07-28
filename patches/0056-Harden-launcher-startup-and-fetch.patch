@@ -19,10 +19,10 @@ Four fixes from review of the launcher UX and team editor:
 - pokepast.es answers the bare paste URL with a 301, which surfaced as a
   network error because redirects are off by default. Follow them.
 ---
- Source/Core/DolphinQt/MainWindow.cpp          |  6 ++++++
- .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  | 20 ++++++++++++++-----
- .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  8 ++++++++
- 3 files changed, 29 insertions(+), 5 deletions(-)
+ Source/Core/DolphinQt/MainWindow.cpp          |  6 +++++
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  | 22 ++++++++++++++-----
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  8 +++++++
+ 3 files changed, 31 insertions(+), 5 deletions(-)
 
 diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
 index faa36ec693..eb9c4cfe23 100644
@@ -42,7 +42,7 @@ index faa36ec693..eb9c4cfe23 100644
    m_xd_launcher->raise();
    m_xd_launcher->activateWindow();
 diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
-index f793a9c459..7c590c4559 100644
+index f793a9c459..7e344498e9 100644
 --- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
 +++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
 @@ -13,6 +13,7 @@
@@ -53,7 +53,7 @@ index f793a9c459..7c590c4559 100644
  #include <QPushButton>
  #include <QRegularExpression>
  #include <QShowEvent>
-@@ -283,17 +284,26 @@ void TeamEditorDialog::OnImport()
+@@ -283,17 +284,28 @@ void TeamEditorDialog::OnImport()
    const std::string url = match.captured(0).toStdString() + "/raw";
    SetMessages({tr("Fetching %1…").arg(match.captured(0))});
    m_fetching = true;
@@ -70,7 +70,9 @@ index f793a9c459..7c590c4559 100644
 -      m_fetching = false;
 +    if (!self)
 +      return;
-+    QueueOnObject(self, [self, response = std::move(response)] {
++    // QueueOnObject takes a raw receiver; the QPointer copy inside the lambda
++    // is what guards the deferred call.
++    QueueOnObject(self.data(), [self, response = std::move(response)] {
 +      if (!self)
 +        return;
 +      self->m_fetching = false;
