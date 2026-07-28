@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 27 Jul 2026 23:42:08 -0700
+Subject: [PATCH] GBA: netplay-safe auto-reset and mute the GBA until its link
+ is up
+
+The auto-reset that reopens Emerald's joybus window was gated off under
+netplay because resetting only the local mirror of a GBA core would desync
+the other players' copies. Instead of skipping it, ride the input stream:
+when the trigger fires, the pad's owner injects the X-button reset signal
+(the same path the desktop GBA window's Reset action uses), netplay
+replicates it to every client, and everyone resets the core at the same
+synced poll. The trigger itself is a pure function of the joybus command
+stream, so all clients agree on when it fires; only the owner acts.
+
+The PAD_BUTTON_X handler also now uses the tick-anchored RequestReset
+instead of the synchronous Reset(), which could deadlock on Android the
+same way the auto-reset used to (CPU thread blocking on Flush() while the
+event thread sits in a synchronous host frame callback).
+
+Also mute each GBA core's audio until its link is established: the GBA
+boot jingle otherwise replays on every auto-reset while XD probes, which
+gets grating fast. Under netplay, remote players' GBAs stay muted for the
+whole session so each player hears only their own handheld. Audio-only,
+host-side state: no effect on emulation, no savestate changes.
+---
+ Source/Core/Core/HW/GBACore.cpp            | 11 +++--
+ Source/Core/Core/HW/GBACore.h              | 10 +++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 48 ++++++++++++++++++----
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  2 +
+ 4 files changed, 58 insertions(+), 13 deletions(-)
+
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 86e8e51..1eceb0f 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -471,11 +471,12 @@ void Core::AddCallbacks()
+ }
+ 
+ static void ReadAudioBufferIntoMixer(mAudioBuffer* audio_buffer, Mixer* mixer,
+-                                     std::size_t device_number)
++                                     std::size_t device_number, bool force_mute)
+ {
+   std::array<s16, AUDIO_BUFFER_SIZE> sample_buffer;
+   const bool mute_link_audio =
+-      device_number != Config::GBPLAYER_GBA_INDEX && Config::Get(Config::MAIN_GBA_LINK_MUTED);
++      force_mute ||
++      (device_number != Config::GBPLAYER_GBA_INDEX && Config::Get(Config::MAIN_GBA_LINK_MUTED));
+   const auto read_size = sample_buffer.size() / audio_buffer->channels;
+   while (true)
+   {
+@@ -502,12 +503,14 @@ void Core::SetAVStream()
+     auto* const av_stream = static_cast<AVStream*>(stream);
+     auto* const core = av_stream->core;
+     auto* const audio_buffer = core->GetAudioBuffer();
+-    ReadAudioBufferIntoMixer(audio_buffer, av_stream->mixer, av_stream->core->m_device_number);
++    ReadAudioBufferIntoMixer(audio_buffer, av_stream->mixer, av_stream->core->m_device_number,
++                             av_stream->core->IsLinkAudioMuted());
+     av_stream->mixer->SetGBAInputSampleRate(core->m_device_number, rate);
+   };
+   m_stream.postAudioBuffer = [](mAVStream* stream, mAudioBuffer* audio_buffer) {
+     auto* const av_stream = static_cast<AVStream*>(stream);
+-    ReadAudioBufferIntoMixer(audio_buffer, av_stream->mixer, av_stream->core->m_device_number);
++    ReadAudioBufferIntoMixer(audio_buffer, av_stream->mixer, av_stream->core->m_device_number,
++                             av_stream->core->IsLinkAudioMuted());
+   };
+ 
+   m_core->setAVStream(m_core, &m_stream);
+diff --git a/Source/Core/Core/HW/GBACore.h b/Source/Core/Core/HW/GBACore.h
+index 72a2195..e4dfe1c 100644
+--- a/Source/Core/Core/HW/GBACore.h
++++ b/Source/Core/Core/HW/GBACore.h
+@@ -81,6 +81,13 @@ public:
+   bool IsLinkEnabled() const { return m_link_enabled; }
+   CoreInfo GetCoreInfo() const;
+ 
++  // Host-side audio gate: while true this core's samples are dropped before
++  // they reach the mixer. Starts muted so the boot jingle stays silent through
++  // the auto-reset churn; the SI device unmutes once the joybus link is
++  // established (and keeps remote players' GBAs muted under netplay).
++  void SetLinkAudioMuted(bool muted) { m_link_audio_muted = muted; }
++  bool IsLinkAudioMuted() const { return m_link_audio_muted; }
++
+   void SetHost(std::weak_ptr<GBAHostInterface> host);
+   void SetForceDisconnect(bool force_disconnect);
+   void EReaderQueueCard(std::string_view card_path);
+@@ -173,6 +180,9 @@ private:
+   u8 m_response_size{};  // State saved.
+   std::atomic_bool m_command_pending{};
+ 
++  // Host-side only (audio), not part of saved state.
++  std::atomic_bool m_link_audio_muted{true};
++
+   // The entire threaded GBA runs within events pushed to this queue.
+   Common::WorkQueueThreadSP<SyncEvent> m_event_thread;
+ 
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 2722a0d..927ff1d 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -103,12 +103,24 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     if (link_now && m_last_data_cmd != 0)
+       m_link_established = true;
+ 
++    // Silence the GBA until its link is actually established: the boot jingle
++    // otherwise replays on every auto-reset while XD probes. Under netplay,
++    // remote players' GBAs additionally stay muted for the whole session so
++    // each player hears only their own handheld. Host-side audio only -- no
++    // effect on emulation state, so no desync concern.
++    if (NetPlay::IsNetPlayRunning() && !m_netplay_locality_cached)
++    {
++      m_netplay_pad_is_local = NetPlay::GetPadDetails(m_device_number).is_local;
++      m_netplay_locality_cached = true;
++    }
++    m_core->SetLinkAudioMuted(!m_link_established ||
++                              (m_netplay_locality_cached && !m_netplay_pad_is_local));
++
+     const bool probing = m_last_cmd == EBufferCommands::CMD_RESET ||
+                          m_last_cmd == EBufferCommands::CMD_STATUS;
+     const bool handshake_active =
+         m_last_data_cmd != 0 && (m_timestamp_sent - m_last_data_cmd) < tps * 8;
+-    if (probing && !link_now && !handshake_active && !m_link_established &&
+-        !NetPlay::IsNetPlayRunning())
++    if (probing && !link_now && !handshake_active && !m_link_established)
+     {
+       const u64 min_interval = tps * 4;
+       const bool window_just_closed = m_link_was_enabled;
+@@ -116,11 +128,25 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           m_last_auto_reset == 0 || m_timestamp_sent - m_last_auto_reset > min_interval;
+       if (window_just_closed || cooldown_elapsed)
+       {
+-        // Async: reset on the GBA's own event thread. Calling Reset() here
+-        // would Flush() (block the CPU thread until the event thread drains),
+-        // which deadlocks the whole emulator on Android where the event
+-        // thread can stall in the synchronous frame callback.
+-        m_core->RequestReset(m_timestamp_sent);
++        if (!NetPlay::IsNetPlayRunning())
++        {
++          // Async: reset on the GBA's own event thread. Calling Reset() here
++          // would Flush() (block the CPU thread until the event thread drains),
++          // which deadlocks the whole emulator on Android where the event
++          // thread can stall in the synchronous frame callback.
++          m_core->RequestReset(m_timestamp_sent);
++        }
++        else if (const NetPlay::PadDetails details = NetPlay::GetPadDetails(m_device_number);
++                 details.is_local && details.local_pad < 4)
++        {
++          // Netplay: resetting only the local mirror of this core would desync
++          // the other players' copies of it. Ride the input stream instead --
++          // the pad's owner injects the X-button reset signal (the same path
++          // the desktop GBA window's Reset action uses), netplay replicates it
++          // to everyone, and every client resets this core at the same synced
++          // poll (the PAD_BUTTON_X handler below).
++          Pad::SetGBAReset(details.local_pad, true);
++        }
+         m_last_auto_reset = m_timestamp_sent;
+       }
+     }
+@@ -237,9 +263,13 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+   for (size_t i = 0; i < buttons_map.size(); ++i)
+     m_keys |= static_cast<u16>(static_cast<bool>((pad_status.button & buttons_map[i]))) << i;
+ 
+-  // Use X button as a reset signal for NetPlay/Movies
++  // Use X button as a reset signal for NetPlay/Movies. Reset asynchronously on
++  // the core's own event thread -- the synchronous Reset() here can deadlock on
++  // Android exactly like the auto-reset above. RequestReset is tick-anchored
++  // (the core runs to the given GC timestamp before resetting), so every
++  // netplay client still resets this core at the same emulated time.
+   if (pad_status.button & PadButton::PAD_BUTTON_X)
+-    m_core->Reset();
++    m_core->RequestReset(m_timestamp_sent);
+ 
+   return DataResponse::NoData;
+ }
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 96acb85..3dbb4fd 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -47,6 +47,8 @@ private:
+   u64 m_last_data_cmd = 0;
+   bool m_link_was_enabled = false;
+   bool m_link_established = false;
++  bool m_netplay_pad_is_local = true;
++  bool m_netplay_locality_cached = false;
+   u16 m_keys = 0;
+ 
+   std::shared_ptr<HW::GBA::Core> m_core;
+-- 
+2.39.5 (Apple Git-154)
+
