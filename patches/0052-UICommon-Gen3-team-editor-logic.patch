@@ -1,0 +1,2268 @@
+From c84f2343275dd800a4234ad5b89c0744a0db7433 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 02:19:29 -0700
+Subject: [PATCH 2/3] UICommon: Gen 3 team-editor logic ported from the Android
+ build
+
+Port the validated Android Kotlin Gen 3 code (features/xdnetplay/gen3/)
+to pure C++ in UICommon/XDNetplay, with no Qt or Android dependencies:
+
+- Gen3Save: the Emerald 128 KiB flash layout - two 57344-byte blocks of
+  14 rotating 4096-byte sections, footer at +0x0FF4 (id / checksum /
+  signature 0x08012025 / save index), active-block selection by highest
+  fully-valid save index, and the per-section checksum with the
+  empirically confirmed per-section data-length table. Trainer info
+  (section 0) and party (section 1) accessors. Verified-write
+  discipline mirroring the validated injectors: re-parse the edited
+  image and check every checksum, write to a .tmp, read it back
+  byte-identical, back up the existing file to .bak, then rename into
+  place.
+- Gen3Mon: the 100-byte party struct - PID/OTID header, four 12-byte
+  substructures ordered by PID % 24 and XOR-encrypted with PID ^ OTID,
+  u16 substructure checksum over the decrypted block, IV/egg/ability
+  bitfield, and the party-only stats tail. Decode verifies the
+  checksum; encode/decode round-trips byte-identically.
+- Gen3Text: the Gen 3 western charset (0xFF-terminated fixed-width
+  strings) with UTF-8 conversion for the non-ASCII glyphs.
+- Gen3Data: the bundled gen3data.json (species/moves/items/abilities/
+  natures/exp tables) loaded with picojson, with normalized-name
+  lookups and exp-for-level.
+- MonFactory: deterministic PID search satisfying nature, ability
+  slot, gender and shininess in priority order (shiny relaxed first,
+  bounded search); the Gen 3 stat formula including nature multipliers
+  and the Shedinja special case; the Showdown-to-Gen3 EV/IV order
+  remap; Hidden Power suffix stripping; the Emerald origins word; and
+  the injector's defaults (English, friendship 70, PP 35, Poke Ball).
+- ShowdownParser: the full Showdown team-export parser (nickname /
+  species / gender / item header, Ability/Level/Shiny/EVs/IVs/Nature
+  lines, move list, unknown lines ignored, === headers skipped).
+
+Bundle Data/Sys/XDNetplay/gen3data.json (the same generated data file
+the Android build ships as an asset) so the desktop team editor reads
+identical game data.
+
+Round-trip verified against the bundled EMERALD-2.sav template: parse,
+re-encode the party in place, byte-identical output, all 28 section
+checksums and every substructure checksum intact, and a Showdown-built
+team injected and re-decoded field-identically.
+---
+ Data/Sys/XDNetplay/gen3data.json              |   1 +
+ Source/Core/DolphinLib.props                  |  12 +
+ Source/Core/UICommon/CMakeLists.txt           |  12 +
+ Source/Core/UICommon/XDNetplay/Gen3Data.cpp   | 243 +++++++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Data.h     | 100 ++++++
+ Source/Core/UICommon/XDNetplay/Gen3Mon.cpp    | 262 ++++++++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Mon.h      | 158 +++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Save.cpp   | 320 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Save.h     | 144 ++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Text.cpp   | 170 ++++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Text.h     |  43 +++
+ Source/Core/UICommon/XDNetplay/MonFactory.cpp | 312 +++++++++++++++++
+ Source/Core/UICommon/XDNetplay/MonFactory.h   |  39 +++
+ .../UICommon/XDNetplay/ShowdownParser.cpp     | 219 ++++++++++++
+ .../Core/UICommon/XDNetplay/ShowdownParser.h  |  44 +++
+ 15 files changed, 2079 insertions(+)
+ create mode 100644 Data/Sys/XDNetplay/gen3data.json
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Data.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Data.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Mon.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Mon.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Save.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Text.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/Gen3Text.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/MonFactory.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/MonFactory.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/ShowdownParser.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/ShowdownParser.h
+
+diff --git a/Data/Sys/XDNetplay/gen3data.json b/Data/Sys/XDNetplay/gen3data.json
+new file mode 100644
+index 0000000000..6f06ce8445
+--- /dev/null
++++ b/Data/Sys/XDNetplay/gen3data.json
+@@ -0,0 +1 @@
++{"species":{"bulbasaur":{"id":1,"natDex":1,"baseStats":[45,49,49,45,65,65],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,3]},"ivysaur":{"id":2,"natDex":2,"baseStats":[60,62,63,60,80,80],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,3]},"venusaur":{"id":3,"natDex":3,"baseStats":[80,82,83,80,100,100],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,3]},"charmander":{"id":4,"natDex":4,"baseStats":[39,52,43,65,60,50],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"charmeleon":{"id":5,"natDex":5,"baseStats":[58,64,58,80,80,65],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"charizard":{"id":6,"natDex":6,"baseStats":[78,84,78,100,109,85],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,2]},"squirtle":{"id":7,"natDex":7,"baseStats":[44,48,65,43,50,64],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"wartortle":{"id":8,"natDex":8,"baseStats":[59,63,80,58,65,80],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"blastoise":{"id":9,"natDex":9,"baseStats":[79,83,100,78,85,105],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"caterpie":{"id":10,"natDex":10,"baseStats":[45,30,35,45,20,20],"abilities":[19,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"metapod":{"id":11,"natDex":11,"baseStats":[50,20,55,30,25,25],"abilities":[61,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"butterfree":{"id":12,"natDex":12,"baseStats":[60,45,50,70,80,80],"abilities":[14,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,2]},"weedle":{"id":13,"natDex":13,"baseStats":[40,35,30,50,20,20],"abilities":[19,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"kakuna":{"id":14,"natDex":14,"baseStats":[45,25,50,35,25,25],"abilities":[61,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"beedrill":{"id":15,"natDex":15,"baseStats":[65,80,40,75,45,80],"abilities":[68,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"pidgey":{"id":16,"natDex":16,"baseStats":[40,45,40,56,35,35],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,2]},"pidgeotto":{"id":17,"natDex":17,"baseStats":[63,60,55,71,50,50],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,2]},"pidgeot":{"id":18,"natDex":18,"baseStats":[83,80,75,91,70,70],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,2]},"rattata":{"id":19,"natDex":19,"baseStats":[30,56,35,72,25,35],"abilities":[50,62],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"raticate":{"id":20,"natDex":20,"baseStats":[55,81,60,97,50,70],"abilities":[50,62],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"spearow":{"id":21,"natDex":21,"baseStats":[40,60,30,70,31,31],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"fearow":{"id":22,"natDex":22,"baseStats":[65,90,65,100,61,61],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"ekans":{"id":23,"natDex":23,"baseStats":[35,60,44,55,40,54],"abilities":[22,61],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"arbok":{"id":24,"natDex":24,"baseStats":[60,85,69,80,65,79],"abilities":[22,61],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"pikachu":{"id":25,"natDex":25,"baseStats":[35,55,30,90,50,40],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[13,13]},"raichu":{"id":26,"natDex":26,"baseStats":[60,90,55,100,90,80],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[13,13]},"sandshrew":{"id":27,"natDex":27,"baseStats":[50,75,85,40,20,30],"abilities":[8,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"sandslash":{"id":28,"natDex":28,"baseStats":[75,100,110,65,45,55],"abilities":[8,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"nidoranf":{"id":29,"natDex":29,"baseStats":[55,47,52,41,40,40],"abilities":[38,0],"genderRatio":254,"expGroup":"MEDIUM_SLOW","types":[3,3]},"nidorina":{"id":30,"natDex":30,"baseStats":[70,62,67,56,55,55],"abilities":[38,0],"genderRatio":254,"expGroup":"MEDIUM_SLOW","types":[3,3]},"nidoqueen":{"id":31,"natDex":31,"baseStats":[90,82,87,76,75,85],"abilities":[38,0],"genderRatio":254,"expGroup":"MEDIUM_SLOW","types":[3,4]},"nidoranm":{"id":32,"natDex":32,"baseStats":[46,57,40,50,40,40],"abilities":[38,0],"genderRatio":0,"expGroup":"MEDIUM_SLOW","types":[3,3]},"nidorino":{"id":33,"natDex":33,"baseStats":[61,72,57,65,55,55],"abilities":[38,0],"genderRatio":0,"expGroup":"MEDIUM_SLOW","types":[3,3]},"nidoking":{"id":34,"natDex":34,"baseStats":[81,92,77,85,85,75],"abilities":[38,0],"genderRatio":0,"expGroup":"MEDIUM_SLOW","types":[3,4]},"clefairy":{"id":35,"natDex":35,"baseStats":[70,45,48,35,60,65],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"clefable":{"id":36,"natDex":36,"baseStats":[95,70,73,60,85,90],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"vulpix":{"id":37,"natDex":37,"baseStats":[38,41,40,65,50,65],"abilities":[18,0],"genderRatio":191,"expGroup":"MEDIUM_FAST","types":[10,10]},"ninetales":{"id":38,"natDex":38,"baseStats":[73,76,75,100,81,100],"abilities":[18,0],"genderRatio":191,"expGroup":"MEDIUM_FAST","types":[10,10]},"jigglypuff":{"id":39,"natDex":39,"baseStats":[115,45,20,20,45,25],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"wigglytuff":{"id":40,"natDex":40,"baseStats":[140,70,45,45,75,50],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"zubat":{"id":41,"natDex":41,"baseStats":[40,45,35,55,30,40],"abilities":[39,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,2]},"golbat":{"id":42,"natDex":42,"baseStats":[75,80,70,90,65,75],"abilities":[39,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,2]},"oddish":{"id":43,"natDex":43,"baseStats":[45,50,55,30,75,65],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"gloom":{"id":44,"natDex":44,"baseStats":[60,65,70,40,85,75],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"vileplume":{"id":45,"natDex":45,"baseStats":[75,80,85,50,100,90],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"paras":{"id":46,"natDex":46,"baseStats":[35,70,55,25,45,55],"abilities":[27,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,12]},"parasect":{"id":47,"natDex":47,"baseStats":[60,95,80,30,60,80],"abilities":[27,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,12]},"venonat":{"id":48,"natDex":48,"baseStats":[60,55,50,45,40,55],"abilities":[14,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"venomoth":{"id":49,"natDex":49,"baseStats":[70,65,60,90,90,75],"abilities":[19,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"diglett":{"id":50,"natDex":50,"baseStats":[10,55,25,95,35,45],"abilities":[8,71],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"dugtrio":{"id":51,"natDex":51,"baseStats":[35,80,50,120,50,70],"abilities":[8,71],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"meowth":{"id":52,"natDex":52,"baseStats":[40,45,35,90,40,40],"abilities":[53,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"persian":{"id":53,"natDex":53,"baseStats":[65,70,60,115,65,65],"abilities":[7,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"psyduck":{"id":54,"natDex":54,"baseStats":[50,52,48,55,65,50],"abilities":[6,13],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"golduck":{"id":55,"natDex":55,"baseStats":[80,82,78,85,95,80],"abilities":[6,13],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"mankey":{"id":56,"natDex":56,"baseStats":[40,80,35,70,35,45],"abilities":[72,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[1,1]},"primeape":{"id":57,"natDex":57,"baseStats":[65,105,60,95,60,70],"abilities":[72,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[1,1]},"growlithe":{"id":58,"natDex":58,"baseStats":[55,70,45,60,70,50],"abilities":[22,18],"genderRatio":63,"expGroup":"SLOW","types":[10,10]},"arcanine":{"id":59,"natDex":59,"baseStats":[90,110,80,95,100,80],"abilities":[22,18],"genderRatio":63,"expGroup":"SLOW","types":[10,10]},"poliwag":{"id":60,"natDex":60,"baseStats":[40,50,40,90,40,40],"abilities":[11,6],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,11]},"poliwhirl":{"id":61,"natDex":61,"baseStats":[65,65,65,90,50,50],"abilities":[11,6],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,11]},"poliwrath":{"id":62,"natDex":62,"baseStats":[90,85,95,70,70,90],"abilities":[11,6],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,1]},"abra":{"id":63,"natDex":63,"baseStats":[25,20,15,90,105,55],"abilities":[28,39],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[14,14]},"kadabra":{"id":64,"natDex":64,"baseStats":[40,35,30,105,120,70],"abilities":[28,39],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[14,14]},"alakazam":{"id":65,"natDex":65,"baseStats":[55,50,45,120,135,85],"abilities":[28,39],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[14,14]},"machop":{"id":66,"natDex":66,"baseStats":[70,80,50,35,35,35],"abilities":[62,0],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[1,1]},"machoke":{"id":67,"natDex":67,"baseStats":[80,100,70,45,50,60],"abilities":[62,0],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[1,1]},"machamp":{"id":68,"natDex":68,"baseStats":[90,130,80,55,65,85],"abilities":[62,0],"genderRatio":63,"expGroup":"MEDIUM_SLOW","types":[1,1]},"bellsprout":{"id":69,"natDex":69,"baseStats":[50,75,35,40,70,30],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"weepinbell":{"id":70,"natDex":70,"baseStats":[65,90,50,55,85,45],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"victreebel":{"id":71,"natDex":71,"baseStats":[80,105,65,70,100,60],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"tentacool":{"id":72,"natDex":72,"baseStats":[40,40,35,70,50,100],"abilities":[29,64],"genderRatio":127,"expGroup":"SLOW","types":[11,3]},"tentacruel":{"id":73,"natDex":73,"baseStats":[80,70,65,100,80,120],"abilities":[29,64],"genderRatio":127,"expGroup":"SLOW","types":[11,3]},"geodude":{"id":74,"natDex":74,"baseStats":[40,80,100,20,30,30],"abilities":[69,5],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[5,4]},"graveler":{"id":75,"natDex":75,"baseStats":[55,95,115,35,45,45],"abilities":[69,5],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[5,4]},"golem":{"id":76,"natDex":76,"baseStats":[80,110,130,45,55,65],"abilities":[69,5],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[5,4]},"ponyta":{"id":77,"natDex":77,"baseStats":[50,85,55,90,65,65],"abilities":[50,18],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,10]},"rapidash":{"id":78,"natDex":78,"baseStats":[65,100,70,105,80,80],"abilities":[50,18],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,10]},"slowpoke":{"id":79,"natDex":79,"baseStats":[90,65,65,15,40,40],"abilities":[12,20],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,14]},"slowbro":{"id":80,"natDex":80,"baseStats":[95,75,110,30,100,80],"abilities":[12,20],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,14]},"magnemite":{"id":81,"natDex":81,"baseStats":[25,35,70,45,95,55],"abilities":[42,5],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[13,8]},"magneton":{"id":82,"natDex":82,"baseStats":[50,60,95,70,120,70],"abilities":[42,5],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[13,8]},"farfetchd":{"id":83,"natDex":83,"baseStats":[52,65,55,60,58,62],"abilities":[51,39],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"doduo":{"id":84,"natDex":84,"baseStats":[35,85,45,75,35,35],"abilities":[50,48],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"dodrio":{"id":85,"natDex":85,"baseStats":[60,110,70,100,60,60],"abilities":[50,48],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"seel":{"id":86,"natDex":86,"baseStats":[65,45,55,45,45,70],"abilities":[47,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"dewgong":{"id":87,"natDex":87,"baseStats":[90,70,80,70,70,95],"abilities":[47,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,15]},"grimer":{"id":88,"natDex":88,"baseStats":[80,80,50,25,40,50],"abilities":[1,60],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"muk":{"id":89,"natDex":89,"baseStats":[105,105,75,50,65,100],"abilities":[1,60],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"shellder":{"id":90,"natDex":90,"baseStats":[30,65,100,40,45,25],"abilities":[75,0],"genderRatio":127,"expGroup":"SLOW","types":[11,11]},"cloyster":{"id":91,"natDex":91,"baseStats":[50,95,180,70,85,45],"abilities":[75,0],"genderRatio":127,"expGroup":"SLOW","types":[11,15]},"gastly":{"id":92,"natDex":92,"baseStats":[30,35,30,80,100,35],"abilities":[26,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[7,3]},"haunter":{"id":93,"natDex":93,"baseStats":[45,50,45,95,115,55],"abilities":[26,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[7,3]},"gengar":{"id":94,"natDex":94,"baseStats":[60,65,60,110,130,75],"abilities":[26,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[7,3]},"onix":{"id":95,"natDex":95,"baseStats":[35,45,160,70,30,45],"abilities":[69,5],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[5,4]},"drowzee":{"id":96,"natDex":96,"baseStats":[60,48,45,42,43,90],"abilities":[15,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,14]},"hypno":{"id":97,"natDex":97,"baseStats":[85,73,70,67,73,115],"abilities":[15,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,14]},"krabby":{"id":98,"natDex":98,"baseStats":[30,105,90,50,25,25],"abilities":[52,75],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"kingler":{"id":99,"natDex":99,"baseStats":[55,130,115,75,50,50],"abilities":[52,75],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"voltorb":{"id":100,"natDex":100,"baseStats":[40,30,50,100,55,55],"abilities":[43,9],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[13,13]},"electrode":{"id":101,"natDex":101,"baseStats":[60,50,70,140,80,80],"abilities":[43,9],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[13,13]},"exeggcute":{"id":102,"natDex":102,"baseStats":[60,40,80,40,60,45],"abilities":[34,0],"genderRatio":127,"expGroup":"SLOW","types":[12,14]},"exeggutor":{"id":103,"natDex":103,"baseStats":[95,95,85,55,125,65],"abilities":[34,0],"genderRatio":127,"expGroup":"SLOW","types":[12,14]},"cubone":{"id":104,"natDex":104,"baseStats":[50,50,95,35,40,50],"abilities":[69,31],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"marowak":{"id":105,"natDex":105,"baseStats":[60,80,110,45,50,80],"abilities":[69,31],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"hitmonlee":{"id":106,"natDex":106,"baseStats":[50,120,53,87,35,110],"abilities":[7,0],"genderRatio":0,"expGroup":"MEDIUM_FAST","types":[1,1]},"hitmonchan":{"id":107,"natDex":107,"baseStats":[50,105,79,76,35,110],"abilities":[51,0],"genderRatio":0,"expGroup":"MEDIUM_FAST","types":[1,1]},"lickitung":{"id":108,"natDex":108,"baseStats":[90,55,75,30,60,75],"abilities":[20,12],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"koffing":{"id":109,"natDex":109,"baseStats":[40,65,95,35,60,45],"abilities":[26,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"weezing":{"id":110,"natDex":110,"baseStats":[65,90,120,60,85,70],"abilities":[26,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,3]},"rhyhorn":{"id":111,"natDex":111,"baseStats":[80,85,95,25,30,30],"abilities":[31,69],"genderRatio":127,"expGroup":"SLOW","types":[4,5]},"rhydon":{"id":112,"natDex":112,"baseStats":[105,130,120,40,45,45],"abilities":[31,69],"genderRatio":127,"expGroup":"SLOW","types":[4,5]},"chansey":{"id":113,"natDex":113,"baseStats":[250,5,5,50,35,105],"abilities":[30,32],"genderRatio":254,"expGroup":"FAST","types":[0,0]},"tangela":{"id":114,"natDex":114,"baseStats":[65,55,115,60,100,40],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[12,12]},"kangaskhan":{"id":115,"natDex":115,"baseStats":[105,95,80,90,40,80],"abilities":[48,0],"genderRatio":254,"expGroup":"MEDIUM_FAST","types":[0,0]},"horsea":{"id":116,"natDex":116,"baseStats":[30,40,70,60,70,25],"abilities":[33,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"seadra":{"id":117,"natDex":117,"baseStats":[55,65,95,85,95,45],"abilities":[38,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"goldeen":{"id":118,"natDex":118,"baseStats":[45,67,60,63,35,50],"abilities":[33,41],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"seaking":{"id":119,"natDex":119,"baseStats":[80,92,65,68,65,80],"abilities":[33,41],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"staryu":{"id":120,"natDex":120,"baseStats":[30,45,55,85,70,55],"abilities":[35,30],"genderRatio":255,"expGroup":"SLOW","types":[11,11]},"starmie":{"id":121,"natDex":121,"baseStats":[60,75,85,115,100,85],"abilities":[35,30],"genderRatio":255,"expGroup":"SLOW","types":[11,14]},"mrmime":{"id":122,"natDex":122,"baseStats":[40,45,65,90,100,120],"abilities":[43,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,14]},"scyther":{"id":123,"natDex":123,"baseStats":[70,110,80,105,55,80],"abilities":[68,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,2]},"jynx":{"id":124,"natDex":124,"baseStats":[65,50,35,95,115,95],"abilities":[12,0],"genderRatio":254,"expGroup":"MEDIUM_FAST","types":[15,14]},"electabuzz":{"id":125,"natDex":125,"baseStats":[65,83,57,105,95,85],"abilities":[9,0],"genderRatio":63,"expGroup":"MEDIUM_FAST","types":[13,13]},"magmar":{"id":126,"natDex":126,"baseStats":[65,95,57,93,100,85],"abilities":[49,0],"genderRatio":63,"expGroup":"MEDIUM_FAST","types":[10,10]},"pinsir":{"id":127,"natDex":127,"baseStats":[65,125,100,85,55,70],"abilities":[52,0],"genderRatio":127,"expGroup":"SLOW","types":[6,6]},"tauros":{"id":128,"natDex":128,"baseStats":[75,100,95,110,40,70],"abilities":[22,0],"genderRatio":0,"expGroup":"SLOW","types":[0,0]},"magikarp":{"id":129,"natDex":129,"baseStats":[20,10,55,80,15,20],"abilities":[33,0],"genderRatio":127,"expGroup":"SLOW","types":[11,11]},"gyarados":{"id":130,"natDex":130,"baseStats":[95,125,79,81,60,100],"abilities":[22,0],"genderRatio":127,"expGroup":"SLOW","types":[11,2]},"lapras":{"id":131,"natDex":131,"baseStats":[130,85,80,60,85,95],"abilities":[11,75],"genderRatio":127,"expGroup":"SLOW","types":[11,15]},"ditto":{"id":132,"natDex":132,"baseStats":[48,48,48,48,48,48],"abilities":[7,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[0,0]},"eevee":{"id":133,"natDex":133,"baseStats":[55,55,50,55,45,65],"abilities":[50,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[0,0]},"vaporeon":{"id":134,"natDex":134,"baseStats":[130,65,60,65,110,95],"abilities":[11,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[11,11]},"jolteon":{"id":135,"natDex":135,"baseStats":[65,65,60,130,110,95],"abilities":[10,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[13,13]},"flareon":{"id":136,"natDex":136,"baseStats":[65,130,60,65,95,110],"abilities":[18,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[10,10]},"porygon":{"id":137,"natDex":137,"baseStats":[65,60,70,40,85,75],"abilities":[36,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[0,0]},"omanyte":{"id":138,"natDex":138,"baseStats":[35,40,100,35,90,55],"abilities":[33,75],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[5,11]},"omastar":{"id":139,"natDex":139,"baseStats":[70,60,125,55,115,70],"abilities":[33,75],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[5,11]},"kabuto":{"id":140,"natDex":140,"baseStats":[30,80,90,55,55,45],"abilities":[33,4],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[5,11]},"kabutops":{"id":141,"natDex":141,"baseStats":[60,115,105,80,65,70],"abilities":[33,4],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[5,11]},"aerodactyl":{"id":142,"natDex":142,"baseStats":[80,105,65,130,60,75],"abilities":[69,46],"genderRatio":31,"expGroup":"SLOW","types":[5,2]},"snorlax":{"id":143,"natDex":143,"baseStats":[160,110,65,30,65,110],"abilities":[17,47],"genderRatio":31,"expGroup":"SLOW","types":[0,0]},"articuno":{"id":144,"natDex":144,"baseStats":[90,85,100,85,95,125],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[15,2]},"zapdos":{"id":145,"natDex":145,"baseStats":[90,90,85,100,125,90],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[13,2]},"moltres":{"id":146,"natDex":146,"baseStats":[90,100,90,90,125,85],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[10,2]},"dratini":{"id":147,"natDex":147,"baseStats":[41,64,45,50,50,50],"abilities":[61,0],"genderRatio":127,"expGroup":"SLOW","types":[16,16]},"dragonair":{"id":148,"natDex":148,"baseStats":[61,84,65,70,70,70],"abilities":[61,0],"genderRatio":127,"expGroup":"SLOW","types":[16,16]},"dragonite":{"id":149,"natDex":149,"baseStats":[91,134,95,80,100,100],"abilities":[39,0],"genderRatio":127,"expGroup":"SLOW","types":[16,2]},"mewtwo":{"id":150,"natDex":150,"baseStats":[106,110,90,130,154,90],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[14,14]},"mew":{"id":151,"natDex":151,"baseStats":[100,100,100,100,100,100],"abilities":[28,0],"genderRatio":255,"expGroup":"MEDIUM_SLOW","types":[14,14]},"chikorita":{"id":152,"natDex":152,"baseStats":[45,49,65,45,49,65],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"bayleef":{"id":153,"natDex":153,"baseStats":[60,62,80,60,63,80],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"meganium":{"id":154,"natDex":154,"baseStats":[80,82,100,80,83,100],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"cyndaquil":{"id":155,"natDex":155,"baseStats":[39,52,43,65,60,50],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"quilava":{"id":156,"natDex":156,"baseStats":[58,64,58,80,80,65],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"typhlosion":{"id":157,"natDex":157,"baseStats":[78,84,78,100,109,85],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"totodile":{"id":158,"natDex":158,"baseStats":[50,65,64,43,44,48],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"croconaw":{"id":159,"natDex":159,"baseStats":[65,80,80,58,59,63],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"feraligatr":{"id":160,"natDex":160,"baseStats":[85,105,100,78,79,83],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"sentret":{"id":161,"natDex":161,"baseStats":[35,46,34,20,35,45],"abilities":[50,51],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"furret":{"id":162,"natDex":162,"baseStats":[85,76,64,90,45,55],"abilities":[50,51],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"hoothoot":{"id":163,"natDex":163,"baseStats":[60,30,30,50,36,56],"abilities":[15,51],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"noctowl":{"id":164,"natDex":164,"baseStats":[100,50,50,70,76,96],"abilities":[15,51],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,2]},"ledyba":{"id":165,"natDex":165,"baseStats":[40,20,30,55,40,80],"abilities":[68,48],"genderRatio":127,"expGroup":"FAST","types":[6,2]},"ledian":{"id":166,"natDex":166,"baseStats":[55,35,50,85,55,110],"abilities":[68,48],"genderRatio":127,"expGroup":"FAST","types":[6,2]},"spinarak":{"id":167,"natDex":167,"baseStats":[40,60,40,30,40,40],"abilities":[68,15],"genderRatio":127,"expGroup":"FAST","types":[6,3]},"ariados":{"id":168,"natDex":168,"baseStats":[70,90,70,40,60,60],"abilities":[68,15],"genderRatio":127,"expGroup":"FAST","types":[6,3]},"crobat":{"id":169,"natDex":169,"baseStats":[85,90,80,130,70,80],"abilities":[39,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[3,2]},"chinchou":{"id":170,"natDex":170,"baseStats":[75,38,38,67,56,56],"abilities":[10,35],"genderRatio":127,"expGroup":"SLOW","types":[11,13]},"lanturn":{"id":171,"natDex":171,"baseStats":[125,58,58,67,76,76],"abilities":[10,35],"genderRatio":127,"expGroup":"SLOW","types":[11,13]},"pichu":{"id":172,"natDex":172,"baseStats":[20,40,15,60,35,35],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[13,13]},"cleffa":{"id":173,"natDex":173,"baseStats":[50,25,28,15,45,55],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"igglybuff":{"id":174,"natDex":174,"baseStats":[90,30,15,15,40,20],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"togepi":{"id":175,"natDex":175,"baseStats":[35,20,65,20,40,65],"abilities":[55,32],"genderRatio":31,"expGroup":"FAST","types":[0,0]},"togetic":{"id":176,"natDex":176,"baseStats":[55,40,85,40,80,105],"abilities":[55,32],"genderRatio":31,"expGroup":"FAST","types":[0,2]},"natu":{"id":177,"natDex":177,"baseStats":[40,50,45,70,70,45],"abilities":[28,48],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,2]},"xatu":{"id":178,"natDex":178,"baseStats":[65,75,70,95,95,70],"abilities":[28,48],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,2]},"mareep":{"id":179,"natDex":179,"baseStats":[55,40,40,35,65,45],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[13,13]},"flaaffy":{"id":180,"natDex":180,"baseStats":[70,55,55,45,80,60],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[13,13]},"ampharos":{"id":181,"natDex":181,"baseStats":[90,75,75,55,115,90],"abilities":[9,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[13,13]},"bellossom":{"id":182,"natDex":182,"baseStats":[75,80,85,50,90,100],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,12]},"marill":{"id":183,"natDex":183,"baseStats":[70,20,50,40,20,50],"abilities":[47,37],"genderRatio":127,"expGroup":"FAST","types":[11,11]},"azumarill":{"id":184,"natDex":184,"baseStats":[100,50,80,50,50,80],"abilities":[47,37],"genderRatio":127,"expGroup":"FAST","types":[11,11]},"sudowoodo":{"id":185,"natDex":185,"baseStats":[70,100,115,30,30,65],"abilities":[5,69],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[5,5]},"politoed":{"id":186,"natDex":186,"baseStats":[90,75,75,70,90,100],"abilities":[11,6],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,11]},"hoppip":{"id":187,"natDex":187,"baseStats":[35,35,40,50,35,55],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,2]},"skiploom":{"id":188,"natDex":188,"baseStats":[55,45,50,80,45,65],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,2]},"jumpluff":{"id":189,"natDex":189,"baseStats":[75,55,70,110,55,85],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,2]},"aipom":{"id":190,"natDex":190,"baseStats":[55,70,55,85,40,55],"abilities":[50,53],"genderRatio":127,"expGroup":"FAST","types":[0,0]},"sunkern":{"id":191,"natDex":191,"baseStats":[30,30,30,30,30,30],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,12]},"sunflora":{"id":192,"natDex":192,"baseStats":[75,75,55,30,105,85],"abilities":[34,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,12]},"yanma":{"id":193,"natDex":193,"baseStats":[65,65,45,95,75,45],"abilities":[3,14],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,2]},"wooper":{"id":194,"natDex":194,"baseStats":[55,45,45,15,25,25],"abilities":[6,11],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,4]},"quagsire":{"id":195,"natDex":195,"baseStats":[95,85,85,35,65,65],"abilities":[6,11],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,4]},"espeon":{"id":196,"natDex":196,"baseStats":[65,65,60,110,130,95],"abilities":[28,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[14,14]},"umbreon":{"id":197,"natDex":197,"baseStats":[95,65,110,65,60,130],"abilities":[28,0],"genderRatio":31,"expGroup":"MEDIUM_FAST","types":[17,17]},"murkrow":{"id":198,"natDex":198,"baseStats":[60,85,42,91,85,42],"abilities":[15,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[17,2]},"slowking":{"id":199,"natDex":199,"baseStats":[95,75,80,30,100,110],"abilities":[12,20],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,14]},"misdreavus":{"id":200,"natDex":200,"baseStats":[60,60,60,85,85,85],"abilities":[26,0],"genderRatio":127,"expGroup":"FAST","types":[7,7]},"unown":{"id":201,"natDex":201,"baseStats":[48,72,48,48,72,48],"abilities":[26,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[14,14]},"wobbuffet":{"id":202,"natDex":202,"baseStats":[190,33,58,33,33,58],"abilities":[23,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,14]},"girafarig":{"id":203,"natDex":203,"baseStats":[70,80,65,85,90,65],"abilities":[39,48],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,14]},"pineco":{"id":204,"natDex":204,"baseStats":[50,65,90,15,35,35],"abilities":[5,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"forretress":{"id":205,"natDex":205,"baseStats":[75,90,140,40,60,60],"abilities":[5,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,8]},"dunsparce":{"id":206,"natDex":206,"baseStats":[100,70,70,45,65,65],"abilities":[32,50],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"gligar":{"id":207,"natDex":207,"baseStats":[65,75,105,85,35,65],"abilities":[52,8],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[4,2]},"steelix":{"id":208,"natDex":208,"baseStats":[75,85,200,30,55,65],"abilities":[69,5],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[8,4]},"snubbull":{"id":209,"natDex":209,"baseStats":[60,80,50,30,40,40],"abilities":[22,50],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"granbull":{"id":210,"natDex":210,"baseStats":[90,120,75,45,60,60],"abilities":[22,22],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"qwilfish":{"id":211,"natDex":211,"baseStats":[65,95,75,85,55,55],"abilities":[38,33],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,3]},"scizor":{"id":212,"natDex":212,"baseStats":[70,130,100,65,55,80],"abilities":[68,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,8]},"shuckle":{"id":213,"natDex":213,"baseStats":[20,10,230,5,10,230],"abilities":[5,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[6,5]},"heracross":{"id":214,"natDex":214,"baseStats":[80,125,75,85,40,95],"abilities":[68,62],"genderRatio":127,"expGroup":"SLOW","types":[6,1]},"sneasel":{"id":215,"natDex":215,"baseStats":[55,95,55,115,35,75],"abilities":[39,51],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[17,15]},"teddiursa":{"id":216,"natDex":216,"baseStats":[60,80,50,40,50,50],"abilities":[53,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"ursaring":{"id":217,"natDex":217,"baseStats":[90,130,75,55,75,75],"abilities":[62,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"slugma":{"id":218,"natDex":218,"baseStats":[40,40,40,20,70,40],"abilities":[40,49],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,10]},"magcargo":{"id":219,"natDex":219,"baseStats":[50,50,120,30,80,80],"abilities":[40,49],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,5]},"swinub":{"id":220,"natDex":220,"baseStats":[50,50,40,50,30,30],"abilities":[12,0],"genderRatio":127,"expGroup":"SLOW","types":[15,4]},"piloswine":{"id":221,"natDex":221,"baseStats":[100,100,80,50,60,60],"abilities":[12,0],"genderRatio":127,"expGroup":"SLOW","types":[15,4]},"corsola":{"id":222,"natDex":222,"baseStats":[55,55,85,35,65,85],"abilities":[55,30],"genderRatio":191,"expGroup":"FAST","types":[11,5]},"remoraid":{"id":223,"natDex":223,"baseStats":[35,65,35,65,65,35],"abilities":[55,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"octillery":{"id":224,"natDex":224,"baseStats":[75,105,75,45,105,75],"abilities":[21,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,11]},"delibird":{"id":225,"natDex":225,"baseStats":[45,55,45,75,65,45],"abilities":[72,55],"genderRatio":127,"expGroup":"FAST","types":[15,2]},"mantine":{"id":226,"natDex":226,"baseStats":[65,40,70,70,80,140],"abilities":[33,11],"genderRatio":127,"expGroup":"SLOW","types":[11,2]},"skarmory":{"id":227,"natDex":227,"baseStats":[65,80,140,70,40,70],"abilities":[51,5],"genderRatio":127,"expGroup":"SLOW","types":[8,2]},"houndour":{"id":228,"natDex":228,"baseStats":[45,60,30,65,80,50],"abilities":[48,18],"genderRatio":127,"expGroup":"SLOW","types":[17,10]},"houndoom":{"id":229,"natDex":229,"baseStats":[75,90,50,95,110,80],"abilities":[48,18],"genderRatio":127,"expGroup":"SLOW","types":[17,10]},"kingdra":{"id":230,"natDex":230,"baseStats":[75,95,95,85,95,95],"abilities":[33,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,16]},"phanpy":{"id":231,"natDex":231,"baseStats":[90,60,60,40,40,40],"abilities":[53,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"donphan":{"id":232,"natDex":232,"baseStats":[90,120,120,50,60,60],"abilities":[5,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[4,4]},"porygon2":{"id":233,"natDex":233,"baseStats":[85,80,90,60,105,95],"abilities":[36,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[0,0]},"stantler":{"id":234,"natDex":234,"baseStats":[73,95,62,85,85,65],"abilities":[22,0],"genderRatio":127,"expGroup":"SLOW","types":[0,0]},"smeargle":{"id":235,"natDex":235,"baseStats":[55,20,35,75,20,45],"abilities":[20,0],"genderRatio":127,"expGroup":"FAST","types":[0,0]},"tyrogue":{"id":236,"natDex":236,"baseStats":[35,35,35,35,35,35],"abilities":[62,0],"genderRatio":0,"expGroup":"MEDIUM_FAST","types":[1,1]},"hitmontop":{"id":237,"natDex":237,"baseStats":[50,95,95,70,35,110],"abilities":[22,0],"genderRatio":0,"expGroup":"MEDIUM_FAST","types":[1,1]},"smoochum":{"id":238,"natDex":238,"baseStats":[45,30,15,65,85,65],"abilities":[12,0],"genderRatio":254,"expGroup":"MEDIUM_FAST","types":[15,14]},"elekid":{"id":239,"natDex":239,"baseStats":[45,63,37,95,65,55],"abilities":[9,0],"genderRatio":63,"expGroup":"MEDIUM_FAST","types":[13,13]},"magby":{"id":240,"natDex":240,"baseStats":[45,75,37,83,70,55],"abilities":[49,0],"genderRatio":63,"expGroup":"MEDIUM_FAST","types":[10,10]},"miltank":{"id":241,"natDex":241,"baseStats":[95,80,105,100,40,70],"abilities":[47,0],"genderRatio":254,"expGroup":"SLOW","types":[0,0]},"blissey":{"id":242,"natDex":242,"baseStats":[255,10,10,55,75,135],"abilities":[30,32],"genderRatio":254,"expGroup":"FAST","types":[0,0]},"raikou":{"id":243,"natDex":243,"baseStats":[90,85,75,115,115,100],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[13,13]},"entei":{"id":244,"natDex":244,"baseStats":[115,115,85,100,90,75],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[10,10]},"suicune":{"id":245,"natDex":245,"baseStats":[100,75,115,85,90,115],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[11,11]},"larvitar":{"id":246,"natDex":246,"baseStats":[50,64,50,41,45,50],"abilities":[62,0],"genderRatio":127,"expGroup":"SLOW","types":[5,4]},"pupitar":{"id":247,"natDex":247,"baseStats":[70,84,70,51,65,70],"abilities":[61,0],"genderRatio":127,"expGroup":"SLOW","types":[5,4]},"tyranitar":{"id":248,"natDex":248,"baseStats":[100,134,110,61,95,100],"abilities":[45,0],"genderRatio":127,"expGroup":"SLOW","types":[5,17]},"lugia":{"id":249,"natDex":249,"baseStats":[106,90,130,110,90,154],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[14,2]},"hooh":{"id":250,"natDex":250,"baseStats":[106,130,90,90,110,154],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[10,2]},"celebi":{"id":251,"natDex":251,"baseStats":[100,100,100,100,100,100],"abilities":[30,0],"genderRatio":255,"expGroup":"MEDIUM_SLOW","types":[14,12]},"treecko":{"id":277,"natDex":252,"baseStats":[40,45,35,70,65,55],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"grovyle":{"id":278,"natDex":253,"baseStats":[50,65,45,95,85,65],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"sceptile":{"id":279,"natDex":254,"baseStats":[70,85,65,120,105,85],"abilities":[65,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[12,12]},"torchic":{"id":280,"natDex":255,"baseStats":[45,60,40,45,70,50],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,10]},"combusken":{"id":281,"natDex":256,"baseStats":[60,85,60,55,85,60],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,1]},"blaziken":{"id":282,"natDex":257,"baseStats":[80,120,70,80,110,70],"abilities":[66,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[10,1]},"mudkip":{"id":283,"natDex":258,"baseStats":[50,70,50,40,50,50],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,11]},"marshtomp":{"id":284,"natDex":259,"baseStats":[70,85,70,50,60,70],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,4]},"swampert":{"id":285,"natDex":260,"baseStats":[100,110,90,60,85,90],"abilities":[67,0],"genderRatio":31,"expGroup":"MEDIUM_SLOW","types":[11,4]},"poochyena":{"id":286,"natDex":261,"baseStats":[35,55,35,35,30,30],"abilities":[50,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[17,17]},"mightyena":{"id":287,"natDex":262,"baseStats":[70,90,70,70,60,60],"abilities":[22,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[17,17]},"zigzagoon":{"id":288,"natDex":263,"baseStats":[38,30,41,60,30,41],"abilities":[53,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"linoone":{"id":289,"natDex":264,"baseStats":[78,70,61,100,50,61],"abilities":[53,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"wurmple":{"id":290,"natDex":265,"baseStats":[45,45,35,20,20,30],"abilities":[19,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"silcoon":{"id":291,"natDex":266,"baseStats":[50,35,55,15,25,25],"abilities":[61,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"beautifly":{"id":292,"natDex":267,"baseStats":[60,70,50,65,90,50],"abilities":[68,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,2]},"cascoon":{"id":293,"natDex":268,"baseStats":[50,35,55,15,25,25],"abilities":[61,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,6]},"dustox":{"id":294,"natDex":269,"baseStats":[60,50,70,65,50,90],"abilities":[19,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,3]},"lotad":{"id":295,"natDex":270,"baseStats":[40,30,30,30,40,50],"abilities":[33,44],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,12]},"lombre":{"id":296,"natDex":271,"baseStats":[60,50,50,50,60,70],"abilities":[33,44],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,12]},"ludicolo":{"id":297,"natDex":272,"baseStats":[80,70,70,70,90,100],"abilities":[33,44],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[11,12]},"seedot":{"id":298,"natDex":273,"baseStats":[40,40,50,30,30,30],"abilities":[34,48],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,12]},"nuzleaf":{"id":299,"natDex":274,"baseStats":[70,70,40,60,60,40],"abilities":[34,48],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,17]},"shiftry":{"id":300,"natDex":275,"baseStats":[90,100,60,80,90,60],"abilities":[34,48],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,17]},"nincada":{"id":301,"natDex":290,"baseStats":[31,45,90,40,30,30],"abilities":[14,0],"genderRatio":127,"expGroup":"ERRATIC","types":[6,4]},"ninjask":{"id":302,"natDex":291,"baseStats":[61,90,45,160,50,50],"abilities":[3,0],"genderRatio":127,"expGroup":"ERRATIC","types":[6,2]},"shedinja":{"id":303,"natDex":292,"baseStats":[1,90,45,40,30,30],"abilities":[25,0],"genderRatio":255,"expGroup":"ERRATIC","types":[6,7]},"taillow":{"id":304,"natDex":276,"baseStats":[40,55,30,85,30,30],"abilities":[62,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,2]},"swellow":{"id":305,"natDex":277,"baseStats":[60,85,60,125,50,50],"abilities":[62,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,2]},"shroomish":{"id":306,"natDex":285,"baseStats":[60,40,60,35,40,60],"abilities":[27,0],"genderRatio":127,"expGroup":"FLUCTUATING","types":[12,12]},"breloom":{"id":307,"natDex":286,"baseStats":[60,130,80,70,60,60],"abilities":[27,0],"genderRatio":127,"expGroup":"FLUCTUATING","types":[12,1]},"spinda":{"id":308,"natDex":327,"baseStats":[60,60,60,60,60,60],"abilities":[20,0],"genderRatio":127,"expGroup":"FAST","types":[0,0]},"wingull":{"id":309,"natDex":278,"baseStats":[40,30,30,85,55,30],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,2]},"pelipper":{"id":310,"natDex":279,"baseStats":[60,50,100,65,85,70],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,2]},"surskit":{"id":311,"natDex":283,"baseStats":[40,30,32,65,50,52],"abilities":[33,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,11]},"masquerain":{"id":312,"natDex":284,"baseStats":[70,60,62,60,80,82],"abilities":[22,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[6,2]},"wailmer":{"id":313,"natDex":320,"baseStats":[130,70,35,60,70,35],"abilities":[41,12],"genderRatio":127,"expGroup":"FLUCTUATING","types":[11,11]},"wailord":{"id":314,"natDex":321,"baseStats":[170,90,45,60,90,45],"abilities":[41,12],"genderRatio":127,"expGroup":"FLUCTUATING","types":[11,11]},"skitty":{"id":315,"natDex":300,"baseStats":[50,45,45,50,35,35],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"delcatty":{"id":316,"natDex":301,"baseStats":[70,65,65,70,55,55],"abilities":[56,0],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"kecleon":{"id":317,"natDex":352,"baseStats":[60,90,70,40,60,120],"abilities":[16,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,0]},"baltoy":{"id":318,"natDex":343,"baseStats":[40,40,55,55,40,70],"abilities":[26,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[4,14]},"claydol":{"id":319,"natDex":344,"baseStats":[60,70,105,75,70,120],"abilities":[26,0],"genderRatio":255,"expGroup":"MEDIUM_FAST","types":[4,14]},"nosepass":{"id":320,"natDex":299,"baseStats":[30,45,135,30,45,90],"abilities":[5,42],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[5,5]},"torkoal":{"id":321,"natDex":324,"baseStats":[70,85,140,20,85,70],"abilities":[73,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,10]},"sableye":{"id":322,"natDex":302,"baseStats":[50,75,75,50,65,65],"abilities":[51,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[17,7]},"barboach":{"id":323,"natDex":339,"baseStats":[50,48,43,60,46,41],"abilities":[12,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,4]},"whiscash":{"id":324,"natDex":340,"baseStats":[110,78,73,60,76,71],"abilities":[12,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[11,4]},"luvdisc":{"id":325,"natDex":370,"baseStats":[43,30,55,97,40,65],"abilities":[33,0],"genderRatio":191,"expGroup":"FAST","types":[11,11]},"corphish":{"id":326,"natDex":341,"baseStats":[43,80,65,35,50,35],"abilities":[52,75],"genderRatio":127,"expGroup":"FLUCTUATING","types":[11,11]},"crawdaunt":{"id":327,"natDex":342,"baseStats":[63,120,85,55,90,55],"abilities":[52,75],"genderRatio":127,"expGroup":"FLUCTUATING","types":[11,17]},"feebas":{"id":328,"natDex":349,"baseStats":[20,15,20,80,10,55],"abilities":[33,0],"genderRatio":127,"expGroup":"ERRATIC","types":[11,11]},"milotic":{"id":329,"natDex":350,"baseStats":[95,60,79,81,100,125],"abilities":[63,0],"genderRatio":127,"expGroup":"ERRATIC","types":[11,11]},"carvanha":{"id":330,"natDex":318,"baseStats":[45,90,20,65,65,20],"abilities":[24,0],"genderRatio":127,"expGroup":"SLOW","types":[11,17]},"sharpedo":{"id":331,"natDex":319,"baseStats":[70,120,40,95,95,40],"abilities":[24,0],"genderRatio":127,"expGroup":"SLOW","types":[11,17]},"trapinch":{"id":332,"natDex":328,"baseStats":[45,100,45,10,45,45],"abilities":[52,71],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[4,4]},"vibrava":{"id":333,"natDex":329,"baseStats":[50,70,50,70,50,50],"abilities":[26,26],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[4,16]},"flygon":{"id":334,"natDex":330,"baseStats":[80,100,80,100,80,80],"abilities":[26,26],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[4,16]},"makuhita":{"id":335,"natDex":296,"baseStats":[72,60,30,25,20,30],"abilities":[47,62],"genderRatio":63,"expGroup":"FLUCTUATING","types":[1,1]},"hariyama":{"id":336,"natDex":297,"baseStats":[144,120,60,50,40,60],"abilities":[47,62],"genderRatio":63,"expGroup":"FLUCTUATING","types":[1,1]},"electrike":{"id":337,"natDex":309,"baseStats":[40,45,40,65,65,40],"abilities":[9,31],"genderRatio":127,"expGroup":"SLOW","types":[13,13]},"manectric":{"id":338,"natDex":310,"baseStats":[70,75,60,105,105,60],"abilities":[9,31],"genderRatio":127,"expGroup":"SLOW","types":[13,13]},"numel":{"id":339,"natDex":322,"baseStats":[60,60,40,35,65,45],"abilities":[12,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,4]},"camerupt":{"id":340,"natDex":323,"baseStats":[70,100,70,40,105,75],"abilities":[40,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[10,4]},"spheal":{"id":341,"natDex":363,"baseStats":[70,40,50,25,55,50],"abilities":[47,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[15,11]},"sealeo":{"id":342,"natDex":364,"baseStats":[90,60,70,45,75,70],"abilities":[47,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[15,11]},"walrein":{"id":343,"natDex":365,"baseStats":[110,80,90,65,95,90],"abilities":[47,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[15,11]},"cacnea":{"id":344,"natDex":331,"baseStats":[50,85,40,35,85,40],"abilities":[8,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,12]},"cacturne":{"id":345,"natDex":332,"baseStats":[70,115,60,55,115,60],"abilities":[8,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,17]},"snorunt":{"id":346,"natDex":361,"baseStats":[50,50,50,50,50,50],"abilities":[39,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[15,15]},"glalie":{"id":347,"natDex":362,"baseStats":[80,80,80,80,80,80],"abilities":[39,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[15,15]},"lunatone":{"id":348,"natDex":337,"baseStats":[70,55,65,70,95,85],"abilities":[26,0],"genderRatio":255,"expGroup":"FAST","types":[5,14]},"solrock":{"id":349,"natDex":338,"baseStats":[70,95,85,70,55,65],"abilities":[26,0],"genderRatio":255,"expGroup":"FAST","types":[5,14]},"azurill":{"id":350,"natDex":298,"baseStats":[50,20,40,20,20,40],"abilities":[47,37],"genderRatio":191,"expGroup":"FAST","types":[0,0]},"spoink":{"id":351,"natDex":325,"baseStats":[60,25,35,60,70,80],"abilities":[47,20],"genderRatio":127,"expGroup":"FAST","types":[14,14]},"grumpig":{"id":352,"natDex":326,"baseStats":[80,45,65,80,90,110],"abilities":[47,20],"genderRatio":127,"expGroup":"FAST","types":[14,14]},"plusle":{"id":353,"natDex":311,"baseStats":[60,50,40,95,85,75],"abilities":[57,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[13,13]},"minun":{"id":354,"natDex":312,"baseStats":[60,40,50,95,75,85],"abilities":[58,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[13,13]},"mawile":{"id":355,"natDex":303,"baseStats":[50,85,85,50,55,55],"abilities":[52,22],"genderRatio":127,"expGroup":"FAST","types":[8,8]},"meditite":{"id":356,"natDex":307,"baseStats":[30,40,55,60,40,55],"abilities":[74,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[1,14]},"medicham":{"id":357,"natDex":308,"baseStats":[60,60,75,80,60,75],"abilities":[74,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[1,14]},"swablu":{"id":358,"natDex":333,"baseStats":[45,40,60,50,40,75],"abilities":[30,0],"genderRatio":127,"expGroup":"ERRATIC","types":[0,2]},"altaria":{"id":359,"natDex":334,"baseStats":[75,70,90,80,70,105],"abilities":[30,0],"genderRatio":127,"expGroup":"ERRATIC","types":[16,2]},"wynaut":{"id":360,"natDex":360,"baseStats":[95,23,48,23,23,48],"abilities":[23,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[14,14]},"duskull":{"id":361,"natDex":355,"baseStats":[20,40,90,25,30,90],"abilities":[26,0],"genderRatio":127,"expGroup":"FAST","types":[7,7]},"dusclops":{"id":362,"natDex":356,"baseStats":[40,70,130,25,60,130],"abilities":[46,0],"genderRatio":127,"expGroup":"FAST","types":[7,7]},"roselia":{"id":363,"natDex":315,"baseStats":[50,60,45,65,100,80],"abilities":[30,38],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[12,3]},"slakoth":{"id":364,"natDex":287,"baseStats":[60,60,60,30,35,35],"abilities":[54,0],"genderRatio":127,"expGroup":"SLOW","types":[0,0]},"vigoroth":{"id":365,"natDex":288,"baseStats":[80,80,80,90,55,55],"abilities":[72,0],"genderRatio":127,"expGroup":"SLOW","types":[0,0]},"slaking":{"id":366,"natDex":289,"baseStats":[150,160,100,100,95,65],"abilities":[54,0],"genderRatio":127,"expGroup":"SLOW","types":[0,0]},"gulpin":{"id":367,"natDex":316,"baseStats":[70,43,53,40,43,53],"abilities":[64,60],"genderRatio":127,"expGroup":"FLUCTUATING","types":[3,3]},"swalot":{"id":368,"natDex":317,"baseStats":[100,73,83,55,73,83],"abilities":[64,60],"genderRatio":127,"expGroup":"FLUCTUATING","types":[3,3]},"tropius":{"id":369,"natDex":357,"baseStats":[99,68,83,51,72,87],"abilities":[34,0],"genderRatio":127,"expGroup":"SLOW","types":[12,2]},"whismur":{"id":370,"natDex":293,"baseStats":[64,51,23,28,51,23],"abilities":[43,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,0]},"loudred":{"id":371,"natDex":294,"baseStats":[84,71,43,48,71,43],"abilities":[43,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,0]},"exploud":{"id":372,"natDex":295,"baseStats":[104,91,63,68,91,63],"abilities":[43,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[0,0]},"clamperl":{"id":373,"natDex":366,"baseStats":[35,64,85,32,74,55],"abilities":[75,0],"genderRatio":127,"expGroup":"ERRATIC","types":[11,11]},"huntail":{"id":374,"natDex":367,"baseStats":[55,104,105,52,94,75],"abilities":[33,0],"genderRatio":127,"expGroup":"ERRATIC","types":[11,11]},"gorebyss":{"id":375,"natDex":368,"baseStats":[55,84,105,52,114,75],"abilities":[33,0],"genderRatio":127,"expGroup":"ERRATIC","types":[11,11]},"absol":{"id":376,"natDex":359,"baseStats":[65,130,60,75,75,60],"abilities":[46,0],"genderRatio":127,"expGroup":"MEDIUM_SLOW","types":[17,17]},"shuppet":{"id":377,"natDex":353,"baseStats":[44,75,35,45,63,33],"abilities":[15,0],"genderRatio":127,"expGroup":"FAST","types":[7,7]},"banette":{"id":378,"natDex":354,"baseStats":[64,115,65,65,83,63],"abilities":[15,0],"genderRatio":127,"expGroup":"FAST","types":[7,7]},"seviper":{"id":379,"natDex":336,"baseStats":[73,100,60,65,100,60],"abilities":[61,0],"genderRatio":127,"expGroup":"FLUCTUATING","types":[3,3]},"zangoose":{"id":380,"natDex":335,"baseStats":[73,115,60,90,60,60],"abilities":[17,0],"genderRatio":127,"expGroup":"ERRATIC","types":[0,0]},"relicanth":{"id":381,"natDex":369,"baseStats":[100,90,130,55,45,65],"abilities":[33,69],"genderRatio":31,"expGroup":"SLOW","types":[11,5]},"aron":{"id":382,"natDex":304,"baseStats":[50,70,100,30,40,40],"abilities":[5,69],"genderRatio":127,"expGroup":"SLOW","types":[8,5]},"lairon":{"id":383,"natDex":305,"baseStats":[60,90,140,40,50,50],"abilities":[5,69],"genderRatio":127,"expGroup":"SLOW","types":[8,5]},"aggron":{"id":384,"natDex":306,"baseStats":[70,110,180,50,60,60],"abilities":[5,69],"genderRatio":127,"expGroup":"SLOW","types":[8,5]},"castform":{"id":385,"natDex":351,"baseStats":[70,70,70,70,70,70],"abilities":[59,0],"genderRatio":127,"expGroup":"MEDIUM_FAST","types":[0,0]},"volbeat":{"id":386,"natDex":313,"baseStats":[65,73,55,85,47,75],"abilities":[35,68],"genderRatio":0,"expGroup":"ERRATIC","types":[6,6]},"illumise":{"id":387,"natDex":314,"baseStats":[65,47,55,85,73,75],"abilities":[12,0],"genderRatio":254,"expGroup":"FLUCTUATING","types":[6,6]},"lileep":{"id":388,"natDex":345,"baseStats":[66,41,77,23,61,87],"abilities":[21,0],"genderRatio":31,"expGroup":"ERRATIC","types":[5,12]},"cradily":{"id":389,"natDex":346,"baseStats":[86,81,97,43,81,107],"abilities":[21,0],"genderRatio":31,"expGroup":"ERRATIC","types":[5,12]},"anorith":{"id":390,"natDex":347,"baseStats":[45,95,50,75,40,50],"abilities":[4,0],"genderRatio":31,"expGroup":"ERRATIC","types":[5,6]},"armaldo":{"id":391,"natDex":348,"baseStats":[75,125,100,45,70,80],"abilities":[4,0],"genderRatio":31,"expGroup":"ERRATIC","types":[5,6]},"ralts":{"id":392,"natDex":280,"baseStats":[28,25,25,40,45,35],"abilities":[28,36],"genderRatio":127,"expGroup":"SLOW","types":[14,14]},"kirlia":{"id":393,"natDex":281,"baseStats":[38,35,35,50,65,55],"abilities":[28,36],"genderRatio":127,"expGroup":"SLOW","types":[14,14]},"gardevoir":{"id":394,"natDex":282,"baseStats":[68,65,65,80,125,115],"abilities":[28,36],"genderRatio":127,"expGroup":"SLOW","types":[14,14]},"bagon":{"id":395,"natDex":371,"baseStats":[45,75,60,50,40,30],"abilities":[69,0],"genderRatio":127,"expGroup":"SLOW","types":[16,16]},"shelgon":{"id":396,"natDex":372,"baseStats":[65,95,100,50,60,50],"abilities":[69,0],"genderRatio":127,"expGroup":"SLOW","types":[16,16]},"salamence":{"id":397,"natDex":373,"baseStats":[95,135,80,100,110,80],"abilities":[22,0],"genderRatio":127,"expGroup":"SLOW","types":[16,2]},"beldum":{"id":398,"natDex":374,"baseStats":[40,55,80,30,35,60],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[8,14]},"metang":{"id":399,"natDex":375,"baseStats":[60,75,100,50,55,80],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[8,14]},"metagross":{"id":400,"natDex":376,"baseStats":[80,135,130,70,95,90],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[8,14]},"regirock":{"id":401,"natDex":377,"baseStats":[80,100,200,50,50,100],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[5,5]},"regice":{"id":402,"natDex":378,"baseStats":[80,50,100,50,100,200],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[15,15]},"registeel":{"id":403,"natDex":379,"baseStats":[80,75,150,50,75,150],"abilities":[29,0],"genderRatio":255,"expGroup":"SLOW","types":[8,8]},"kyogre":{"id":404,"natDex":382,"baseStats":[100,100,90,90,150,140],"abilities":[2,0],"genderRatio":255,"expGroup":"SLOW","types":[11,11]},"groudon":{"id":405,"natDex":383,"baseStats":[100,150,140,90,100,90],"abilities":[70,0],"genderRatio":255,"expGroup":"SLOW","types":[4,4]},"rayquaza":{"id":406,"natDex":384,"baseStats":[105,150,90,95,150,90],"abilities":[77,0],"genderRatio":255,"expGroup":"SLOW","types":[16,2]},"latias":{"id":407,"natDex":380,"baseStats":[80,80,90,110,110,130],"abilities":[26,0],"genderRatio":254,"expGroup":"SLOW","types":[16,14]},"latios":{"id":408,"natDex":381,"baseStats":[80,90,80,110,130,110],"abilities":[26,0],"genderRatio":0,"expGroup":"SLOW","types":[16,14]},"jirachi":{"id":409,"natDex":385,"baseStats":[100,100,100,100,100,100],"abilities":[32,0],"genderRatio":255,"expGroup":"SLOW","types":[8,14]},"deoxys":{"id":410,"natDex":386,"baseStats":[50,150,50,150,150,50],"abilities":[46,0],"genderRatio":255,"expGroup":"SLOW","types":[14,14],"emeraldStats":[50,95,90,180,95,90]},"chimecho":{"id":411,"natDex":358,"baseStats":[65,50,70,65,95,80],"abilities":[26,0],"genderRatio":127,"expGroup":"FAST","types":[14,14]}},"moves":{"pound":1,"karatechop":2,"doubleslap":3,"cometpunch":4,"megapunch":5,"payday":6,"firepunch":7,"icepunch":8,"thunderpunch":9,"scratch":10,"vicegrip":11,"guillotine":12,"razorwind":13,"swordsdance":14,"cut":15,"gust":16,"wingattack":17,"whirlwind":18,"fly":19,"bind":20,"slam":21,"vinewhip":22,"stomp":23,"doublekick":24,"megakick":25,"jumpkick":26,"rollingkick":27,"sandattack":28,"headbutt":29,"hornattack":30,"furyattack":31,"horndrill":32,"tackle":33,"bodyslam":34,"wrap":35,"takedown":36,"thrash":37,"doubleedge":38,"tailwhip":39,"poisonsting":40,"twineedle":41,"pinmissile":42,"leer":43,"bite":44,"growl":45,"roar":46,"sing":47,"supersonic":48,"sonicboom":49,"disable":50,"acid":51,"ember":52,"flamethrower":53,"mist":54,"watergun":55,"hydropump":56,"surf":57,"icebeam":58,"blizzard":59,"psybeam":60,"bubblebeam":61,"aurorabeam":62,"hyperbeam":63,"peck":64,"drillpeck":65,"submission":66,"lowkick":67,"counter":68,"seismictoss":69,"strength":70,"absorb":71,"megadrain":72,"leechseed":73,"growth":74,"razorleaf":75,"solarbeam":76,"poisonpowder":77,"stunspore":78,"sleeppowder":79,"petaldance":80,"stringshot":81,"dragonrage":82,"firespin":83,"thundershock":84,"thunderbolt":85,"thunderwave":86,"thunder":87,"rockthrow":88,"earthquake":89,"fissure":90,"dig":91,"toxic":92,"confusion":93,"psychic":94,"hypnosis":95,"meditate":96,"agility":97,"quickattack":98,"rage":99,"teleport":100,"nightshade":101,"mimic":102,"screech":103,"doubleteam":104,"recover":105,"harden":106,"minimize":107,"smokescreen":108,"confuseray":109,"withdraw":110,"defensecurl":111,"barrier":112,"lightscreen":113,"haze":114,"reflect":115,"focusenergy":116,"bide":117,"metronome":118,"mirrormove":119,"selfdestruct":120,"eggbomb":121,"lick":122,"smog":123,"sludge":124,"boneclub":125,"fireblast":126,"waterfall":127,"clamp":128,"swift":129,"skullbash":130,"spikecannon":131,"constrict":132,"amnesia":133,"kinesis":134,"softboiled":135,"hijumpkick":136,"glare":137,"dreameater":138,"poisongas":139,"barrage":140,"leechlife":141,"lovelykiss":142,"skyattack":143,"transform":144,"bubble":145,"dizzypunch":146,"spore":147,"flash":148,"psywave":149,"splash":150,"acidarmor":151,"crabhammer":152,"explosion":153,"furyswipes":154,"bonemerang":155,"rest":156,"rockslide":157,"hyperfang":158,"sharpen":159,"conversion":160,"triattack":161,"superfang":162,"slash":163,"substitute":164,"struggle":165,"sketch":166,"triplekick":167,"thief":168,"spiderweb":169,"mindreader":170,"nightmare":171,"flamewheel":172,"snore":173,"curse":174,"flail":175,"conversion2":176,"aeroblast":177,"cottonspore":178,"reversal":179,"spite":180,"powdersnow":181,"protect":182,"machpunch":183,"scaryface":184,"faintattack":185,"sweetkiss":186,"bellydrum":187,"sludgebomb":188,"mudslap":189,"octazooka":190,"spikes":191,"zapcannon":192,"foresight":193,"destinybond":194,"perishsong":195,"icywind":196,"detect":197,"bonerush":198,"lockon":199,"outrage":200,"sandstorm":201,"gigadrain":202,"endure":203,"charm":204,"rollout":205,"falseswipe":206,"swagger":207,"milkdrink":208,"spark":209,"furycutter":210,"steelwing":211,"meanlook":212,"attract":213,"sleeptalk":214,"healbell":215,"return":216,"present":217,"frustration":218,"safeguard":219,"painsplit":220,"sacredfire":221,"magnitude":222,"dynamicpunch":223,"megahorn":224,"dragonbreath":225,"batonpass":226,"encore":227,"pursuit":228,"rapidspin":229,"sweetscent":230,"irontail":231,"metalclaw":232,"vitalthrow":233,"morningsun":234,"synthesis":235,"moonlight":236,"hiddenpower":237,"crosschop":238,"twister":239,"raindance":240,"sunnyday":241,"crunch":242,"mirrorcoat":243,"psychup":244,"extremespeed":245,"ancientpower":246,"shadowball":247,"futuresight":248,"rocksmash":249,"whirlpool":250,"beatup":251,"fakeout":252,"uproar":253,"stockpile":254,"spitup":255,"swallow":256,"heatwave":257,"hail":258,"torment":259,"flatter":260,"willowisp":261,"memento":262,"facade":263,"focuspunch":264,"smellingsalt":265,"followme":266,"naturepower":267,"charge":268,"taunt":269,"helpinghand":270,"trick":271,"roleplay":272,"wish":273,"assist":274,"ingrain":275,"superpower":276,"magiccoat":277,"recycle":278,"revenge":279,"brickbreak":280,"yawn":281,"knockoff":282,"endeavor":283,"eruption":284,"skillswap":285,"imprison":286,"refresh":287,"grudge":288,"snatch":289,"secretpower":290,"dive":291,"armthrust":292,"camouflage":293,"tailglow":294,"lusterpurge":295,"mistball":296,"featherdance":297,"teeterdance":298,"blazekick":299,"mudsport":300,"iceball":301,"needlearm":302,"slackoff":303,"hypervoice":304,"poisonfang":305,"crushclaw":306,"blastburn":307,"hydrocannon":308,"meteormash":309,"astonish":310,"weatherball":311,"aromatherapy":312,"faketears":313,"aircutter":314,"overheat":315,"odorsleuth":316,"rocktomb":317,"silverwind":318,"metalsound":319,"grasswhistle":320,"tickle":321,"cosmicpower":322,"waterspout":323,"signalbeam":324,"shadowpunch":325,"extrasensory":326,"skyuppercut":327,"sandtomb":328,"sheercold":329,"muddywater":330,"bulletseed":331,"aerialace":332,"iciclespear":333,"irondefense":334,"block":335,"howl":336,"dragonclaw":337,"frenzyplant":338,"bulkup":339,"bounce":340,"mudshot":341,"poisontail":342,"covet":343,"volttackle":344,"magicalleaf":345,"watersport":346,"calmmind":347,"leafblade":348,"dragondance":349,"rockblast":350,"shockwave":351,"waterpulse":352,"doomdesire":353,"psychoboost":354,"smellingsalts":265,"visegrip":11,"feintattack":185,"highjumpkick":136},"items":{"masterball":1,"ultraball":2,"greatball":3,"pokeball":4,"safariball":5,"netball":6,"diveball":7,"nestball":8,"repeatball":9,"timerball":10,"luxuryball":11,"premierball":12,"potion":13,"antidote":14,"burnheal":15,"iceheal":16,"awakening":17,"paralyzeheal":18,"fullrestore":19,"maxpotion":20,"hyperpotion":21,"superpotion":22,"fullheal":23,"revive":24,"maxrevive":25,"freshwater":26,"sodapop":27,"lemonade":28,"moomoomilk":29,"energypowder":30,"energyroot":31,"healpowder":32,"revivalherb":33,"ether":34,"maxether":35,"elixir":36,"maxelixir":37,"lavacookie":38,"blueflute":39,"yellowflute":40,"redflute":41,"blackflute":42,"whiteflute":43,"berryjuice":44,"sacredash":45,"shoalsalt":46,"shoalshell":47,"redshard":48,"blueshard":49,"yellowshard":50,"greenshard":51,"034":52,"035":53,"036":54,"037":55,"038":56,"039":57,"03a":58,"03b":59,"03c":60,"03d":61,"03e":62,"hpup":63,"protein":64,"iron":65,"carbos":66,"calcium":67,"rarecandy":68,"ppup":69,"zinc":70,"ppmax":71,"048":72,"guardspec":73,"direhit":74,"xattack":75,"xdefend":76,"xspeed":77,"xaccuracy":78,"xspecial":79,"pokedoll":80,"fluffytail":81,"052":82,"superrepel":83,"maxrepel":84,"escaperope":85,"repel":86,"057":87,"058":88,"059":89,"05a":90,"05b":91,"05c":92,"sunstone":93,"moonstone":94,"firestone":95,"thunderstone":96,"waterstone":97,"leafstone":98,"063":99,"064":100,"065":101,"066":102,"tinymushroom":103,"bigmushroom":104,"069":105,"pearl":106,"bigpearl":107,"stardust":108,"starpiece":109,"nugget":110,"heartscale":111,"070":112,"071":113,"072":114,"073":115,"074":116,"075":117,"076":118,"077":119,"078":120,"orangemail":121,"harbormail":122,"glittermail":123,"mechmail":124,"woodmail":125,"wavemail":126,"beadmail":127,"shadowmail":128,"tropicmail":129,"dreammail":130,"fabmail":131,"retromail":132,"cheriberry":133,"chestoberry":134,"pechaberry":135,"rawstberry":136,"aspearberry":137,"leppaberry":138,"oranberry":139,"persimberry":140,"lumberry":141,"sitrusberry":142,"figyberry":143,"wikiberry":144,"magoberry":145,"aguavberry":146,"iapapaberry":147,"razzberry":148,"blukberry":149,"nanabberry":150,"wepearberry":151,"pinapberry":152,"pomegberry":153,"kelpsyberry":154,"qualotberry":155,"hondewberry":156,"grepaberry":157,"tamatoberry":158,"cornnberry":159,"magostberry":160,"rabutaberry":161,"nomelberry":162,"spelonberry":163,"pamtreberry":164,"watmelberry":165,"durinberry":166,"belueberry":167,"liechiberry":168,"ganlonberry":169,"salacberry":170,"petayaberry":171,"apicotberry":172,"lansatberry":173,"starfberry":174,"enigmaberry":175,"unusedberry1":176,"unusedberry2":177,"unusedberry3":178,"brightpowder":179,"whiteherb":180,"machobrace":181,"expshare":182,"quickclaw":183,"soothebell":184,"mentalherb":185,"choiceband":186,"kingsrock":187,"silverpowder":188,"amuletcoin":189,"cleansetag":190,"souldew":191,"deepseatooth":192,"deepseascale":193,"smokeball":194,"everstone":195,"focusband":196,"luckyegg":197,"scopelens":198,"metalcoat":199,"leftovers":200,"dragonscale":201,"lightball":202,"softsand":203,"hardstone":204,"miracleseed":205,"blackglasses":206,"blackbelt":207,"magnet":208,"mysticwater":209,"sharpbeak":210,"poisonbarb":211,"nevermeltice":212,"spelltag":213,"twistedspoon":214,"charcoal":215,"dragonfang":216,"silkscarf":217,"upgrade":218,"shellbell":219,"seaincense":220,"laxincense":221,"luckypunch":222,"metalpowder":223,"thickclub":224,"stick":225,"0e2":226,"0e3":227,"0e4":228,"0e5":229,"0e6":230,"0e7":231,"0e8":232,"0e9":233,"0ea":234,"0eb":235,"0ec":236,"0ed":237,"0ee":238,"0ef":239,"0f0":240,"0f1":241,"0f2":242,"0f3":243,"0f4":244,"0f5":245,"0f6":246,"0f7":247,"0f8":248,"0f9":249,"0fa":250,"0fb":251,"0fc":252,"0fd":253,"redscarf":254,"bluescarf":255,"pinkscarf":256,"greenscarf":257,"yellowscarf":258,"machbike":259,"coincase":260,"itemfinder":261,"oldrod":262,"goodrod":263,"superrod":264,"ssticket":265,"contestpass":266,"10b":267,"wailmerpail":268,"devongoods":269,"sootsack":270,"basementkey":271,"acrobike":272,"pokeblockcase":273,"letter":274,"eonticket":275,"redorb":276,"blueorb":277,"scanner":278,"gogoggles":279,"meteorite":280,"room1key":281,"room2key":282,"room4key":283,"room6key":284,"storagekey":285,"rootfossil":286,"clawfossil":287,"devonscope":288,"tm01":289,"tm02":290,"tm03":291,"tm04":292,"tm05":293,"tm06":294,"tm07":295,"tm08":296,"tm09":297,"tm10":298,"tm11":299,"tm12":300,"tm13":301,"tm14":302,"tm15":303,"tm16":304,"tm17":305,"tm18":306,"tm19":307,"tm20":308,"tm21":309,"tm22":310,"tm23":311,"tm24":312,"tm25":313,"tm26":314,"tm27":315,"tm28":316,"tm29":317,"tm30":318,"tm31":319,"tm32":320,"tm33":321,"tm34":322,"tm35":323,"tm36":324,"tm37":325,"tm38":326,"tm39":327,"tm40":328,"tm41":329,"tm42":330,"tm43":331,"tm44":332,"tm45":333,"tm46":334,"tm47":335,"tm48":336,"tm49":337,"tm50":338,"hm01":339,"hm02":340,"hm03":341,"hm04":342,"hm05":343,"hm06":344,"hm07":345,"hm08":346,"15b":347,"15c":348,"oaksparcel":349,"pokeflute":350,"secretkey":351,"bikevoucher":352,"goldteeth":353,"oldamber":354,"cardkey":355,"liftkey":356,"helixfossil":357,"domefossil":358,"silphscope":359,"bicycle":360,"townmap":361,"vsseeker":362,"famechecker":363,"tmcase":364,"berrypouch":365,"teachytv":366,"tripass":367,"rainbowpass":368,"tea":369,"mysticticket":370,"auroraticket":371,"powderjar":372,"ruby":373,"sapphire":374,"magmaemblem":375,"oldseamap":376,"leek":225},"abilities":{"stench":1,"drizzle":2,"speedboost":3,"battlearmor":4,"sturdy":5,"damp":6,"limber":7,"sandveil":8,"static":9,"voltabsorb":10,"waterabsorb":11,"oblivious":12,"cloudnine":13,"compoundeyes":14,"insomnia":15,"colorchange":16,"immunity":17,"flashfire":18,"shielddust":19,"owntempo":20,"suctioncups":21,"intimidate":22,"shadowtag":23,"roughskin":24,"wonderguard":25,"levitate":26,"effectspore":27,"synchronize":28,"clearbody":29,"naturalcure":30,"lightningrod":31,"serenegrace":32,"swiftswim":33,"chlorophyll":34,"illuminate":35,"trace":36,"hugepower":37,"poisonpoint":38,"innerfocus":39,"magmaarmor":40,"waterveil":41,"magnetpull":42,"soundproof":43,"raindish":44,"sandstream":45,"pressure":46,"thickfat":47,"earlybird":48,"flamebody":49,"runaway":50,"keeneye":51,"hypercutter":52,"pickup":53,"truant":54,"hustle":55,"cutecharm":56,"plus":57,"minus":58,"forecast":59,"stickyhold":60,"shedskin":61,"guts":62,"marvelscale":63,"liquidooze":64,"overgrow":65,"blaze":66,"torrent":67,"swarm":68,"rockhead":69,"drought":70,"arenatrap":71,"vitalspirit":72,"whitesmoke":73,"purepower":74,"shellarmor":75,"cacophony":76,"airlock":77},"natures":{"hardy":{"id":0,"plus":-1,"minus":-1},"lonely":{"id":1,"plus":0,"minus":1},"brave":{"id":2,"plus":0,"minus":2},"adamant":{"id":3,"plus":0,"minus":3},"naughty":{"id":4,"plus":0,"minus":4},"bold":{"id":5,"plus":1,"minus":0},"docile":{"id":6,"plus":-1,"minus":-1},"relaxed":{"id":7,"plus":1,"minus":2},"impish":{"id":8,"plus":1,"minus":3},"lax":{"id":9,"plus":1,"minus":4},"timid":{"id":10,"plus":2,"minus":0},"hasty":{"id":11,"plus":2,"minus":1},"serious":{"id":12,"plus":-1,"minus":-1},"jolly":{"id":13,"plus":2,"minus":3},"naive":{"id":14,"plus":2,"minus":4},"modest":{"id":15,"plus":3,"minus":0},"mild":{"id":16,"plus":3,"minus":1},"quiet":{"id":17,"plus":3,"minus":2},"bashful":{"id":18,"plus":-1,"minus":-1},"rash":{"id":19,"plus":3,"minus":4},"calm":{"id":20,"plus":4,"minus":0},"gentle":{"id":21,"plus":4,"minus":1},"sassy":{"id":22,"plus":4,"minus":2},"careful":{"id":23,"plus":4,"minus":3},"quirky":{"id":24,"plus":-1,"minus":-1}},"expTables":{"MEDIUM_FAST":{"max":1000000,"cumulative":[0,1,8,27,64,125,216,343,512,729,1000,1331,1728,2197,2744,3375,4096,4913,5832,6859,8000,9261,10648,12167,13824,15625,17576,19683,21952,24389,27000,29791,32768,35937,39304,42875,46656,50653,54872,59319,64000,68921,74088,79507,85184,91125,97336,103823,110592,117649,125000,132651,140608,148877,157464,166375,175616,185193,195112,205379,216000,226981,238328,250047,262144,274625,287496,300763,314432,328509,343000,357911,373248,389017,405224,421875,438976,456533,474552,493039,512000,531441,551368,571787,592704,614125,636056,658503,681472,704969,729000,753571,778688,804357,830584,857375,884736,912673,941192,970299,1000000]},"ERRATIC":{"max":600000,"cumulative":[0,1,15,52,122,237,406,637,942,1326,1800,2369,3041,3822,4719,5737,6881,8155,9564,11111,12800,14632,16610,18737,21012,23437,26012,28737,31610,34632,37800,41111,44564,48155,51881,55737,59719,63822,68041,72369,76800,81326,85942,90637,95406,100237,105122,110052,115015,120001,125000,131324,137795,144410,151165,158056,165079,172229,179503,186894,194400,202013,209728,217540,225443,233431,241496,249633,257834,267406,276458,286328,296358,305767,316074,326531,336255,346965,357812,367807,378880,390077,400293,411686,423190,433572,445239,457001,467489,479378,491346,501878,513934,526049,536557,548720,560922,571333,583539,591882,600000]},"FLUCTUATING":{"max":1640000,"cumulative":[0,1,4,13,32,65,112,178,276,393,540,745,967,1230,1591,1957,2457,3046,3732,4526,5440,6482,7666,9003,10506,12187,14060,16140,18439,20974,23760,26811,30146,33780,37731,42017,46656,50653,55969,60505,66560,71677,78533,84277,91998,98415,107069,114205,123863,131766,142500,151222,163105,172697,185807,196322,210739,222231,238036,250562,267840,281456,300293,315059,335544,351520,373744,390991,415050,433631,459620,479600,507617,529063,559209,582187,614566,639146,673863,700115,737280,765275,804997,834809,877201,908905,954084,987754,1035837,1071552,1122660,1160499,1214753,1254796,1312322,1354652,1415577,1460276,1524731,1571884,1640000]},"MEDIUM_SLOW":{"max":1059860,"cumulative":[0,1,9,57,96,135,179,236,314,419,560,742,973,1261,1612,2035,2535,3120,3798,4575,5460,6458,7577,8825,10208,11735,13411,15244,17242,19411,21760,24294,27021,29949,33084,36435,40007,43808,47846,52127,56660,61450,66505,71833,77440,83335,89523,96012,102810,109923,117360,125126,133229,141677,150476,159635,169159,179056,189334,199999,211060,222522,234393,246681,259392,272535,286115,300140,314618,329555,344960,360838,377197,394045,411388,429235,447591,466464,485862,505791,526260,547274,568841,590969,613664,636935,660787,685228,710266,735907,762160,789030,816525,844653,873420,902835,932903,963632,995030,1027103,1059860]},"FAST":{"max":800000,"cumulative":[0,1,6,21,51,100,172,274,409,583,800,1064,1382,1757,2195,2700,3276,3930,4665,5487,6400,7408,8518,9733,11059,12500,14060,15746,17561,19511,21600,23832,26214,28749,31443,34300,37324,40522,43897,47455,51200,55136,59270,63605,68147,72900,77868,83058,88473,94119,100000,106120,112486,119101,125971,133100,140492,148154,156089,164303,172800,181584,190662,200037,209715,219700,229996,240610,251545,262807,274400,286328,298598,311213,324179,337500,351180,365226,379641,394431,409600,425152,441094,457429,474163,491300,508844,526802,545177,563975,583200,602856,622950,643485,664467,685900,707788,730138,752953,776239,800000]},"SLOW":{"max":1250000,"cumulative":[0,1,10,33,80,156,270,428,640,911,1250,1663,2160,2746,3430,4218,5120,6141,7290,8573,10000,11576,13310,15208,17280,19531,21970,24603,27440,30486,33750,37238,40960,44921,49130,53593,58320,63316,68590,74148,80000,86151,92610,99383,106480,113906,121670,129778,138240,147061,156250,165813,175760,186096,196830,207968,219520,231491,243890,256723,270000,283726,297910,312558,327680,343281,359370,375953,393040,410636,428750,447388,466560,486271,506530,527343,548720,570666,593190,616298,640000,664301,689210,714733,740880,767656,795070,823128,851840,881211,911250,941963,973360,1005446,1038230,1071718,1105920,1140841,1176490,1212873,1250000]}},"charset":{" ":0,"&":45,"+":46,"=":53,";":54,"%":91,"(":92,")":93,"<":133,">":134,"0":161,"1":162,"2":163,"3":164,"4":165,"5":166,"6":167,"7":168,"8":169,"9":170,"!":171,"?":172,".":173,"-":174,"'":180,",":184,"/":186,"A":187,"B":188,"C":189,"D":190,"E":191,"F":192,"G":193,"H":194,"I":195,"J":196,"K":197,"L":198,"M":199,"N":200,"O":201,"P":202,"Q":203,"R":204,"S":205,"T":206,"U":207,"V":208,"W":209,"X":210,"Y":211,"Z":212,"a":213,"b":214,"c":215,"d":216,"e":217,"f":218,"g":219,"h":220,"i":221,"j":222,"k":223,"l":224,"m":225,"n":226,"o":227,"p":228,"q":229,"r":230,"s":231,"t":232,"u":233,"v":234,"w":235,"x":236,"y":237,"z":238,":":240,"$":255,"\"":178},"typeNames":{"0":"NORMAL","1":"FIGHTING","2":"FLYING","3":"POISON","4":"GROUND","5":"ROCK","6":"BUG","7":"GHOST","8":"STEEL","9":"MYSTERY","10":"FIRE","11":"WATER","12":"GRASS","13":"ELECTRIC","14":"PSYCHIC","15":"ICE","16":"DRAGON","17":"DARK"}}
+\ No newline at end of file
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index d343d4b151..99cd8cd49c 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -593,6 +593,12 @@
+     <ClInclude Include="UICommon\ResourcePack\Manifest.h" />
+     <ClInclude Include="UICommon\ResourcePack\ResourcePack.h" />
+     <ClInclude Include="UICommon\UICommon.h" />
++    <ClInclude Include="UICommon\XDNetplay\Gen3Data.h" />
++    <ClInclude Include="UICommon\XDNetplay\Gen3Mon.h" />
++    <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
++    <ClInclude Include="UICommon\XDNetplay\Gen3Text.h" />
++    <ClInclude Include="UICommon\XDNetplay\MonFactory.h" />
++    <ClInclude Include="UICommon\XDNetplay\ShowdownParser.h" />
+     <ClInclude Include="UpdaterCommon\UI.h" />
+     <ClInclude Include="UpdaterCommon\UpdaterCommon.h" />
+     <ClInclude Include="VideoBackends\D3D\D3DBase.h" />
+@@ -1294,6 +1300,12 @@
+     <ClCompile Include="UICommon\ResourcePack\Manifest.cpp" />
+     <ClCompile Include="UICommon\ResourcePack\ResourcePack.cpp" />
+     <ClCompile Include="UICommon\UICommon.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\Gen3Data.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\Gen3Mon.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\Gen3Text.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\MonFactory.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\ShowdownParser.cpp" />
+     <ClCompile Include="UpdaterCommon\UpdaterCommon.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBase.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBoundingBox.cpp" />
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index e141eab6f9..45eaae9227 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -19,6 +19,18 @@ add_library(uicommon
+   ResourcePack/ResourcePack.h
+   UICommon.cpp
+   UICommon.h
++  XDNetplay/Gen3Data.cpp
++  XDNetplay/Gen3Data.h
++  XDNetplay/Gen3Mon.cpp
++  XDNetplay/Gen3Mon.h
++  XDNetplay/Gen3Save.cpp
++  XDNetplay/Gen3Save.h
++  XDNetplay/Gen3Text.cpp
++  XDNetplay/Gen3Text.h
++  XDNetplay/MonFactory.cpp
++  XDNetplay/MonFactory.h
++  XDNetplay/ShowdownParser.cpp
++  XDNetplay/ShowdownParser.h
+ )
+ 
+ target_link_libraries(uicommon
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Data.cpp b/Source/Core/UICommon/XDNetplay/Gen3Data.cpp
+new file mode 100644
+index 0000000000..156de0beb1
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Data.cpp
+@@ -0,0 +1,243 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/Gen3Data.h"
++
++#include <cctype>
++
++#include <picojson.h>
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++#include "Common/FileUtil.h"
++#endif
++
++namespace XDNetplay
++{
++namespace
++{
++int JsonInt(const picojson::value& v)
++{
++  return v.is<double>() ? static_cast<int>(v.get<double>()) : 0;
++}
++
++std::vector<int> JsonIntVector(const picojson::value& v)
++{
++  std::vector<int> out;
++  if (!v.is<picojson::array>())
++    return out;
++  for (const picojson::value& element : v.get<picojson::array>())
++    out.push_back(JsonInt(element));
++  return out;
++}
++
++template <size_t N>
++std::array<int, N> JsonIntArray(const picojson::value& v)
++{
++  std::array<int, N> out{};
++  const std::vector<int> values = JsonIntVector(v);
++  for (size_t i = 0; i < N && i < values.size(); i++)
++    out[i] = values[i];
++  return out;
++}
++
++std::map<std::string, int> JsonIdMap(const picojson::value& v)
++{
++  std::map<std::string, int> out;
++  if (!v.is<picojson::object>())
++    return out;
++  for (const auto& [key, value] : v.get<picojson::object>())
++    out[Gen3Data::NormalizeName(key)] = JsonInt(value);
++  return out;
++}
++}  // namespace
++
++std::string Gen3Data::NormalizeName(const std::string& name)
++{
++  std::string out;
++  out.reserve(name.size());
++  for (const char c : name)
++  {
++    const char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
++    if ((lower >= 'a' && lower <= 'z') || (lower >= '0' && lower <= '9'))
++      out.push_back(lower);
++  }
++  return out;
++}
++
++std::optional<Gen3Data> Gen3Data::FromJson(const std::string& text, std::string* error)
++{
++  picojson::value root;
++  const std::string parse_error = picojson::parse(root, text);
++  if (!parse_error.empty() || !root.is<picojson::object>())
++  {
++    if (error)
++      *error = "gen3data.json malformed: " + parse_error;
++    return std::nullopt;
++  }
++
++  const auto member = [&root](const char* name) -> const picojson::value& {
++    static const picojson::value null_value;
++    const auto& obj = root.get<picojson::object>();
++    const auto it = obj.find(name);
++    return it != obj.end() ? it->second : null_value;
++  };
++
++  Gen3Data data;
++
++  const picojson::value& species_value = member("species");
++  if (!species_value.is<picojson::object>())
++  {
++    if (error)
++      *error = "gen3data.json has no species object";
++    return std::nullopt;
++  }
++  for (const auto& [key, value] : species_value.get<picojson::object>())
++  {
++    if (!value.is<picojson::object>())
++      continue;
++    const picojson::object& s = value.get<picojson::object>();
++    const auto field = [&s](const char* name) -> const picojson::value& {
++      static const picojson::value null_value;
++      const auto it = s.find(name);
++      return it != s.end() ? it->second : null_value;
++    };
++    Species species;
++    species.name = NormalizeName(key);
++    species.id = JsonInt(field("id"));
++    species.nat_dex = JsonInt(field("natDex"));
++    species.base_stats = JsonIntArray<6>(field("baseStats"));
++    species.abilities = JsonIntArray<2>(field("abilities"));
++    species.gender_ratio = JsonInt(field("genderRatio"));
++    if (field("expGroup").is<std::string>())
++      species.exp_group = field("expGroup").get<std::string>();
++    species.types = JsonIntVector(field("types"));
++    data.m_species[species.name] = std::move(species);
++  }
++
++  const picojson::value& exp_value = member("expTables");
++  if (exp_value.is<picojson::object>())
++  {
++    for (const auto& [key, value] : exp_value.get<picojson::object>())
++    {
++      // Actual generated shape: { "max": n, "cumulative": [101] }. Also
++      // accept a bare [101] array (the originally stated schema).
++      if (value.is<picojson::object>())
++      {
++        const auto& obj = value.get<picojson::object>();
++        const auto it = obj.find("cumulative");
++        if (it != obj.end())
++          data.m_exp_tables[key] = JsonIntVector(it->second);
++      }
++      else if (value.is<picojson::array>())
++      {
++        data.m_exp_tables[key] = JsonIntVector(value);
++      }
++    }
++  }
++
++  const picojson::value& natures_value = member("natures");
++  if (natures_value.is<picojson::object>())
++  {
++    for (const auto& [key, value] : natures_value.get<picojson::object>())
++    {
++      if (!value.is<picojson::object>())
++        continue;
++      const picojson::object& n = value.get<picojson::object>();
++      Nature nature;
++      nature.name = NormalizeName(key);
++      const auto get = [&n](const char* name, int fallback) {
++        const auto it = n.find(name);
++        return it != n.end() ? JsonInt(it->second) : fallback;
++      };
++      nature.id = get("id", 0);
++      nature.plus = get("plus", -1);
++      nature.minus = get("minus", -1);
++      data.m_natures[nature.name] = std::move(nature);
++    }
++  }
++
++  const picojson::value& charset_value = member("charset");
++  if (charset_value.is<picojson::object>())
++  {
++    for (const auto& [key, value] : charset_value.get<picojson::object>())
++      data.m_charset[key] = JsonInt(value);
++  }
++
++  const picojson::value& type_names_value = member("typeNames");
++  if (type_names_value.is<picojson::object>())
++  {
++    for (const auto& [key, value] : type_names_value.get<picojson::object>())
++    {
++      if (value.is<std::string>())
++        data.m_type_names[std::atoi(key.c_str())] = value.get<std::string>();
++    }
++  }
++
++  data.m_moves = JsonIdMap(member("moves"));
++  data.m_items = JsonIdMap(member("items"));
++  data.m_abilities = JsonIdMap(member("abilities"));
++  return data;
++}
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++std::optional<Gen3Data> Gen3Data::LoadBundled(std::string* error)
++{
++  const std::string path = File::GetSysDirectory() + "XDNetplay/gen3data.json";
++  std::string text;
++  if (!File::ReadFileToString(path, text))
++  {
++    if (error)
++      *error = "could not read " + path;
++    return std::nullopt;
++  }
++  return FromJson(text, error);
++}
++#endif
++
++const Gen3Data::Species* Gen3Data::FindSpecies(const std::string& name) const
++{
++  const auto it = m_species.find(NormalizeName(name));
++  return it != m_species.end() ? &it->second : nullptr;
++}
++
++std::optional<int> Gen3Data::MoveId(const std::string& name) const
++{
++  const auto it = m_moves.find(NormalizeName(name));
++  if (it == m_moves.end())
++    return std::nullopt;
++  return it->second;
++}
++
++std::optional<int> Gen3Data::ItemId(const std::string& name) const
++{
++  const auto it = m_items.find(NormalizeName(name));
++  if (it == m_items.end())
++    return std::nullopt;
++  return it->second;
++}
++
++std::optional<int> Gen3Data::AbilityId(const std::string& name) const
++{
++  const auto it = m_abilities.find(NormalizeName(name));
++  if (it == m_abilities.end())
++    return std::nullopt;
++  return it->second;
++}
++
++const Gen3Data::Nature* Gen3Data::FindNature(const std::string& name) const
++{
++  const auto it = m_natures.find(NormalizeName(name));
++  return it != m_natures.end() ? &it->second : nullptr;
++}
++
++std::optional<int> Gen3Data::ExpForLevel(const std::string& exp_group, int level) const
++{
++  const auto it = m_exp_tables.find(exp_group);
++  if (it == m_exp_tables.end() || level < 1 || level > 100 ||
++      static_cast<size_t>(level) >= it->second.size())
++  {
++    return std::nullopt;
++  }
++  return it->second[level];
++}
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Data.h b/Source/Core/UICommon/XDNetplay/Gen3Data.h
+new file mode 100644
+index 0000000000..25bf6dd2bb
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Data.h
+@@ -0,0 +1,100 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <map>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++namespace XDNetplay
++{
++// Static Gen 3 (Emerald) game data loaded from the bundled
++// Sys/XDNetplay/gen3data.json (the same file the Android build ships as an
++// asset). Ported 1:1 from the Android Kotlin port (Gen3Data.kt).
++//
++// Schema (verified against the generated file):
++//   species:   { name: { id, natDex, baseStats [hp,atk,def,speed,spatk,spdef],
++//                        abilities [a1,a2], genderRatio, expGroup, types } }
++//   moves:     { name: id }
++//   items:     { name: id }
++//   abilities: { name: id }
++//   natures:   { name: { id, plus, minus } }   plus/minus: -1 = neutral,
++//              else stat index 0=atk 1=def 2=speed 3=spatk 4=spdef
++//   expTables: { group: { max, cumulative [101] } }  cumulative indexed by
++//              level (a plain 101-element array is also accepted)
++//   charset:   { char: byte }  (pokeemerald charmap; '$' maps to 0xFF because
++//              '$' is the EOS marker in pokeemerald source strings — use
++//              Gen3Text for actual name encoding)
++//   typeNames: { typeId: name }  (optional)
++//
++// All name keys are normalized: lowercase with non-alphanumerics stripped.
++// The lookup helpers apply the same normalization to their inputs.
++class Gen3Data
++{
++public:
++  struct Species
++  {
++    std::string name;
++    int id = 0;       // internal (Hoenn) species id used in save data
++    int nat_dex = 0;  // National Dex number
++    std::array<int, 6> base_stats{};  // hp, atk, def, speed, spatk, spdef
++    std::array<int, 2> abilities{};   // slot 1, slot 2 (0 = none)
++    int gender_ratio = 0;  // 0 = always male, 254 = always female, 255 =
++                           // genderless, else female iff (PID & 0xFF) < ratio
++    std::string exp_group;
++    std::vector<int> types;
++  };
++
++  struct Nature
++  {
++    std::string name;
++    int id = 0;
++    int plus = -1;  // -1 = neutral, else 0=atk 1=def 2=speed 3=spatk 4=spdef
++    int minus = -1;
++  };
++
++  // Normalize a display name to a lookup key: lowercase, ASCII letters and
++  // digits only ("Mr. Mime" -> "mrmime", "Nidoran-F" -> "nidoranf").
++  static std::string NormalizeName(const std::string& name);
++
++  // Parse the JSON text. Returns std::nullopt (with *error) on malformed
++  // input or a missing top-level object.
++  static std::optional<Gen3Data> FromJson(const std::string& text, std::string* error = nullptr);
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++  // Load the bundled Sys/XDNetplay/gen3data.json.
++  static std::optional<Gen3Data> LoadBundled(std::string* error = nullptr);
++#endif
++
++  // -- lookup helpers (input names are normalized) ---------------------------
++
++  const Species* FindSpecies(const std::string& name) const;
++  std::optional<int> MoveId(const std::string& name) const;
++  std::optional<int> ItemId(const std::string& name) const;
++  std::optional<int> AbilityId(const std::string& name) const;
++  const Nature* FindNature(const std::string& name) const;
++
++  // Total experience at level (1..100) for growth group exp_group (e.g.
++  // "MEDIUM_SLOW"), from the cumulative table. std::nullopt for an unknown
++  // group or out-of-range level.
++  std::optional<int> ExpForLevel(const std::string& exp_group, int level) const;
++
++  const std::map<std::string, Species>& GetSpecies() const { return m_species; }
++  const std::map<int, std::string>& GetTypeNames() const { return m_type_names; }
++
++private:
++  std::map<std::string, Species> m_species;
++  std::map<std::string, int> m_moves;
++  std::map<std::string, int> m_items;
++  std::map<std::string, int> m_abilities;
++  std::map<std::string, Nature> m_natures;
++  std::map<std::string, std::vector<int>> m_exp_tables;
++  std::map<std::string, int> m_charset;  // key: single-codepoint UTF-8 string
++  std::map<int, std::string> m_type_names;
++};
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Mon.cpp b/Source/Core/UICommon/XDNetplay/Gen3Mon.cpp
+new file mode 100644
+index 0000000000..371c126f4b
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Mon.cpp
+@@ -0,0 +1,262 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/Gen3Mon.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstring>
++
++#include "UICommon/XDNetplay/Gen3Text.h"
++
++namespace XDNetplay
++{
++namespace
++{
++using namespace Gen3Bytes;
++
++// XOR each little-endian u32 of the 48-byte block with key (symmetric).
++void XorBlockInPlace(u8* block48, u32 key)
++{
++  for (size_t i = 0; i < 48; i += 4)
++    WriteU32(block48, i, ReadU32(block48, i) ^ key);
++}
++
++// u16 sum of the decrypted 48-byte block taken as 24 u16 words.
++u32 DataChecksum(const u8* decrypted48)
++{
++  u32 total = 0;
++  for (size_t i = 0; i < 48; i += 2)
++    total = (total + ReadU16(decrypted48, i)) & 0xFFFF;
++  return total;
++}
++}  // namespace
++
++const std::array<const char*, 24> Gen3Mon::SUBSTRUCT_ORDER = {
++    "GAEM", "GAME", "GEAM", "GEMA", "GMAE", "GMEA", "AGEM", "AGME", "AEGM", "AEMG", "AMGE", "AMEG",
++    "EGAM", "EGMA", "EAGM", "EAMG", "EMGA", "EMAG", "MGAE", "MGEA", "MAGE", "MAEG", "MEGA", "MEAG",
++};
++
++const std::array<const char*, 25> Gen3Mon::NATURES = {
++    "Hardy",  "Lonely", "Brave",   "Adamant", "Naughty", "Bold",   "Docile",  "Relaxed", "Impish",
++    "Lax",    "Timid",  "Hasty",   "Serious", "Jolly",   "Naive",  "Modest",  "Mild",    "Quiet",
++    "Bashful", "Rash",  "Calm",    "Gentle",  "Sassy",   "Careful", "Quirky",
++};
++
++std::string Gen3Mon::GetNickname() const
++{
++  return Gen3Text::Decode(nickname_raw.data(), nickname_raw.size());
++}
++
++std::string Gen3Mon::GetOtName() const
++{
++  return Gen3Text::Decode(ot_name_raw.data(), ot_name_raw.size());
++}
++
++const char* Gen3Mon::GetNatureName() const
++{
++  return NATURES[GetNature()];
++}
++
++std::array<u32, 6> Gen3Mon::GetIvs() const
++{
++  std::array<u32, 6> out{};
++  for (size_t i = 0; i < 6; i++)
++    out[i] = (iv_egg_ability >> (5 * i)) & 0x1F;
++  return out;
++}
++
++void Gen3Mon::SetIvs(const std::array<u32, 6>& ivs)
++{
++  u32 v = iv_egg_ability & ~u32{0x3FFFFFFF};
++  for (size_t i = 0; i < 6; i++)
++    v |= (ivs[i] & 0x1F) << (5 * i);
++  iv_egg_ability = v;
++}
++
++void Gen3Mon::SetAbilitySlot(u32 slot)
++{
++  iv_egg_ability = (iv_egg_ability & 0x7FFFFFFF) | ((slot & 1) << 31);
++}
++
++std::array<u8, Gen3Mon::SIZE> Gen3Mon::Encode() const
++{
++  std::array<u8, SIZE> buf{};
++  WriteU32(buf.data(), 0x00, pid);
++  WriteU32(buf.data(), 0x04, ot_id);
++  std::memcpy(buf.data() + 0x08, nickname_raw.data(), nickname_raw.size());
++  WriteU16(buf.data(), 0x12, language);
++  std::memcpy(buf.data() + 0x14, ot_name_raw.data(), ot_name_raw.size());
++  WriteU8(buf.data(), 0x1B, markings);
++  WriteU16(buf.data(), 0x1E, unknown_1e);
++
++  u8 g[12]{};
++  WriteU16(g, 0, species);
++  WriteU16(g, 2, held_item);
++  WriteU32(g, 4, experience);
++  WriteU8(g, 8, pp_bonuses);
++  WriteU8(g, 9, friendship);
++  WriteU16(g, 10, growth_unknown);
++
++  u8 a[12]{};
++  for (size_t i = 0; i < 4; i++)
++  {
++    WriteU16(a, 2 * i, moves[i]);
++    WriteU8(a, 8 + i, pp[i]);
++  }
++
++  u8 e[12]{};
++  for (size_t i = 0; i < 6; i++)
++  {
++    WriteU8(e, i, evs[i]);
++    WriteU8(e, 6 + i, contest[i]);
++  }
++
++  u8 m[12]{};
++  WriteU8(m, 0, pokerus);
++  WriteU8(m, 1, met_location);
++  WriteU16(m, 2, origins);
++  WriteU32(m, 4, iv_egg_ability);
++  WriteU32(m, 8, ribbons);
++
++  const char* order = SUBSTRUCT_ORDER[pid % 24];
++  u8 decrypted[48]{};
++  for (size_t slot = 0; slot < 4; slot++)
++  {
++    const u8* sub = nullptr;
++    switch (order[slot])
++    {
++    case 'G':
++      sub = g;
++      break;
++    case 'A':
++      sub = a;
++      break;
++    case 'E':
++      sub = e;
++      break;
++    default:
++      sub = m;
++      break;
++    }
++    std::memcpy(decrypted + slot * 12, sub, 12);
++  }
++
++  WriteU16(buf.data(), 0x1C, DataChecksum(decrypted));
++  XorBlockInPlace(decrypted, pid ^ ot_id);
++  std::memcpy(buf.data() + 0x20, decrypted, 48);
++
++  WriteU32(buf.data(), 0x50, status);
++  WriteU8(buf.data(), 0x54, level);
++  WriteU8(buf.data(), 0x55, pokerus_days);
++  WriteU16(buf.data(), 0x56, current_hp);
++  WriteU16(buf.data(), 0x58, max_hp);
++  WriteU16(buf.data(), 0x5A, attack);
++  WriteU16(buf.data(), 0x5C, defense);
++  WriteU16(buf.data(), 0x5E, speed);
++  WriteU16(buf.data(), 0x60, sp_attack);
++  WriteU16(buf.data(), 0x62, sp_defense);
++  return buf;
++}
++
++bool Gen3Mon::IsEmptySlotBytes(const u8* buf)
++{
++  return std::all_of(buf, buf + SIZE, [](u8 b) { return b == 0; });
++}
++
++std::optional<Gen3Mon> Gen3Mon::FromBytes(const u8* buf, std::string* error)
++{
++  Gen3Mon mon;
++  mon.pid = ReadU32(buf, 0x00);
++  mon.ot_id = ReadU32(buf, 0x04);
++  std::memcpy(mon.nickname_raw.data(), buf + 0x08, mon.nickname_raw.size());
++  mon.language = ReadU16(buf, 0x12);
++  std::memcpy(mon.ot_name_raw.data(), buf + 0x14, mon.ot_name_raw.size());
++  mon.markings = ReadU8(buf, 0x1B);
++  const u32 stored_checksum = ReadU16(buf, 0x1C);
++  mon.unknown_1e = ReadU16(buf, 0x1E);
++
++  u8 decrypted[48];
++  std::memcpy(decrypted, buf + 0x20, 48);
++  XorBlockInPlace(decrypted, mon.pid ^ mon.ot_id);
++
++  if (!IsEmptySlotBytes(buf))
++  {
++    const u32 calc = DataChecksum(decrypted);
++    if (calc != stored_checksum)
++    {
++      if (error)
++      {
++        char msg[80];
++        std::snprintf(msg, sizeof(msg),
++                      "substructure checksum mismatch: stored=0x%04X calc=0x%04X", stored_checksum,
++                      calc);
++        *error = msg;
++      }
++      return std::nullopt;
++    }
++  }
++
++  const char* order = SUBSTRUCT_ORDER[mon.pid % 24];
++  const u8* g = nullptr;
++  const u8* a = nullptr;
++  const u8* e = nullptr;
++  const u8* m = nullptr;
++  for (size_t slot = 0; slot < 4; slot++)
++  {
++    const u8* sub = decrypted + slot * 12;
++    switch (order[slot])
++    {
++    case 'G':
++      g = sub;
++      break;
++    case 'A':
++      a = sub;
++      break;
++    case 'E':
++      e = sub;
++      break;
++    default:
++      m = sub;
++      break;
++    }
++  }
++
++  mon.species = ReadU16(g, 0);
++  mon.held_item = ReadU16(g, 2);
++  mon.experience = ReadU32(g, 4);
++  mon.pp_bonuses = ReadU8(g, 8);
++  mon.friendship = ReadU8(g, 9);
++  mon.growth_unknown = ReadU16(g, 10);
++
++  for (size_t i = 0; i < 4; i++)
++  {
++    mon.moves[i] = ReadU16(a, 2 * i);
++    mon.pp[i] = ReadU8(a, 8 + i);
++  }
++
++  for (size_t i = 0; i < 6; i++)
++  {
++    mon.evs[i] = ReadU8(e, i);
++    mon.contest[i] = ReadU8(e, 6 + i);
++  }
++
++  mon.pokerus = ReadU8(m, 0);
++  mon.met_location = ReadU8(m, 1);
++  mon.origins = ReadU16(m, 2);
++  mon.iv_egg_ability = ReadU32(m, 4);
++  mon.ribbons = ReadU32(m, 8);
++
++  mon.status = ReadU32(buf, 0x50);
++  mon.level = ReadU8(buf, 0x54);
++  mon.pokerus_days = ReadU8(buf, 0x55);
++  mon.current_hp = ReadU16(buf, 0x56);
++  mon.max_hp = ReadU16(buf, 0x58);
++  mon.attack = ReadU16(buf, 0x5A);
++  mon.defense = ReadU16(buf, 0x5C);
++  mon.speed = ReadU16(buf, 0x5E);
++  mon.sp_attack = ReadU16(buf, 0x60);
++  mon.sp_defense = ReadU16(buf, 0x62);
++  return mon;
++}
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Mon.h b/Source/Core/UICommon/XDNetplay/Gen3Mon.h
+new file mode 100644
+index 0000000000..5599ebcdd3
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Mon.h
+@@ -0,0 +1,158 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <optional>
++#include <string>
++
++#include "Common/CommonTypes.h"
++
++namespace XDNetplay
++{
++// Little-endian byte helpers shared by the Gen 3 save/mon code. All reads
++// mask to the unsigned width; u32 values are raw bit patterns.
++namespace Gen3Bytes
++{
++inline u32 ReadU8(const u8* buf, size_t off)
++{
++  return buf[off];
++}
++
++inline u32 ReadU16(const u8* buf, size_t off)
++{
++  return static_cast<u32>(buf[off]) | (static_cast<u32>(buf[off + 1]) << 8);
++}
++
++inline u32 ReadU32(const u8* buf, size_t off)
++{
++  return static_cast<u32>(buf[off]) | (static_cast<u32>(buf[off + 1]) << 8) |
++         (static_cast<u32>(buf[off + 2]) << 16) | (static_cast<u32>(buf[off + 3]) << 24);
++}
++
++inline void WriteU8(u8* buf, size_t off, u32 value)
++{
++  buf[off] = static_cast<u8>(value & 0xFF);
++}
++
++inline void WriteU16(u8* buf, size_t off, u32 value)
++{
++  buf[off] = static_cast<u8>(value & 0xFF);
++  buf[off + 1] = static_cast<u8>((value >> 8) & 0xFF);
++}
++
++inline void WriteU32(u8* buf, size_t off, u32 value)
++{
++  buf[off] = static_cast<u8>(value & 0xFF);
++  buf[off + 1] = static_cast<u8>((value >> 8) & 0xFF);
++  buf[off + 2] = static_cast<u8>((value >> 16) & 0xFF);
++  buf[off + 3] = static_cast<u8>((value >> 24) & 0xFF);
++}
++}  // namespace Gen3Bytes
++
++// Fully decoded Gen 3 party Pokemon (100-byte struct).
++//
++// Ported 1:1 from the Android Kotlin port (Gen3Mon.kt) of the empirically
++// validated Python reference. FromBytes()/Encode() round-trip
++// byte-identically.
++//
++// Box portion (80 bytes):
++//   0x00 u32  personality (PID)
++//   0x04 u32  OT ID (low u16 public, high u16 secret)
++//   0x08 10B  nickname (Gen 3 charset)
++//   0x12 u16  language (0x0202 = English)
++//   0x14 7B   OT name
++//   0x1B u8   markings
++//   0x1C u16  checksum (u16-sum of DECRYPTED 48-byte data block)
++//   0x1E u16  unknown/padding (preserved verbatim)
++//   0x20 48B  encrypted data: four 12-byte substructures, order = PID % 24,
++//             each u32 XORed with key = PID ^ OTID
++// Party-only portion (20 bytes):
++//   0x50 u32 status, 0x54 u8 level, 0x55 u8 pokerus days, 0x56 u16 curHP,
++//   0x58 u16 maxHP, 0x5A atk, 0x5C def, 0x5E spe, 0x60 spa, 0x62 spd
++struct Gen3Mon
++{
++  // Size of a party Pokemon struct in bytes.
++  static constexpr size_t SIZE = 100;
++
++  // Box header
++  u32 pid = 0;
++  u32 ot_id = 0;
++  std::array<u8, 10> nickname_raw{};  // raw bytes (kept for exact round-trip)
++  u32 language = 0x0202;
++  std::array<u8, 7> ot_name_raw{};
++  u32 markings = 0;
++  u32 unknown_1e = 0;
++
++  // Growth substructure
++  u32 species = 0;
++  u32 held_item = 0;
++  u32 experience = 0;
++  u32 pp_bonuses = 0;
++  u32 friendship = 0;
++  u32 growth_unknown = 0;
++
++  // Attacks substructure
++  std::array<u32, 4> moves{};
++  std::array<u32, 4> pp{};
++
++  // EVs substructure (+ contest stats)
++  std::array<u32, 6> evs{};      // hp, atk, def, speed, spatk, spdef
++  std::array<u32, 6> contest{};  // cool, beauty, cute, smart, tough, feel
++
++  // Misc substructure
++  u32 pokerus = 0;
++  u32 met_location = 0;
++  u32 origins = 0;         // bits: 0-6 level met, 7-10 game, 11-14 ball, 15 OT gender
++  u32 iv_egg_ability = 0;  // bits: 6x5-bit IVs, 30 is_egg, 31 ability slot
++  u32 ribbons = 0;
++
++  // Party-only portion
++  u32 status = 0;
++  u32 level = 0;
++  u32 pokerus_days = 0;
++  u32 current_hp = 0;
++  u32 max_hp = 0;
++  u32 attack = 0;
++  u32 defense = 0;
++  u32 speed = 0;
++  u32 sp_attack = 0;
++  u32 sp_defense = 0;
++
++  // -- derived accessors -----------------------------------------------------
++
++  std::string GetNickname() const;
++  std::string GetOtName() const;
++
++  // Nature index 0..24 = PID % 25.
++  u32 GetNature() const { return pid % 25; }
++  const char* GetNatureName() const;
++
++  // IVs as (hp, atk, def, speed, spatk, spdef), 5 bits each.
++  std::array<u32, 6> GetIvs() const;
++  void SetIvs(const std::array<u32, 6>& ivs);
++
++  u32 IsEgg() const { return (iv_egg_ability >> 30) & 1; }
++  u32 GetAbilitySlot() const { return (iv_egg_ability >> 31) & 1; }
++  void SetAbilitySlot(u32 slot);
++
++  bool IsEmpty() const { return pid == 0 && species == 0; }
++
++  // Rebuild the 100-byte struct from decoded fields (re-encrypts and
++  // recomputes the substructure checksum).
++  std::array<u8, SIZE> Encode() const;
++
++  // Substructure order by PID % 24. G=Growth A=Attacks E=EVs M=Misc.
++  static const std::array<const char*, 24> SUBSTRUCT_ORDER;
++  static const std::array<const char*, 25> NATURES;
++
++  // An unused party slot is all zeroes (PID 0, OTID 0, checksum 0).
++  static bool IsEmptySlotBytes(const u8* buf);
++
++  // Decode a 100-byte party struct at buf. Verifies the substructure checksum
++  // for non-empty slots; returns std::nullopt (with *error set, if given) on
++  // mismatch.
++  static std::optional<Gen3Mon> FromBytes(const u8* buf, std::string* error = nullptr);
++};
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+new file mode 100644
+index 0000000000..5d9d66dd72
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+@@ -0,0 +1,320 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/Gen3Save.h"
++
++#include <algorithm>
++#include <cstring>
++#include <utility>
++
++#include "UICommon/XDNetplay/Gen3Text.h"
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++#endif
++
++namespace XDNetplay
++{
++using namespace Gen3Bytes;
++
++const std::array<u32, EmeraldSave::SECTIONS_PER_BLOCK> EmeraldSave::EMERALD_SECTION_DATA_LENGTHS = {
++    3884,  // 0  Trainer info
++    3968,  // 1  Team / items
++    3968,  // 2  Game state
++    3968,  // 3  Misc data
++    3848,  // 4  Rival info
++    3968,  // 5  PC buffer A
++    3968,  // 6  PC buffer B
++    3968,  // 7  PC buffer C
++    3968,  // 8  PC buffer D
++    3968,  // 9  PC buffer E
++    3968,  // 10 PC buffer F
++    3968,  // 11 PC buffer G
++    3968,  // 12 PC buffer H
++    2000,  // 13 PC buffer I
++};
++
++u32 EmeraldSave::SectionChecksum(const u8* buf, size_t base, u32 data_length)
++{
++  u32 total = 0;
++  for (u32 i = 0; i < data_length; i += 4)
++    total += ReadU32(buf, base + i);
++  return ((total & 0xFFFF) + (total >> 16)) & 0xFFFF;
++}
++
++std::optional<EmeraldSave> EmeraldSave::Create(std::vector<u8> raw, std::string* error)
++{
++  if (raw.size() < 2 * BLOCK_SIZE)
++  {
++    if (error)
++      *error = "file too small for an Emerald save";
++    return std::nullopt;
++  }
++
++  EmeraldSave save;
++  save.m_raw = std::move(raw);
++  const std::optional<int> active = save.FindActiveBlock();
++  if (!active)
++  {
++    if (error)
++      *error = "no valid save block found";
++    return std::nullopt;
++  }
++  save.m_active_block = *active;
++  save.MapSections(save.m_active_block);
++  return save;
++}
++
++std::pair<s64, bool> EmeraldSave::BlockIndexAndValid(int block) const
++{
++  s64 idx = -1;
++  bool valid = true;
++  std::array<bool, SECTIONS_PER_BLOCK> seen{};
++  size_t seen_count = 0;
++  for (size_t slot = 0; slot < SECTIONS_PER_BLOCK; slot++)
++  {
++    const size_t off = block * BLOCK_SIZE + slot * SECTION_SIZE;
++    const u32 sid = ReadU16(m_raw.data(), off + SECTION_FOOTER_OFFSET);
++    const u32 sig = ReadU32(m_raw.data(), off + SECTION_FOOTER_OFFSET + 4);
++    const u32 sidx = ReadU32(m_raw.data(), off + SECTION_FOOTER_OFFSET + 8);
++    if (sig != SAVE_SIGNATURE || sid >= SECTIONS_PER_BLOCK)
++    {
++      valid = false;
++      continue;
++    }
++    if (!seen[sid])
++    {
++      seen[sid] = true;
++      seen_count++;
++    }
++    if (idx == -1)
++      idx = sidx;
++    else if (static_cast<s64>(sidx) != idx)
++      valid = false;
++  }
++  if (seen_count != SECTIONS_PER_BLOCK)
++    valid = false;
++  return {idx, valid};
++}
++
++std::optional<int> EmeraldSave::FindActiveBlock() const
++{
++  const auto [idx0, ok0] = BlockIndexAndValid(0);
++  const auto [idx1, ok1] = BlockIndexAndValid(1);
++  if (ok0 && ok1)
++    return idx1 > idx0 ? 1 : 0;
++  if (ok1)
++    return 1;
++  if (ok0)
++    return 0;
++  return std::nullopt;
++}
++
++void EmeraldSave::MapSections(int block)
++{
++  for (size_t slot = 0; slot < SECTIONS_PER_BLOCK; slot++)
++  {
++    const size_t off = block * BLOCK_SIZE + slot * SECTION_SIZE;
++    const u32 sid = ReadU16(m_raw.data(), off + SECTION_FOOTER_OFFSET);
++    if (sid < SECTIONS_PER_BLOCK)
++      m_section_offsets[sid] = off;
++  }
++}
++
++std::vector<u8> EmeraldSave::GetExtraBytes() const
++{
++  return std::vector<u8>(m_raw.begin() + 2 * BLOCK_SIZE, m_raw.end());
++}
++
++std::vector<u8> EmeraldSave::SectionBytes(size_t section_id) const
++{
++  const size_t off = m_section_offsets[section_id];
++  return std::vector<u8>(m_raw.begin() + off, m_raw.begin() + off + SECTION_SIZE);
++}
++
++std::vector<ChecksumMismatch> EmeraldSave::VerifyAllChecksums() const
++{
++  std::vector<ChecksumMismatch> bad;
++  for (int block = 0; block <= 1; block++)
++  {
++    for (size_t slot = 0; slot < SECTIONS_PER_BLOCK; slot++)
++    {
++      const size_t off = block * BLOCK_SIZE + slot * SECTION_SIZE;
++      const u32 sid = ReadU16(m_raw.data(), off + SECTION_FOOTER_OFFSET);
++      const u32 stored = ReadU16(m_raw.data(), off + SECTION_FOOTER_OFFSET + 2);
++      if (sid >= SECTIONS_PER_BLOCK)
++        continue;
++      const u32 calc = SectionChecksum(m_raw.data(), off, EMERALD_SECTION_DATA_LENGTHS[sid]);
++      if (calc != stored)
++      {
++        bad.push_back({block, static_cast<int>(slot), static_cast<int>(sid), stored, calc});
++      }
++    }
++  }
++  return bad;
++}
++
++void EmeraldSave::UpdateSectionChecksum(size_t section_id)
++{
++  const size_t off = m_section_offsets[section_id];
++  const u32 calc = SectionChecksum(m_raw.data(), off, EMERALD_SECTION_DATA_LENGTHS[section_id]);
++  WriteU16(m_raw.data(), off + SECTION_FOOTER_OFFSET + 2, calc);
++}
++
++std::string EmeraldSave::GetTrainerName() const
++{
++  return Gen3Text::Decode(m_raw.data() + m_section_offsets[0] + TRAINER_NAME_OFFSET,
++                          TRAINER_NAME_LEN);
++}
++
++u32 EmeraldSave::GetTrainerId() const
++{
++  return ReadU32(m_raw.data(), m_section_offsets[0] + TRAINER_ID_OFFSET);
++}
++
++u32 EmeraldSave::GetTrainerGender() const
++{
++  return ReadU8(m_raw.data(), m_section_offsets[0] + TRAINER_GENDER_OFFSET);
++}
++
++size_t EmeraldSave::GetPartyCount() const
++{
++  const u32 count = ReadU32(m_raw.data(), m_section_offsets[1] + PARTY_COUNT_OFFSET);
++  return std::min<size_t>(count, PARTY_MAX);
++}
++
++std::optional<std::vector<Gen3Mon>> EmeraldSave::ReadParty(std::string* error) const
++{
++  const size_t off = m_section_offsets[1];
++  std::vector<Gen3Mon> mons;
++  const size_t count = GetPartyCount();
++  for (size_t i = 0; i < count; i++)
++  {
++    auto mon = Gen3Mon::FromBytes(m_raw.data() + off + PARTY_DATA_OFFSET + i * Gen3Mon::SIZE, error);
++    if (!mon)
++      return std::nullopt;
++    mons.push_back(std::move(*mon));
++  }
++  return mons;
++}
++
++bool EmeraldSave::WriteParty(const std::vector<Gen3Mon>& mons)
++{
++  if (mons.size() > PARTY_MAX)
++    return false;
++  const size_t off = m_section_offsets[1];
++  WriteU32(m_raw.data(), off + PARTY_COUNT_OFFSET, static_cast<u32>(mons.size()));
++  for (size_t i = 0; i < PARTY_MAX; i++)
++  {
++    u8* slot = m_raw.data() + off + PARTY_DATA_OFFSET + i * Gen3Mon::SIZE;
++    if (i < mons.size())
++    {
++      const std::array<u8, Gen3Mon::SIZE> bytes = mons[i].Encode();
++      std::memcpy(slot, bytes.data(), bytes.size());
++    }
++    else
++    {
++      std::memset(slot, 0, Gen3Mon::SIZE);
++    }
++  }
++  UpdateSectionChecksum(1);
++  return true;
++}
++
++bool EmeraldSave::RewritePartyInPlace(std::string* error)
++{
++  const auto party = ReadParty(error);
++  if (!party)
++    return false;
++  return WriteParty(*party);
++}
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++std::optional<EmeraldSave> LoadSaveFile(const std::string& path, std::string* error)
++{
++  File::IOFile file(path, "rb");
++  if (!file)
++  {
++    if (error)
++      *error = "could not open save file: " + path;
++    return std::nullopt;
++  }
++  std::vector<u8> data(file.GetSize());
++  if (!file.ReadBytes(data.data(), data.size()))
++  {
++    if (error)
++      *error = "could not read save file: " + path;
++    return std::nullopt;
++  }
++  return EmeraldSave::Create(std::move(data), error);
++}
++
++bool VerifiedWriteSaveFile(const std::string& path, const EmeraldSave& save, std::string* error)
++{
++  const std::vector<u8>& bytes = save.ToBytes();
++
++  // Re-parse the edited image and verify it before touching the disk.
++  std::string parse_error;
++  const auto reparsed = EmeraldSave::Create(bytes, &parse_error);
++  if (!reparsed)
++  {
++    if (error)
++      *error = "edited save does not re-parse: " + parse_error;
++    return false;
++  }
++  if (!reparsed->VerifyAllChecksums().empty())
++  {
++    if (error)
++      *error = "edited save has checksum mismatches";
++    return false;
++  }
++  if (!reparsed->ReadParty(&parse_error))
++  {
++    if (error)
++      *error = "edited party does not decode: " + parse_error;
++    return false;
++  }
++
++  // Write to a tmp file and read it back byte-identical.
++  const std::string tmp_path = path + ".tmp";
++  {
++    File::IOFile tmp(tmp_path, "wb");
++    if (!tmp || !tmp.WriteBytes(bytes.data(), bytes.size()) || !tmp.Flush())
++    {
++      if (error)
++        *error = "could not write " + tmp_path;
++      return false;
++    }
++  }
++  {
++    File::IOFile tmp(tmp_path, "rb");
++    std::vector<u8> readback(bytes.size());
++    if (!tmp || tmp.GetSize() != bytes.size() ||
++        !tmp.ReadBytes(readback.data(), readback.size()) || readback != bytes)
++    {
++      if (error)
++        *error = "tmp readback mismatch for " + tmp_path;
++      File::Delete(tmp_path);
++      return false;
++    }
++  }
++
++  // Back up the existing save, then rename the verified tmp into place.
++  if (File::Exists(path) && !File::CopyRegularFile(path, path + ".bak"))
++  {
++    if (error)
++      *error = "could not back up " + path;
++    File::Delete(tmp_path);
++    return false;
++  }
++  if (!File::Rename(tmp_path, path))
++  {
++    if (error)
++      *error = "could not rename " + tmp_path + " into place";
++    return false;
++  }
++  return true;
++}
++#endif  // XDNETPLAY_STANDALONE_NO_FILE_IO
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.h b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+new file mode 100644
+index 0000000000..2190bba871
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+@@ -0,0 +1,144 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++#include "UICommon/XDNetplay/Gen3Mon.h"
++
++namespace XDNetplay
++{
++// One section whose stored footer checksum does not match the computed one.
++struct ChecksumMismatch
++{
++  int block = 0;
++  int slot = 0;
++  int section_id = 0;
++  u32 stored = 0;
++  u32 calculated = 0;
++};
++
++// Pokemon Emerald (Gen 3) save file: 131072 bytes of flash plus any trailing
++// bytes (e.g. the 16-byte mGBA RTC footer), which are preserved verbatim.
++//
++// Ported 1:1 from the Android Kotlin port (Gen3Save.kt) of the empirically
++// validated Python reference:
++//  - Flash holds two 57344-byte game-save blocks of 14 rotating 4096-byte
++//    sections each; the physical slot of logical section N shifts every save.
++//  - Section footer at +0x0FF4: u16 section id, u16 checksum,
++//    u32 signature (0x08012025), u32 save index (shared by the block).
++//  - Active block = the fully valid block with the higher save index.
++//  - Section checksum: sum of the section's data bytes as little-endian u32s
++//    over that section's data length, folded to u16 as
++//    ((sum & 0xFFFF) + (sum >> 16)) & 0xFFFF.
++class EmeraldSave
++{
++public:
++  static constexpr size_t SECTION_SIZE = 4096;
++  static constexpr size_t SECTION_FOOTER_OFFSET = 0x0FF4;
++  static constexpr size_t SECTIONS_PER_BLOCK = 14;
++  static constexpr size_t BLOCK_SIZE = SECTION_SIZE * SECTIONS_PER_BLOCK;  // 57344
++  static constexpr u32 SAVE_SIGNATURE = 0x08012025;
++
++  // Section 1 (Team/Items) offsets - Emerald.
++  static constexpr size_t PARTY_COUNT_OFFSET = 0x0234;  // u32
++  static constexpr size_t PARTY_DATA_OFFSET = 0x0238;   // 6 * 100 bytes
++  static constexpr size_t PARTY_MAX = 6;
++
++  // Section 0 (Trainer Info) offsets - Emerald.
++  static constexpr size_t TRAINER_NAME_OFFSET = 0x0000;  // 7 bytes + 0xFF
++  static constexpr size_t TRAINER_NAME_LEN = 7;
++  static constexpr size_t TRAINER_GENDER_OFFSET = 0x0008;
++  static constexpr size_t TRAINER_ID_OFFSET = 0x000A;  // u32: low public, high secret
++
++  // Per-section valid data length used by the checksum (Emerald). Index =
++  // logical section ID. Empirically confirmed: with these exact lengths every
++  // section checksum in the test saves matches.
++  static const std::array<u32, SECTIONS_PER_BLOCK> EMERALD_SECTION_DATA_LENGTHS;
++
++  // Parse a save image. Returns std::nullopt (with *error set, if given) when
++  // the file is too small or no fully valid block exists.
++  static std::optional<EmeraldSave> Create(std::vector<u8> raw, std::string* error = nullptr);
++
++  // Sum data_length bytes starting at base as little-endian u32s (mod 2^32),
++  // then fold to u16: ((sum & 0xFFFF) + (sum >> 16)) & 0xFFFF.
++  static u32 SectionChecksum(const u8* buf, size_t base, u32 data_length);
++
++  int GetActiveBlock() const { return m_active_block; }
++
++  // Bytes after the two game-save blocks (Hall of Fame area, emulator RTC
++  // footer, ...). Preserved verbatim; exposed for inspection only.
++  std::vector<u8> GetExtraBytes() const;
++
++  // The full file image (flash + any trailing bytes), reflecting all edits.
++  const std::vector<u8>& ToBytes() const { return m_raw; }
++
++  // Copy of the 4096-byte physical section holding logical section_id.
++  std::vector<u8> SectionBytes(size_t section_id) const;
++
++  // Check every section footer checksum in BOTH blocks. Returns the list of
++  // mismatches (empty when the file is fully consistent).
++  std::vector<ChecksumMismatch> VerifyAllChecksums() const;
++
++  void UpdateSectionChecksum(size_t section_id);
++
++  // -- trainer info (logical section 0) --------------------------------------
++
++  std::string GetTrainerName() const;
++  // Raw u32: low u16 = public (visible) trainer ID, high u16 = secret ID.
++  u32 GetTrainerId() const;
++  u32 GetTrainerPublicId() const { return GetTrainerId() & 0xFFFF; }
++  u32 GetTrainerSecretId() const { return (GetTrainerId() >> 16) & 0xFFFF; }
++  u32 GetTrainerGender() const;
++
++  // -- party (logical section 1) ---------------------------------------------
++
++  // Stored party count, clamped to 0..6 so a corrupt count cannot drive reads
++  // past the party area.
++  size_t GetPartyCount() const;
++
++  // Decode the party. Returns std::nullopt (with *error) if a non-empty slot
++  // fails its substructure checksum.
++  std::optional<std::vector<Gen3Mon>> ReadParty(std::string* error = nullptr) const;
++
++  // Serialize mons into section 1, zero unused slots, fix the count and the
++  // section checksum. Fails (false) if mons.size() > PARTY_MAX.
++  bool WriteParty(const std::vector<Gen3Mon>& mons);
++
++  // Re-encode the current party over itself (round-trip identity helper).
++  bool RewritePartyInPlace(std::string* error = nullptr);
++
++private:
++  EmeraldSave() = default;
++
++  // Returns (save index, all valid) for a block; the index is taken from any
++  // valid section (all 14 share it). Index is -1 if no section was valid.
++  std::pair<s64, bool> BlockIndexAndValid(int block) const;
++  std::optional<int> FindActiveBlock() const;
++  void MapSections(int block);
++
++  std::vector<u8> m_raw;
++  int m_active_block = 0;
++  std::array<size_t, SECTIONS_PER_BLOCK> m_section_offsets{};
++};
++
++#ifndef XDNETPLAY_STANDALONE_NO_FILE_IO
++// Verified-write discipline (mirrors the validated Android/Python injectors):
++// re-parse the edited image and check every checksum, write it to path.tmp,
++// read the tmp back and compare byte-identical, back up an existing file to
++// path.bak, then rename the tmp into place. Returns false with *error set on
++// any failure; the original file is never touched until the tmp has been
++// verified.
++bool VerifiedWriteSaveFile(const std::string& path, const EmeraldSave& save,
++                           std::string* error = nullptr);
++
++// Read + parse a save file from disk.
++std::optional<EmeraldSave> LoadSaveFile(const std::string& path, std::string* error = nullptr);
++#endif
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Text.cpp b/Source/Core/UICommon/XDNetplay/Gen3Text.cpp
+new file mode 100644
+index 0000000000..6eb44e3e2d
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Text.cpp
+@@ -0,0 +1,170 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/Gen3Text.h"
++
++#include <algorithm>
++#include <map>
++
++namespace XDNetplay::Gen3Text
++{
++namespace
++{
++struct Maps
++{
++  std::map<u8, char32_t> byte_to_char;
++  std::map<char32_t, u8> char_to_byte;
++
++  void Map(u8 b, char32_t c)
++  {
++    byte_to_char[b] = c;
++    char_to_byte[c] = b;
++  }
++
++  Maps()
++  {
++    Map(0x00, U' ');
++    // Digits 0-9: 0xA1..0xAA
++    for (int i = 0; i <= 9; i++)
++      Map(static_cast<u8>(0xA1 + i), U'0' + i);
++    Map(0xAB, U'!');
++    Map(0xAC, U'?');
++    Map(0xAD, U'.');
++    Map(0xAE, U'-');
++    Map(0xAF, U'・');  // KATAKANA MIDDLE DOT
++    Map(0xB0, U'…');  // HORIZONTAL ELLIPSIS
++    Map(0xB1, U'“');  // LEFT DOUBLE QUOTATION MARK
++    Map(0xB2, U'”');  // RIGHT DOUBLE QUOTATION MARK
++    Map(0xB3, U'‘');  // LEFT SINGLE QUOTATION MARK
++    Map(0xB4, U'’');  // RIGHT SINGLE QUOTATION MARK
++    Map(0xB5, U'♂');  // MALE SIGN
++    Map(0xB6, U'♀');  // FEMALE SIGN
++    Map(0xB7, U'$');
++    Map(0xB8, U',');
++    Map(0xB9, U'×');  // MULTIPLICATION SIGN
++    Map(0xBA, U'/');
++    // A-Z: 0xBB..0xD4, a-z: 0xD5..0xEE
++    for (int i = 0; i <= 25; i++)
++    {
++      Map(static_cast<u8>(0xBB + i), U'A' + i);
++      Map(static_cast<u8>(0xD5 + i), U'a' + i);
++    }
++  }
++};
++
++const Maps& GetMaps()
++{
++  static const Maps maps;
++  return maps;
++}
++}  // namespace
++
++std::u32string DecodeUtf8(const std::string& text)
++{
++  std::u32string out;
++  size_t i = 0;
++  const size_t n = text.size();
++  while (i < n)
++  {
++    const u8 b0 = static_cast<u8>(text[i]);
++    char32_t cp = U'?';
++    size_t len = 1;
++    if (b0 < 0x80)
++    {
++      cp = b0;
++    }
++    else if ((b0 & 0xE0) == 0xC0 && i + 1 < n)
++    {
++      cp = ((b0 & 0x1F) << 6) | (static_cast<u8>(text[i + 1]) & 0x3F);
++      len = 2;
++    }
++    else if ((b0 & 0xF0) == 0xE0 && i + 2 < n)
++    {
++      cp = ((b0 & 0x0F) << 12) | ((static_cast<u8>(text[i + 1]) & 0x3F) << 6) |
++           (static_cast<u8>(text[i + 2]) & 0x3F);
++      len = 3;
++    }
++    else if ((b0 & 0xF8) == 0xF0 && i + 3 < n)
++    {
++      cp = ((b0 & 0x07) << 18) | ((static_cast<u8>(text[i + 1]) & 0x3F) << 12) |
++           ((static_cast<u8>(text[i + 2]) & 0x3F) << 6) | (static_cast<u8>(text[i + 3]) & 0x3F);
++      len = 4;
++    }
++    out.push_back(cp);
++    i += len;
++  }
++  return out;
++}
++
++std::string EncodeUtf8(const std::u32string& text)
++{
++  std::string out;
++  for (const char32_t cp : text)
++  {
++    if (cp < 0x80)
++    {
++      out.push_back(static_cast<char>(cp));
++    }
++    else if (cp < 0x800)
++    {
++      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
++      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++    else if (cp < 0x10000)
++    {
++      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
++      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++    else
++    {
++      out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
++      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
++      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
++      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
++    }
++  }
++  return out;
++}
++
++bool CanEncode(char32_t c)
++{
++  return GetMaps().char_to_byte.count(c) != 0;
++}
++
++std::string Decode(const u8* buf, size_t max_len)
++{
++  const auto& maps = GetMaps();
++  std::u32string out;
++  for (size_t i = 0; i < max_len; i++)
++  {
++    const u8 b = buf[i];
++    if (b == TERMINATOR)
++      break;
++    const auto it = maps.byte_to_char.find(b);
++    out.push_back(it != maps.byte_to_char.end() ? it->second : U'?');
++  }
++  return EncodeUtf8(out);
++}
++
++std::optional<std::vector<u8>> Encode(const std::string& text, size_t max_len, std::string* error)
++{
++  const auto& maps = GetMaps();
++  std::vector<u8> out(max_len, TERMINATOR);
++  const std::u32string codepoints = DecodeUtf8(text);
++  const size_t n = std::min(codepoints.size(), max_len);
++  for (size_t i = 0; i < n; i++)
++  {
++    const auto it = maps.char_to_byte.find(codepoints[i]);
++    if (it == maps.char_to_byte.end())
++    {
++      if (error)
++        *error = "character '" + EncodeUtf8(std::u32string(1, codepoints[i])) +
++                 "' not encodable in Gen 3 charset";
++      return std::nullopt;
++    }
++    out[i] = it->second;
++  }
++  return out;
++}
++}  // namespace XDNetplay::Gen3Text
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Text.h b/Source/Core/UICommon/XDNetplay/Gen3Text.h
+new file mode 100644
+index 0000000000..b9fa8a0032
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Gen3Text.h
+@@ -0,0 +1,43 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++// Gen 3 western (International) character set encode/decode.
++//
++// Ported 1:1 from the Android Kotlin port (Gen3Text.kt) of the empirically
++// validated Python reference; all byte values were confirmed against real
++// Emerald saves. Strings are fixed-width, 0xFF-terminated; a string that
++// fills the whole field carries no terminator, exactly like the games.
++//
++// The public API uses UTF-8 std::strings (the charset contains non-ASCII
++// glyphs such as the gender symbols and curly quotes); the codepoint helpers
++// are exposed for callers that sanitize text before encoding.
++namespace XDNetplay::Gen3Text
++{
++constexpr u8 TERMINATOR = 0xFF;
++
++// True if the Unicode codepoint has a Gen 3 byte value in this charset.
++bool CanEncode(char32_t c);
++
++// Decode up to max_len bytes of Gen 3 text starting at buf. Unknown bytes
++// decode as '?', mirroring the reference implementations.
++std::string Decode(const u8* buf, size_t max_len);
++
++// Encode UTF-8 text to exactly max_len bytes, 0xFF-terminated/padded. Text
++// longer than max_len codepoints is truncated (as in the references).
++// Returns std::nullopt (with *error set, if given) if a codepoint cannot be
++// encoded.
++std::optional<std::vector<u8>> Encode(const std::string& text, size_t max_len,
++                                      std::string* error = nullptr);
++
++// Minimal UTF-8 <-> codepoint helpers shared with MonFactory's sanitizer.
++std::u32string DecodeUtf8(const std::string& text);
++std::string EncodeUtf8(const std::u32string& text);
++}  // namespace XDNetplay::Gen3Text
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.cpp b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+new file mode 100644
+index 0000000000..9295e5d820
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+@@ -0,0 +1,312 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/MonFactory.h"
++
++#include <algorithm>
++#include <array>
++#include <cctype>
++
++#include "UICommon/XDNetplay/Gen3Text.h"
++
++namespace XDNetplay::MonFactory
++{
++namespace
++{
++constexpr u32 LANGUAGE_ENGLISH = 0x0202;
++constexpr u32 DEFAULT_FRIENDSHIP = 70;
++constexpr u32 DEFAULT_PP = 35;  // mirrors the Python injector
++constexpr u32 GAME_EMERALD = 3;
++constexpr u32 BALL_POKE = 4;  // the Python injector's default ball
++constexpr u32 OT_GENDER_MALE = 0;
++constexpr u32 SHINY_THRESHOLD = 8;
++
++// Gender ratio sentinel values (never PID-dependent).
++constexpr int RATIO_ALWAYS_MALE = 0;
++constexpr int RATIO_ALWAYS_FEMALE = 254;
++constexpr int RATIO_GENDERLESS = 255;
++
++// Remap hp/atk/def/spa/spd/spe (Showdown order) to
++// hp/atk/def/speed/spatk/spdef (Gen 3 save order).
++std::array<int, 6> ShowdownToGen3Order(const std::array<int, 6>& sd)
++{
++  return {sd[0], sd[1], sd[2], sd[5], sd[3], sd[4]};
++}
++
++// Move name -> id. "Hidden Power [Ice]" / "Hidden Power Ice" resolve to plain
++// Hidden Power (Gen 3 stores no HP type; it derives from IVs).
++std::optional<int> ResolveMoveId(const std::string& name, const Gen3Data& data)
++{
++  if (const auto id = data.MoveId(name))
++    return id;
++  if (Gen3Data::NormalizeName(name).rfind("hiddenpower", 0) == 0)
++  {
++    if (const auto id = data.MoveId("hiddenpower"))
++      return id;
++  }
++  return std::nullopt;
++}
++
++// Make text Gen 3-encodable: straight ASCII quotes become the charset's curly
++// forms, anything else unencodable is dropped.
++std::string SanitizeText(const std::string& text)
++{
++  std::u32string out;
++  for (const char32_t c : Gen3Text::DecodeUtf8(text))
++  {
++    char32_t mapped = c;
++    if (c == U'\'')
++      mapped = U'’';
++    else if (c == U'"')
++      mapped = U'”';
++    if (Gen3Text::CanEncode(mapped))
++      out.push_back(mapped);
++  }
++  return Gen3Text::EncodeUtf8(out);
++}
++
++// Gen 3 stat formula, integer division exactly as the game:
++//   HP     = (2*base + IV + EV/4) * level / 100 + level + 10   (Shedinja: 1)
++//   others = ((2*base + IV + EV/4) * level / 100 + 5) * nature
++// where the nature multiplier is *110/100 or *90/100 (integer division), with
++// nature plus/minus indices 0=atk 1=def 2=speed 3=spatk 4=spdef. Arrays are
++// in Gen 3 order: hp, atk, def, speed, spatk, spdef.
++std::array<int, 6> ComputeStats(const Gen3Data::Species& species, int level,
++                                const std::array<int, 6>& ivs, const std::array<int, 6>& evs,
++                                const Gen3Data::Nature& nature)
++{
++  std::array<int, 6> out{};
++  if (species.name == "shedinja")
++  {
++    out[0] = 1;
++  }
++  else
++  {
++    out[0] = (2 * species.base_stats[0] + ivs[0] + evs[0] / 4) * level / 100 + level + 10;
++  }
++  for (int i = 1; i <= 5; i++)
++  {
++    int v = (2 * species.base_stats[i] + ivs[i] + evs[i] / 4) * level / 100 + 5;
++    const int stat_index = i - 1;  // nature indices skip HP
++    if (nature.plus == stat_index && nature.minus != stat_index)
++      v = v * 110 / 100;
++    else if (nature.minus == stat_index && nature.plus != stat_index)
++      v = v * 90 / 100;
++    out[i] = v;
++  }
++  return out;
++}
++
++bool IsShinyPid(u32 pid, u32 trainer_id)
++{
++  const u32 tid = trainer_id & 0xFFFF;
++  const u32 sid = (trainer_id >> 16) & 0xFFFF;
++  const u32 pid_low = pid & 0xFFFF;
++  const u32 pid_high = (pid >> 16) & 0xFFFF;
++  return (tid ^ sid ^ pid_high ^ pid_low) < SHINY_THRESHOLD;
++}
++
++bool GenderOk(u32 pid_low_byte, int gender_ratio, char wanted_gender)
++{
++  if (gender_ratio == RATIO_GENDERLESS || gender_ratio == RATIO_ALWAYS_FEMALE ||
++      gender_ratio == RATIO_ALWAYS_MALE)
++  {
++    // Gender is fixed by the species regardless of PID.
++    return true;
++  }
++  switch (wanted_gender)
++  {
++  case 'F':
++    return static_cast<int>(pid_low_byte) < gender_ratio;  // female iff (PID & 0xFF) < ratio
++  case 'M':
++    return static_cast<int>(pid_low_byte) >= gender_ratio;
++  default:
++    return true;
++  }
++}
++
++// Deterministic PID search. For shiny requests: enumerate the low u16
++// (parity = ability slot, low byte satisfying gender), derive the eight shiny
++// high u16 values, and take the first PID with the right nature. Non-shiny
++// (or shiny-unsatisfiable, relaxed): start from the Python reference's
++// nature-preserving base (0x12345678 rounded to the nature) and step by 25,
++// which cycles the low u16 through every value, until parity + gender match
++// and the PID is not accidentally shiny.
++std::optional<u32> ChoosePid(u32 nature_id, u32 ability_slot, int gender_ratio, char wanted_gender,
++                             bool shiny, u32 trainer_id)
++{
++  const u32 tid = trainer_id & 0xFFFF;
++  const u32 sid = (trainer_id >> 16) & 0xFFFF;
++
++  if (shiny)
++  {
++    for (u32 low = 0; low <= 0xFFFF; low++)
++    {
++      if ((low & 1) != ability_slot)
++        continue;
++      if (!GenderOk(low & 0xFF, gender_ratio, wanted_gender))
++        continue;
++      for (u32 r = 0; r < SHINY_THRESHOLD; r++)
++      {
++        const u32 high = (tid ^ sid ^ low ^ r) & 0xFFFF;
++        const u32 pid = (high << 16) | low;
++        if (pid % 25 == nature_id)
++          return pid;
++      }
++    }
++    // No shiny PID satisfies nature+ability+gender: relax shiny.
++  }
++
++  // Nature-preserving scan (mirrors find_pid_for_nature's base). No overflow:
++  // base + 25 * 0x20000 stays far below 2^31.
++  constexpr u32 base = 0x12345678;
++  u32 pid = base - (base % 25) + nature_id;
++  for (u32 step = 0; step < 0x20000; step++)
++  {
++    if ((pid & 1) == ability_slot && GenderOk(pid & 0xFF, gender_ratio, wanted_gender) &&
++        !IsShinyPid(pid, trainer_id))
++    {
++      return pid;
++    }
++    pid += 25;
++  }
++  // Unreachable: the low u16 cycles through all values (gcd(25, 2^16)=1), so
++  // parity+gender always hit, and shininess excludes at most 8/65536.
++  return std::nullopt;
++}
++
++std::string Upper(std::string text)
++{
++  std::transform(text.begin(), text.end(), text.begin(),
++                 [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
++  return text;
++}
++}  // namespace
++
++std::optional<Gen3Mon> Build(const ShowdownSet& set, const Gen3Data& data,
++                             const std::string& trainer_name, u32 trainer_id, std::string* error)
++{
++  const auto fail = [error](const std::string& message) -> std::optional<Gen3Mon> {
++    if (error)
++      *error = message;
++    return std::nullopt;
++  };
++
++  const Gen3Data::Species* species = data.FindSpecies(set.species);
++  if (!species)
++    return fail("unknown species: " + set.species);
++
++  const int level = std::clamp(set.level, 1, 100);
++
++  // Nature: default Hardy (neutral) when the set omits it, so the stats we
++  // store match the nature the PID encodes.
++  Gen3Data::Nature nature{"hardy", 0, -1, -1};
++  if (set.nature)
++  {
++    const Gen3Data::Nature* found = data.FindNature(*set.nature);
++    if (!found)
++      return fail("unknown nature: " + *set.nature);
++    nature = *found;
++  }
++  else if (const Gen3Data::Nature* hardy = data.FindNature("hardy"))
++  {
++    nature = *hardy;
++  }
++
++  // Ability slot: 1 only when the requested ability is the species' distinct
++  // second ability; otherwise 0.
++  u32 ability_slot = 0;
++  if (set.ability)
++  {
++    const std::optional<int> ability_id = data.AbilityId(*set.ability);
++    if (!ability_id)
++      return fail("unknown ability: " + *set.ability);
++    if (*ability_id == species->abilities[1] && species->abilities[1] != 0 &&
++        species->abilities[1] != species->abilities[0])
++    {
++      ability_slot = 1;
++    }
++  }
++
++  const std::optional<u32> pid =
++      ChoosePid(static_cast<u32>(nature.id), ability_slot, species->gender_ratio, set.gender,
++                set.shiny, trainer_id);
++  if (!pid)
++    return fail("no PID satisfies the requested constraints");
++
++  // Remap hp/atk/def/spa/spd/spe (Showdown order) to Gen 3 save order.
++  std::array<int, 6> evs = ShowdownToGen3Order(set.evs);
++  std::array<int, 6> ivs = ShowdownToGen3Order(set.ivs);
++  for (int i = 0; i < 6; i++)
++  {
++    ivs[i] = std::clamp(ivs[i], 0, 31);
++    evs[i] = std::clamp(evs[i], 0, 255);
++  }
++
++  std::array<u32, 4> move_ids{};
++  for (size_t i = 0; i < std::min<size_t>(set.moves.size(), 4); i++)
++  {
++    const std::optional<int> id = ResolveMoveId(set.moves[i], data);
++    if (!id)
++      return fail("unknown move: " + set.moves[i]);
++    move_ids[i] = static_cast<u32>(*id);
++  }
++
++  u32 held_item = 0;
++  if (set.item)
++  {
++    const std::optional<int> item_id = data.ItemId(*set.item);
++    if (!item_id)
++      return fail("unknown item: " + *set.item);
++    held_item = static_cast<u32>(*item_id);
++  }
++
++  const std::optional<int> experience = data.ExpForLevel(species->exp_group, level);
++  if (!experience)
++    return fail("unknown experience group: " + species->exp_group);
++
++  const std::array<int, 6> stats = ComputeStats(*species, level, ivs, evs, nature);
++
++  const std::string nickname = SanitizeText(set.nickname ? *set.nickname : Upper(set.species));
++  const auto nickname_bytes = Gen3Text::Encode(nickname, 10, error);
++  if (!nickname_bytes)
++    return std::nullopt;
++  const auto ot_name_bytes = Gen3Text::Encode(SanitizeText(trainer_name), 7, error);
++  if (!ot_name_bytes)
++    return std::nullopt;
++
++  Gen3Mon mon;
++  mon.pid = *pid;
++  mon.ot_id = trainer_id;
++  std::copy(nickname_bytes->begin(), nickname_bytes->end(), mon.nickname_raw.begin());
++  mon.language = LANGUAGE_ENGLISH;
++  std::copy(ot_name_bytes->begin(), ot_name_bytes->end(), mon.ot_name_raw.begin());
++  mon.species = static_cast<u32>(species->id);
++  mon.held_item = held_item;
++  mon.experience = static_cast<u32>(*experience);
++  mon.pp_bonuses = 0;
++  mon.friendship = DEFAULT_FRIENDSHIP;
++  mon.moves = move_ids;
++  for (size_t i = 0; i < 4; i++)
++    mon.pp[i] = move_ids[i] != 0 ? DEFAULT_PP : 0;
++  for (size_t i = 0; i < 6; i++)
++    mon.evs[i] = static_cast<u32>(evs[i]);
++  mon.met_location = 0;
++  mon.origins = (static_cast<u32>(level) & 0x7F) | ((GAME_EMERALD & 0xF) << 7) |
++                ((BALL_POKE & 0xF) << 11) | ((OT_GENDER_MALE & 1) << 15);
++  std::array<u32, 6> iv_array{};
++  for (size_t i = 0; i < 6; i++)
++    iv_array[i] = static_cast<u32>(ivs[i]);
++  mon.SetIvs(iv_array);
++  mon.SetAbilitySlot(ability_slot);
++  mon.level = static_cast<u32>(level);
++  mon.max_hp = static_cast<u32>(stats[0]);
++  mon.current_hp = static_cast<u32>(stats[0]);
++  mon.attack = static_cast<u32>(stats[1]);
++  mon.defense = static_cast<u32>(stats[2]);
++  mon.speed = static_cast<u32>(stats[3]);
++  mon.sp_attack = static_cast<u32>(stats[4]);
++  mon.sp_defense = static_cast<u32>(stats[5]);
++  return mon;
++}
++}  // namespace XDNetplay::MonFactory
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.h b/Source/Core/UICommon/XDNetplay/MonFactory.h
+new file mode 100644
+index 0000000000..b8ac7c9fea
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <string>
++
++#include "Common/CommonTypes.h"
++
++#include "UICommon/XDNetplay/Gen3Data.h"
++#include "UICommon/XDNetplay/Gen3Mon.h"
++#include "UICommon/XDNetplay/ShowdownParser.h"
++
++namespace XDNetplay::MonFactory
++{
++// Build a party-ready Gen3Mon from a parsed Showdown set, mirroring the
++// defaults of the validated Python injector (and its Android Kotlin port,
++// MonFactory.kt):
++//
++//  - language English (0x0202), friendship 70
++//  - origins: met level = current level, game of origin 3 (Emerald),
++//    ball 4 (Poke Ball), OT gender male, met location 0
++//  - PP = 35 for every non-empty move slot, 0 otherwise, PP bonuses 0
++//  - contest stats, ribbons, status, pokerus all 0
++//
++// The PID is chosen deterministically to satisfy, in priority order: nature
++// (PID % 25), ability slot (PID & 1), gender (PID low byte vs the species
++// gender ratio, when the set requests a gender the species can actually
++// have), and shininess ((TID^SID^PIDhigh^PIDlow) < 8). Shiny is relaxed first
++// if the combination is unsatisfiable; the search is bounded, never infinite.
++//
++// trainer_id is the raw u32 as read from the save: low u16 public ID, high
++// u16 secret ID. Returns std::nullopt (with *error set, if given) for
++// unknown species/move/item/ability/nature names.
++std::optional<Gen3Mon> Build(const ShowdownSet& set, const Gen3Data& data,
++                             const std::string& trainer_name, u32 trainer_id,
++                             std::string* error = nullptr);
++}  // namespace XDNetplay::MonFactory
+diff --git a/Source/Core/UICommon/XDNetplay/ShowdownParser.cpp b/Source/Core/UICommon/XDNetplay/ShowdownParser.cpp
+new file mode 100644
+index 0000000000..a5b4d24b44
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/ShowdownParser.cpp
+@@ -0,0 +1,219 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/ShowdownParser.h"
++
++#include <algorithm>
++#include <cctype>
++#include <map>
++#include <sstream>
++
++namespace XDNetplay::ShowdownParser
++{
++namespace
++{
++constexpr size_t MAX_MOVES = 4;
++
++// Showdown stat tokens -> index in the hp/atk/def/spa/spd/spe arrays.
++const std::map<std::string, int> STAT_INDEX = {
++    {"hp", 0},     {"atk", 1},   {"attack", 1},    {"def", 2},      {"defense", 2},
++    {"spa", 3},    {"spatk", 3}, {"spatt", 3},     {"spattack", 3}, {"spd", 4},
++    {"spdef", 4},  {"spdefense", 4},               {"spe", 5},      {"speed", 5},
++};
++
++std::string Trim(const std::string& text)
++{
++  size_t begin = 0;
++  size_t end = text.size();
++  while (begin < end && std::isspace(static_cast<unsigned char>(text[begin])))
++    begin++;
++  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1])))
++    end--;
++  return text.substr(begin, end - begin);
++}
++
++std::string ToLower(std::string text)
++{
++  std::transform(text.begin(), text.end(), text.begin(),
++                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
++  return text;
++}
++
++bool StartsWith(const std::string& text, const std::string& prefix)
++{
++  return text.rfind(prefix, 0) == 0;
++}
++
++bool EndsWith(const std::string& text, const std::string& suffix)
++{
++  return text.size() >= suffix.size() &&
++         text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
++}
++
++std::optional<int> ToInt(const std::string& text)
++{
++  if (text.empty())
++    return std::nullopt;
++  size_t i = text[0] == '-' ? 1 : 0;
++  if (i == text.size())
++    return std::nullopt;
++  for (; i < text.size(); i++)
++  {
++    if (!std::isdigit(static_cast<unsigned char>(text[i])))
++      return std::nullopt;
++  }
++  return std::atoi(text.c_str());
++}
++
++// Parse "252 Atk / 4 Def / 252 Spe" into out; unknown tokens ignored.
++void ParseStatList(const std::string& text, std::array<int, 6>* out)
++{
++  std::stringstream parts(text);
++  std::string part;
++  while (std::getline(parts, part, '/'))
++  {
++    std::stringstream tokens(Trim(part));
++    std::string value_token;
++    std::string stat_token;
++    if (!(tokens >> value_token >> stat_token))
++      continue;
++    const std::optional<int> value = ToInt(value_token);
++    if (!value)
++      continue;
++    const auto it = STAT_INDEX.find(ToLower(stat_token));
++    if (it == STAT_INDEX.end())
++      continue;
++    (*out)[it->second] = *value;
++  }
++}
++}  // namespace
++
++std::vector<ShowdownSet> ParseTeam(const std::string& text)
++{
++  std::vector<ShowdownSet> sets;
++  std::vector<std::string> block;
++  const auto flush = [&] {
++    if (auto set = ParseSet(block))
++      sets.push_back(std::move(*set));
++    block.clear();
++  };
++
++  std::stringstream lines(text);
++  std::string raw_line;
++  while (std::getline(lines, raw_line))
++  {
++    const std::string line = Trim(raw_line);
++    if (line.empty())
++    {
++      flush();
++    }
++    else if (!StartsWith(line, "==="))
++    {
++      // "=== [gen3ou] Team Name ===" headers from full exports are skipped.
++      block.push_back(line);
++    }
++  }
++  flush();
++  return sets;
++}
++
++std::optional<ShowdownSet> ParseSet(const std::vector<std::string>& lines)
++{
++  if (lines.empty())
++    return std::nullopt;
++
++  // ---- header line: "Nickname (Species) (G) @ Item" with every part except
++  // the species optional.
++  std::string header = lines[0];
++  std::optional<std::string> item;
++  const size_t at_idx = header.rfind(" @ ");
++  if (at_idx != std::string::npos)
++  {
++    const std::string item_text = Trim(header.substr(at_idx + 3));
++    if (!item_text.empty())
++      item = item_text;
++    header = Trim(header.substr(0, at_idx));
++  }
++
++  char gender = 0;
++  if (EndsWith(header, "(M)"))
++  {
++    gender = 'M';
++    header = Trim(header.substr(0, header.size() - 3));
++  }
++  else if (EndsWith(header, "(F)"))
++  {
++    gender = 'F';
++    header = Trim(header.substr(0, header.size() - 3));
++  }
++
++  std::optional<std::string> nickname;
++  std::string species_name = header;
++  if (EndsWith(header, ")"))
++  {
++    const size_t open = header.rfind('(');
++    if (open != std::string::npos && open > 0)
++    {
++      species_name = Trim(header.substr(open + 1, header.size() - open - 2));
++      const std::string nick = Trim(header.substr(0, open));
++      if (!nick.empty())
++        nickname = nick;
++    }
++  }
++  if (species_name.empty())
++    return std::nullopt;
++
++  // ---- body lines
++  ShowdownSet set;
++  set.species = species_name;
++  set.nickname = nickname;
++  set.gender = gender;
++  set.item = item;
++
++  for (size_t i = 1; i < lines.size(); i++)
++  {
++    const std::string& line = lines[i];
++    if (StartsWith(line, "Ability:"))
++    {
++      const std::string ability = Trim(line.substr(8));
++      if (!ability.empty())
++        set.ability = ability;
++    }
++    else if (StartsWith(line, "Level:"))
++    {
++      if (const std::optional<int> level = ToInt(Trim(line.substr(6))))
++        set.level = *level;
++    }
++    else if (StartsWith(line, "Shiny:"))
++    {
++      set.shiny = ToLower(Trim(line.substr(6))) == "yes";
++    }
++    else if (StartsWith(line, "EVs:"))
++    {
++      ParseStatList(line.substr(4), &set.evs);
++    }
++    else if (StartsWith(line, "IVs:"))
++    {
++      ParseStatList(line.substr(4), &set.ivs);
++    }
++    else if (StartsWith(line, "-"))
++    {
++      if (set.moves.size() < MAX_MOVES)
++      {
++        const std::string move = Trim(line.substr(1));
++        if (!move.empty())
++          set.moves.push_back(move);
++      }
++    }
++    else if (EndsWith(line, " Nature"))
++    {
++      const std::string nature = Trim(line.substr(0, line.size() - 7));
++      if (!nature.empty())
++        set.nature = nature;
++    }
++    // Anything else ("Happiness:", "Tera Type:", ...) is ignored.
++  }
++
++  return set;
++}
++}  // namespace XDNetplay::ShowdownParser
+diff --git a/Source/Core/UICommon/XDNetplay/ShowdownParser.h b/Source/Core/UICommon/XDNetplay/ShowdownParser.h
+new file mode 100644
+index 0000000000..3892d36e75
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/ShowdownParser.h
+@@ -0,0 +1,44 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <array>
++#include <optional>
++#include <string>
++#include <vector>
++
++namespace XDNetplay
++{
++// One parsed set from a Pokemon Showdown team export.
++//
++// EV/IV arrays use Showdown's writing order: hp, atk, def, spa, spd, spe.
++// (Note this differs from the Gen 3 save order hp/atk/def/speed/spatk/spdef;
++// MonFactory remaps.)
++struct ShowdownSet
++{
++  std::string species;
++  std::optional<std::string> nickname;
++  char gender = 0;  // 'M' / 'F' from a "(M)"/"(F)" marker, 0 if none
++  std::optional<std::string> item;
++  std::optional<std::string> ability;
++  int level = 100;
++  bool shiny = false;
++  std::optional<std::string> nature;
++  std::array<int, 6> evs{};                        // hp, atk, def, spa, spd, spe
++  std::array<int, 6> ivs{31, 31, 31, 31, 31, 31};  // hp, atk, def, spa, spd, spe
++  std::vector<std::string> moves;                  // max 4
++};
++
++// Parser for Showdown team-export text. Sets are separated by blank lines;
++// lines that are not recognized (e.g. "Happiness:", "Tera Type:") are ignored
++// gracefully. Ported 1:1 from the Android Kotlin port (ShowdownParser.kt).
++namespace ShowdownParser
++{
++// Parse a full export possibly containing multiple blank-line-separated sets.
++std::vector<ShowdownSet> ParseTeam(const std::string& text);
++
++// Parse one set from its (trimmed, non-blank) lines. std::nullopt if empty.
++std::optional<ShowdownSet> ParseSet(const std::vector<std::string>& lines);
++}  // namespace ShowdownParser
++}  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
