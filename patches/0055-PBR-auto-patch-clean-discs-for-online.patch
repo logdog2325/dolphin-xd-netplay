@@ -1,0 +1,1112 @@
+From 7c5d37f46285fb29127bdbda3afd42a259029079 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 03:09:14 -0700
+Subject: [PATCH] PBR: auto-patch clean discs for online play
+
+Pokemon Battle Revolution's online mode still works through Wiimmfi, but
+only if the disc's hardcoded GameSpy hostnames are redirected. Until now
+the PBR launcher required users to source an already-patched disc. Carry
+the redirect ourselves instead, so a clean dump in any container format
+(iso/wbfs/rvz/ciso/nfs) just works.
+
+What the payload is
+-------------------
+A "patched" PBR disc is the stock disc with 30 strings rewritten inside
+main.dol (section data5) and nothing else changed -- 824 bytes per region,
+no code patches:
+
+   25x  *.gs.nintendowifi.net        -> *.gs.wiimmfi.de
+    4x  "https://"                   -> "http://"
+    1x  NAS User-Agent "RVL SDK/1.0" -> "D-3-0"
+
+XDNetplay/PbrWiimmfiData.h carries that table for RPBE01 and RPBP01. It is
+machine-generated, and was checked byte-for-byte against the output of the
+official Wiimmfi patcher (wit --wiimmfi) for RPBE01 and against a shipped
+Wiimmfi-patched disc for RPBP01. There is no RPBJ01 payload -- Wiimmfi does
+not carry PBR-JP -- so that region is detected and reported rather than
+silently half-supported.
+
+How it is applied
+-----------------
+As Riivolution <memory> patches. Those are written into RAM by
+CBoot::BootUp() once the DOL is loaded, so the disc image itself is never
+read-modify-written and every container format works with no conversion.
+The Riivolution "offset" attribute is a memory address -- ApplyMemoryPatch()
+writes to (m_offset | 0x80000000) -- so the absolute virtual addresses in
+the table are used as-is.
+
+The Patch structs are built directly rather than by generating XML and
+calling ParseString(). RiivolutionParser.cpp's <memory> handling is exactly
+"m_offset = offset attribute, m_value = hex of the value attribute", so the
+two are equivalent, and building them in code removes a hex round trip and a
+runtime parse that could fail silently.
+
+BootManager::BootCore() calls into the helper for every disc boot, which
+covers the Android PBR launcher, the Android game grid and the desktop game
+list alike. It is placed after the existing riivolution_patches check so
+that adding these patches does not also force MAIN_FAST_DISC_SPEED -- the
+disc image is untouched, so there are no Riivolution load times to skip.
+The patches are appended to BootParameters::riivolution_patches rather than
+handed to AddRiivolutionPatches(), because that helper additionally wraps
+the volume in a DirectoryBlobReader so <file> patches can rewrite the FST.
+There are no file patches here, so the wrapper would buy nothing and cost a
+full FST rebuild plus on-the-fly Wii partition re-encryption every boot.
+
+Not double-applying
+-------------------
+ExamineDisc() reads the disc's DOL header, maps each patched address back to
+a file offset and compares the 30 fields, so a pre-patched disc is detected
+and skipped. That read is about a kilobyte, not the whole 4.5 MB DOL.
+
+Applying anyway would in fact be harmless, which is why the fallback for an
+unreadable main.dol is to patch regardless: every replacement is the new
+string NUL-padded out to the length of the string it replaces, so writing it
+over an image that already contains it stores byte-identical data. Verified
+by applying the embedded table to a copy of the official Wiimmfi-patched
+RPBE01 main.dol and diffing -- zero bytes changed. The same harness confirms
+stock main.dol + this table == official patched main.dol exactly.
+
+Launcher UI
+-----------
+- The disc row accepts a clean dump and says the Wiimmfi patch is applied
+  automatically at boot. It now reports which region was found and calls out
+  the Japanese disc as unsupported instead of claiming it is ready to play.
+- The NAND row is a warning, not a blocker: offline play works without one,
+  and Play is no longer gated on it. The text is explicit that online play
+  needs a NAND backup from the user's own Wii, because a shared or generated
+  NAND gets rejected and can get the user banned.
+- The disc picker stays a folder picker. Android's game list is built by
+  UICommon::FindAllGamePaths() over directories (Common/FileSearch.cpp only
+  walks directories, including for SAF content URIs), so a single-file
+  picker would not survive a rescan. The label now says which folder to pick.
+---
+ .../xdnetplay/ui/PbrLauncherActivity.kt       |  66 ++--
+ .../xdnetplay/ui/PbrLauncherScreen.kt         |  77 +++-
+ Source/Core/Core/BootManager.cpp              |   6 +
+ Source/Core/Core/CMakeLists.txt               |   3 +
+ Source/Core/Core/XDNetplay/PbrWiimmfi.cpp     | 229 ++++++++++++
+ Source/Core/Core/XDNetplay/PbrWiimmfi.h       |  69 ++++
+ Source/Core/Core/XDNetplay/PbrWiimmfiData.h   | 334 ++++++++++++++++++
+ Source/Core/DolphinLib.props                  |   3 +
+ 8 files changed, 748 insertions(+), 39 deletions(-)
+ create mode 100644 Source/Core/Core/XDNetplay/PbrWiimmfi.cpp
+ create mode 100644 Source/Core/Core/XDNetplay/PbrWiimmfi.h
+ create mode 100644 Source/Core/Core/XDNetplay/PbrWiimmfiData.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+index a9f189a..2dac8fb 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
+@@ -31,17 +31,22 @@ import org.dolphinemu.dolphinemu.utils.ThreadUtil
+ import org.dolphinemu.dolphinemu.utils.WiiUtils
+ 
+ /**
+- * Pokémon Battle Revolution online mode (UPA private server). Fully separate
+- * from the XD launcher: it drives a different game (RPBE01) and its own config
+- * only. The XD launcher force-applies its own setup every time it opens, so
+- * nothing here can degrade XD -- see ensurePbrConfig().
++ * Pokémon Battle Revolution online mode (Wiimmfi). Fully separate from the XD
++ * launcher: it drives a different game and its own config only. The XD launcher
++ * force-applies its own setup every time it opens, so nothing here can degrade
++ * XD -- see ensurePbrConfig().
++ *
++ * Bring a CLEAN dump in any format (iso/wbfs/rvz/ciso). The Wiimmfi redirect is
++ * applied in RAM at boot by Core/XDNetplay/PbrWiimmfi, so no pre-patched disc,
++ * no conversion, and no writing to your dump. A disc that is already patched is
++ * detected and left alone.
+  */
+ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+     override var themeId: Int = 0
+ 
+     private var initialized by mutableStateOf(false)
+     private var nandImported by mutableStateOf(false)
+-    private var pbrFound by mutableStateOf(false)
++    private var pbrGameId by mutableStateOf<String?>(null)
+     private var statusMessage by mutableStateOf<String?>(null)
+ 
+     private val pickPbrFolder =
+@@ -60,7 +65,7 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+             if (uri != null) importNand(uri)
+         }
+ 
+-    /** Imports the UPA-provided nand.bin (NAND + appended keys) into the app's
++    /** Imports the user's own nand.bin (NAND + appended keys) into the app's
+      *  Wii/ dir on a background thread. Success is silent; the native side pops
+      *  a panic on failure. */
+     private fun importNand(uri: Uri) {
+@@ -90,7 +95,7 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+ 
+         GameFileCacheManager.getGameFiles().observe(this) {
+-            pbrFound = findPbrGame() != null
++            pbrGameId = findPbrGame()?.getGameId()
+         }
+ 
+         setContent {
+@@ -98,7 +103,8 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+                 PbrLauncherScreen(
+                     initialized = initialized,
+                     nandImported = nandImported,
+-                    pbrFound = pbrFound,
++                    pbrGameId = pbrGameId,
++                    pbrSupported = isSupported(pbrGameId),
+                     statusMessage = statusMessage,
+                     onImportNand = { pickNand.launch("*/*") },
+                     onPickPbrFolder = { pickPbrFolder.launch(null) },
+@@ -120,9 +126,12 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private fun refreshChecks() {
+         ensurePbrConfig()
+         nandImported = checkNandImported()
+-        pbrFound = findPbrGame() != null
++        pbrGameId = findPbrGame()?.getGameId()
+     }
+ 
++    private fun isSupported(gameId: String?): Boolean =
++        gameId != null && SUPPORTED_PBR_GAME_IDS.contains(gameId)
++
+     private fun checkNandImported(): Boolean = try {
+         File(DirectoryInitialization.getUserDirectory(), "Wii/title").listFiles()?.isNotEmpty() == true
+     } catch (_: Exception) {
+@@ -134,11 +143,11 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+      *  - Turn the emulated-GBA SI ports OFF (XD sets them to 13 for its GBA-vs-
+      *    GBA link; PBR is a Wii game and must not spin up Emerald cores). The XD
+      *    launcher flips them back to 13 whenever it opens, so XD is unaffected.
+-     *  - Cheats on so RPBE01.ini's on-frame black-screen fix applies (same flag
+-     *    XD already forces, so no conflict). RPBE01.ini also forces the EFB
+-     *    graphics fix so battle-pass avatars render.
+-     * The UPA route needs no SSL certs, no DNS change, and no activation wait --
+-     * the patched ISO reaches the server directly.
++     *  - Cheats on so the disc's on-frame black-screen fix applies (same flag
++     *    XD already forces, so no conflict). RPBE01.ini/RPBP01.ini also force
++     *    the EFB graphics fix so battle-pass avatars render.
++     * The Wiimmfi route needs no SSL certs, no DNS change, and no activation
++     * wait -- the redirect is baked into the game's own hostname strings.
+      */
+     private fun ensurePbrConfig() {
+         var changed = false
+@@ -156,21 +165,38 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ 
++    /**
++     * Boots the disc as-is. The Wiimmfi redirect is not applied here: it is
++     * attached to the BootParameters natively in BootManager::BootCore, so it
++     * covers this button, the game grid and any other entry point, and it never
++     * touches the file on disk.
++     */
+     private fun bootPbr() {
+         val pbr = findPbrGame()
+-        if (pbr != null) {
+-            EmulationActivity.launch(this, pbr.getPath(), false)
+-        } else {
++        if (pbr == null) {
+             statusMessage =
+-                "Pokémon Battle Revolution not found (any region) — choose the folder with your UPA ISO."
++                "Pokémon Battle Revolution not found (any region) — choose the folder " +
++                    "holding your dump."
++            return
+         }
++        if (!isSupported(pbr.getGameId())) {
++            statusMessage =
++                "Pokémon Battle Revolution (${pbr.getGameId()}) is an unsupported region — " +
++                    "online play needs the US (RPBE01) or European (RPBP01) disc."
++            return
++        }
++        statusMessage = null
++        EmulationActivity.launch(this, pbr.getPath(), false)
+     }
+ 
+     companion object {
+-        // The UPA server pack is built from the PAL disc (RPBP01), while stock
+-        // dumps are usually USA (RPBE01) -- accept every region's ID.
++        // Stock dumps are usually USA (RPBE01) or PAL (RPBP01) -- look for every
++        // region's ID so the checklist can explain an unsupported one.
+         val PBR_GAME_IDS = listOf("RPBE01", "RPBP01", "RPBJ01")
+ 
++        // Regions we carry a Wiimmfi payload for; keep in sync with PbrWiimmfiData.h.
++        val SUPPORTED_PBR_GAME_IDS = listOf("RPBE01", "RPBP01")
++
+         fun findPbrGame() =
+             PBR_GAME_IDS.firstNotNullOfOrNull { GameFileCacheManager.getGameFileByGameId(it) }
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+index 3bc7e16..0d7b782 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherScreen.kt
+@@ -17,6 +17,7 @@ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material.icons.Icons
+ import androidx.compose.material.icons.filled.Check
+ import androidx.compose.material.icons.filled.Close
++import androidx.compose.material.icons.filled.Info
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.Card
+ import androidx.compose.material3.CircularProgressIndicator
+@@ -35,13 +36,15 @@ import androidx.compose.ui.unit.dp
+ fun PbrLauncherScreen(
+     initialized: Boolean,
+     nandImported: Boolean,
+-    pbrFound: Boolean,
++    pbrGameId: String?,
++    pbrSupported: Boolean,
+     statusMessage: String?,
+     onImportNand: () -> Unit,
+     onPickPbrFolder: () -> Unit,
+     onPlayPbr: () -> Unit,
+     onBack: () -> Unit
+ ) {
++    val playable = pbrGameId != null && pbrSupported
+     Column(
+         modifier = Modifier
+             .fillMaxSize()
+@@ -57,7 +60,7 @@ fun PbrLauncherScreen(
+             color = MaterialTheme.colorScheme.primary
+         )
+         Text(
+-            text = "Pokémon Battle Revolution, online (UPA)",
++            text = "Pokémon Battle Revolution, online (Wiimmfi)",
+             style = MaterialTheme.typography.bodyLarge,
+             color = MaterialTheme.colorScheme.onSurfaceVariant
+         )
+@@ -79,22 +82,35 @@ fun PbrLauncherScreen(
+                         fontWeight = FontWeight.SemiBold
+                     )
+                     CheckRow(
+-                        ok = pbrFound,
+-                        okText = "Patched PBR ISO found",
+-                        missingText = "Patched PBR not found — choose the folder with your UPA ISO",
++                        state = when {
++                            playable -> RowState.Ok
++                            pbrGameId != null -> RowState.Warn
++                            else -> RowState.Missing
++                        },
++                        okText = "Pokémon Battle Revolution found ($pbrGameId) — " +
++                            "Wiimmfi patch applied automatically at boot",
++                        warnText = "Pokémon Battle Revolution found ($pbrGameId), but that " +
++                            "region has no Wiimmfi support. Online play needs the US (RPBE01) " +
++                            "or European (RPBP01) disc.",
++                        missingText = "Pokémon Battle Revolution not found — choose the folder " +
++                            "holding your dump. A clean dump is fine (iso/wbfs/rvz/ciso).",
+                         fixLabel = "Choose folder…",
+                         onFix = onPickPbrFolder
+                     )
+                     CheckRow(
+-                        ok = nandImported,
++                        state = if (nandImported) RowState.Ok else RowState.Warn,
+                         okText = "Wii NAND imported",
+-                        missingText = "Import the UPA nand.bin (has keys appended)",
++                        warnText = "No Wii NAND imported. Offline play works without one, but " +
++                            "online play needs a NAND backup from YOUR OWN Wii — a shared or " +
++                            "generated NAND gets rejected and can get you banned.",
++                        missingText = "",
+                         fixLabel = "Import NAND…",
+                         onFix = onImportNand
+                     )
+                     CheckRow(
+-                        ok = true,
++                        state = RowState.Ok,
+                         okText = "Graphics + black-screen fixes bundled",
++                        warnText = "",
+                         missingText = "",
+                         fixLabel = "",
+                         onFix = null
+@@ -104,9 +120,11 @@ fun PbrLauncherScreen(
+ 
+             Spacer(Modifier.height(12.dp))
+             Text(
+-                text = "No SSL certs, no DNS change, no 1-week wait — the UPA ISO connects directly. " +
+-                    "For teams, drop the Restorer save's PbrSaveData in the game's Wii save folder " +
+-                    "(or edit with PKHeX).",
++                text = "Bring a clean dump in any format — the Wiimmfi redirect is applied in " +
++                    "memory at boot, so your file is never modified and a disc that is already " +
++                    "patched is left alone. No SSL certs, no DNS change, no 1-week wait. " +
++                    "For teams, drop the Restorer save's PbrSaveData in the game's Wii save " +
++                    "folder (or edit with PKHeX).",
+                 style = MaterialTheme.typography.bodySmall,
+                 color = MaterialTheme.colorScheme.onSurfaceVariant
+             )
+@@ -122,15 +140,20 @@ fun PbrLauncherScreen(
+             Spacer(Modifier.height(24.dp))
+ 
+             FilledTonalButton(onClick = onImportNand, modifier = Modifier.fillMaxWidth()) {
+-                Text("Import Wii NAND (nand.bin)", style = MaterialTheme.typography.titleMedium)
++                Text(
++                    "Import your Wii NAND (online only)",
++                    style = MaterialTheme.typography.titleMedium
++                )
+             }
+             Spacer(Modifier.height(12.dp))
++            // Deliberately not gated on the NAND: without one the game still boots and plays
++            // offline, and a NAND is something only the user can supply from their own console.
+             Button(
+                 onClick = onPlayPbr,
+-                enabled = pbrFound && nandImported,
++                enabled = playable,
+                 modifier = Modifier.fillMaxWidth()
+             ) {
+-                Text("Play PBR Online", style = MaterialTheme.typography.titleMedium)
++                Text("Play PBR", style = MaterialTheme.typography.titleMedium)
+             }
+             Spacer(Modifier.height(24.dp))
+ 
+@@ -142,28 +165,44 @@ fun PbrLauncherScreen(
+     }
+ }
+ 
++/** Ok = done, Warn = worth fixing but does not block Play, Missing = actually blocks Play. */
++private enum class RowState { Ok, Warn, Missing }
++
+ @Composable
+ private fun CheckRow(
+-    ok: Boolean,
++    state: RowState,
+     okText: String,
++    warnText: String,
+     missingText: String,
+     fixLabel: String,
+     onFix: (() -> Unit)?
+ ) {
+     Row(verticalAlignment = Alignment.CenterVertically) {
+         Icon(
+-            imageVector = if (ok) Icons.Default.Check else Icons.Default.Close,
++            imageVector = when (state) {
++                RowState.Ok -> Icons.Default.Check
++                RowState.Warn -> Icons.Default.Info
++                RowState.Missing -> Icons.Default.Close
++            },
+             contentDescription = null,
+-            tint = if (ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
++            tint = when (state) {
++                RowState.Ok -> MaterialTheme.colorScheme.primary
++                RowState.Warn -> MaterialTheme.colorScheme.tertiary
++                RowState.Missing -> MaterialTheme.colorScheme.error
++            },
+             modifier = Modifier.size(20.dp)
+         )
+         Spacer(Modifier.width(10.dp))
+         Column(modifier = Modifier.fillMaxWidth()) {
+             Text(
+-                text = if (ok) okText else missingText,
++                text = when (state) {
++                    RowState.Ok -> okText
++                    RowState.Warn -> warnText
++                    RowState.Missing -> missingText
++                },
+                 style = MaterialTheme.typography.bodyMedium
+             )
+-            if (!ok && onFix != null) {
++            if (state != RowState.Ok && onFix != null) {
+                 TextButton(
+                     onClick = onFix,
+                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
+diff --git a/Source/Core/Core/BootManager.cpp b/Source/Core/Core/BootManager.cpp
+index 85444ef..0381427 100644
+--- a/Source/Core/Core/BootManager.cpp
++++ b/Source/Core/Core/BootManager.cpp
+@@ -39,6 +39,7 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/System.h"
+ #include "Core/WiiRoot.h"
++#include "Core/XDNetplay/PbrWiimmfi.h"
+ 
+ #include "DiscIO/Enums.h"
+ 
+@@ -134,6 +135,11 @@ bool BootCore(Core::System& system, std::unique_ptr<BootParameters> boot,
+   if (!boot->riivolution_patches.empty())
+     Config::SetCurrent(Config::MAIN_FAST_DISC_SPEED, true);
+ 
++  // Redirect Pokemon Battle Revolution's online mode to Wiimmfi so a clean dump works. This has
++  // to come after the check above: it only adds <memory> patches, which leave the disc image
++  // untouched, so there is no reason to also skip loading time emulation.
++  XDNetplay::PbrWiimmfi::ApplyToBootParameters(boot.get());
++
+   if (system.IsTriforce())
+   {
+     // Attach Triforce Baseboard hardware if not overridden in any layer.
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 996b63e..20a96cf 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -589,6 +589,9 @@ add_library(core
+   WiiRoot.h
+   WiiUtils.cpp
+   WiiUtils.h
++  XDNetplay/PbrWiimmfi.cpp
++  XDNetplay/PbrWiimmfi.h
++  XDNetplay/PbrWiimmfiData.h
+ )
+ 
+ if(_M_X86_64)
+diff --git a/Source/Core/Core/XDNetplay/PbrWiimmfi.cpp b/Source/Core/Core/XDNetplay/PbrWiimmfi.cpp
+new file mode 100644
+index 0000000..e638f2f
+--- /dev/null
++++ b/Source/Core/Core/XDNetplay/PbrWiimmfi.cpp
+@@ -0,0 +1,229 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/XDNetplay/PbrWiimmfi.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <optional>
++#include <span>
++#include <utility>
++#include <variant>
++
++#include "Common/CommonTypes.h"
++#include "Common/Logging/Log.h"
++#include "Common/Swap.h"
++
++#include "Core/Boot/Boot.h"
++#include "Core/XDNetplay/PbrWiimmfiData.h"
++
++#include "DiscIO/DiscUtils.h"
++#include "DiscIO/Volume.h"
++#include "DiscIO/VolumeDisc.h"
++
++namespace XDNetplay::PbrWiimmfi
++{
++namespace
++{
++constexpr char PATCH_ID[] = "xd-pbr-wiimmfi";
++
++// A DOL header is 7 text sections followed by 11 data sections; the three tables (file offset,
++// virtual address, size) are each 18 contiguous big-endian u32s.
++constexpr size_t DOL_SECTION_COUNT = 18;
++constexpr u32 DOL_OFFSET_TABLE = 0x00;
++constexpr u32 DOL_ADDRESS_TABLE = 0x48;
++constexpr u32 DOL_SIZE_TABLE = 0x90;
++constexpr u32 DOL_HEADER_SIZE = 0x100;
++
++std::span<const MemoryWrite> GetWriteTable(std::string_view game_id)
++{
++  if (game_id == GAME_ID_USA)
++    return {RPBE01_WRITES};
++  if (game_id == GAME_ID_PAL)
++    return {RPBP01_WRITES};
++  return {};
++}
++
++u32 ReadBE32(const u8* header, u32 table, size_t index)
++{
++  u32 value;
++  std::memcpy(&value, header + table + index * sizeof(u32), sizeof(u32));
++  return Common::FromBigEndian(value);
++}
++
++// Translates a PowerPC virtual address into an offset inside the main.dol file, making sure the
++// whole [address, address + length) range stays inside one section.
++bool DolAddressToOffset(const u8* header, u32 address, u32 length, u64* out_offset)
++{
++  for (size_t i = 0; i < DOL_SECTION_COUNT; ++i)
++  {
++    const u32 section_offset = ReadBE32(header, DOL_OFFSET_TABLE, i);
++    const u32 section_address = ReadBE32(header, DOL_ADDRESS_TABLE, i);
++    const u32 section_size = ReadBE32(header, DOL_SIZE_TABLE, i);
++    if (section_size == 0 || section_address == 0)
++      continue;
++    if (address < section_address || address - section_address >= section_size)
++      continue;
++
++    const u32 delta = address - section_address;
++    if (section_size - delta < length)
++      return false;
++    *out_offset = u64{section_offset} + delta;
++    return true;
++  }
++  return false;
++}
++}  // namespace
++
++bool IsPbrGameID(std::string_view game_id)
++{
++  return game_id == GAME_ID_USA || game_id == GAME_ID_PAL || game_id == GAME_ID_JPN;
++}
++
++bool IsSupportedGameID(std::string_view game_id)
++{
++  return !GetWriteTable(game_id).empty();
++}
++
++std::vector<DiscIO::Riivolution::Patch> GetPatches(std::string_view game_id)
++{
++  const std::span<const MemoryWrite> writes = GetWriteTable(game_id);
++  if (writes.empty())
++    return {};
++
++  // Built by hand rather than by round-tripping an XML string through
++  // DiscIO::Riivolution::ParseString(). The parser only ever does
++  //   memory.m_offset = attribute("offset").as_uint(0);
++  //   memory.m_value  = ReadHexString(attribute("value"));
++  // for a <memory> element (DiscIO/RiivolutionParser.cpp), so constructing the structs directly
++  // is exactly equivalent to parsing the reference XML, minus a hex encode/decode round trip and
++  // a parse that could silently fail at runtime.
++  //
++  // The addresses below are absolute PowerPC virtual addresses. That is what a Riivolution
++  // "offset" attribute means too: ApplyMemoryPatch() writes to (m_offset | 0x80000000), so an
++  // address that already has the 0x8 nibble set is passed through unchanged
++  // (DiscIO/RiivolutionPatcher.cpp).
++  std::vector<DiscIO::Riivolution::Patch> patches;
++  DiscIO::Riivolution::Patch& patch = patches.emplace_back();
++  patch.m_id = PATCH_ID;
++  patch.m_memory_patches.reserve(writes.size());
++  for (const MemoryWrite& write : writes)
++  {
++    DiscIO::Riivolution::Memory& memory = patch.m_memory_patches.emplace_back();
++    memory.m_offset = write.address;
++    memory.m_value.assign(write.bytes, write.bytes + write.length);
++    // Deliberately no m_original: leaving it empty means the write is unconditional. The payload
++    // is idempotent (see below), so an unconditional write cannot corrupt a pre-patched disc,
++    // whereas an m_original guard would silently skip the patch on any disc revision whose stock
++    // bytes we did not anticipate.
++  }
++  return patches;
++}
++
++DiscStatus ExamineDisc(const DiscIO::VolumeDisc& volume)
++{
++  const std::string game_id = volume.GetGameID();
++  if (!IsPbrGameID(game_id))
++    return DiscStatus::NotPbr;
++
++  const std::span<const MemoryWrite> writes = GetWriteTable(game_id);
++  if (writes.empty())
++    return DiscStatus::UnsupportedRegion;
++
++  const DiscIO::Partition partition = volume.GetGamePartition();
++  const std::optional<u64> dol_offset = DiscIO::GetBootDOLOffset(volume, partition);
++  if (!dol_offset)
++    return DiscStatus::Unknown;
++
++  std::array<u8, DOL_HEADER_SIZE> header{};
++  if (!volume.Read(*dol_offset, header.size(), header.data(), partition))
++    return DiscStatus::Unknown;
++
++  // Only the fields the payload touches are read back, so this stays around a kilobyte of I/O
++  // even though main.dol itself is several megabytes.
++  std::vector<u8> buffer;
++  bool all_patched = true;
++  for (const MemoryWrite& write : writes)
++  {
++    u64 file_offset = 0;
++    if (!DolAddressToOffset(header.data(), write.address, write.length, &file_offset))
++      return DiscStatus::Unknown;
++
++    buffer.resize(write.length);
++    if (!volume.Read(*dol_offset + file_offset, buffer.size(), buffer.data(), partition))
++      return DiscStatus::Unknown;
++
++    if (!std::equal(buffer.begin(), buffer.end(), write.bytes))
++    {
++      all_patched = false;
++      break;
++    }
++  }
++
++  return all_patched ? DiscStatus::AlreadyPatched : DiscStatus::Clean;
++}
++
++bool ApplyToBootParameters(BootParameters* boot_params)
++{
++  if (!boot_params)
++    return false;
++  if (!std::holds_alternative<BootParameters::Disc>(boot_params->parameters))
++    return false;
++
++  const BootParameters::Disc& disc = std::get<BootParameters::Disc>(boot_params->parameters);
++  if (!disc.volume)
++    return false;
++
++  const std::string game_id = disc.volume->GetGameID();
++  if (!IsPbrGameID(game_id))
++    return false;
++
++  if (!IsSupportedGameID(game_id))
++  {
++    WARN_LOG_FMT(BOOT, "Pokemon Battle Revolution {} has no Wiimmfi payload; online play will "
++                       "not work with this disc.",
++                 game_id);
++    return false;
++  }
++
++  // Don't stack a second copy on top of a Riivolution patch set that already includes ours.
++  const auto already_attached =
++      std::ranges::any_of(boot_params->riivolution_patches,
++                          [](const DiscIO::Riivolution::Patch& p) { return p.m_id == PATCH_ID; });
++  if (already_attached)
++    return false;
++
++  switch (ExamineDisc(*disc.volume))
++  {
++  case DiscStatus::AlreadyPatched:
++    INFO_LOG_FMT(BOOT, "{} already carries the Wiimmfi payload; not patching again.", game_id);
++    return false;
++  case DiscStatus::Clean:
++    INFO_LOG_FMT(BOOT, "Clean {} dump detected; applying the built-in Wiimmfi patch.", game_id);
++    break;
++  default:
++    // Couldn't read main.dol (odd container, damaged FST, ...). Patch anyway: every replacement
++    // is the new string NUL-padded to the length of the string it replaces, so applying it to an
++    // image that already contains it writes back byte-identical data.
++    WARN_LOG_FMT(BOOT, "Could not inspect {}'s main.dol; applying the Wiimmfi patch regardless.",
++                 game_id);
++    break;
++  }
++
++  std::vector<DiscIO::Riivolution::Patch> patches = GetPatches(game_id);
++  if (patches.empty())
++    return false;
++
++  // Note this appends to riivolution_patches instead of going through AddRiivolutionPatches().
++  // That helper additionally wraps the volume in a DirectoryBlobReader so that <file> patches can
++  // rewrite the on-disc FST. We have no file patches -- only <memory> ones, which CBoot::BootUp()
++  // applies straight from boot_params->riivolution_patches after the DOL is in RAM -- so the
++  // wrapper would buy us nothing and cost a full FST rebuild plus on-the-fly Wii partition
++  // re-encryption on every boot.
++  boot_params->riivolution_patches.insert(boot_params->riivolution_patches.end(),
++                                          std::make_move_iterator(patches.begin()),
++                                          std::make_move_iterator(patches.end()));
++  return true;
++}
++}  // namespace XDNetplay::PbrWiimmfi
+diff --git a/Source/Core/Core/XDNetplay/PbrWiimmfi.h b/Source/Core/Core/XDNetplay/PbrWiimmfi.h
+new file mode 100644
+index 0000000..50f9f89
+--- /dev/null
++++ b/Source/Core/Core/XDNetplay/PbrWiimmfi.h
+@@ -0,0 +1,69 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// Automatic Wiimmfi redirection for Pokemon Battle Revolution.
++//
++// PBR's online mode talks to Nintendo's long-dead GameSpy backend. The community keeps it alive
++// by redirecting the hardcoded hostnames at Wiimmfi, which is exactly what a "patched" PBR disc
++// is: the stock disc with 30 strings rewritten inside main.dol and nothing else changed.
++//
++// Rather than asking users to source a pre-patched disc, we carry that payload ourselves and
++// apply it as Riivolution <memory> patches at boot. Riivolution memory patches are written into
++// RAM after the DOL has been loaded, so the disc file is never touched and every container
++// format (ISO/WBFS/RVZ/CISO/NFS/...) works with no conversion.
++//
++// See PbrWiimmfiData.h for the payload itself.
++
++#pragma once
++
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "DiscIO/RiivolutionParser.h"
++
++struct BootParameters;
++
++namespace DiscIO
++{
++class VolumeDisc;
++}
++
++namespace XDNetplay::PbrWiimmfi
++{
++constexpr char GAME_ID_USA[] = "RPBE01";
++constexpr char GAME_ID_PAL[] = "RPBP01";
++constexpr char GAME_ID_JPN[] = "RPBJ01";
++
++enum class DiscStatus
++{
++  // Not Pokemon Battle Revolution.
++  NotPbr,
++  // Pokemon Battle Revolution, but we have no payload for this region (RPBJ01).
++  UnsupportedRegion,
++  // Supported region carrying the stock Nintendo hostnames; we patch it at boot.
++  Clean,
++  // Supported region that already carries the Wiimmfi payload (a pre-patched disc).
++  AlreadyPatched,
++  // Supported region, but main.dol could not be inspected. We patch anyway; see below.
++  Unknown,
++};
++
++// True for any Pokemon Battle Revolution disc, including the region we cannot patch.
++bool IsPbrGameID(std::string_view game_id);
++
++// True if a built-in Wiimmfi payload exists for this game ID.
++bool IsSupportedGameID(std::string_view game_id);
++
++// The built-in Wiimmfi patch set for a game ID, or an empty vector for anything we do not know
++// about (including RPBJ01, which callers should report as an unsupported region).
++std::vector<DiscIO::Riivolution::Patch> GetPatches(std::string_view game_id);
++
++// Reads the relevant fields out of the disc's main.dol to work out whether the payload is
++// already present. Only ~1 KiB is read, so this is cheap even on compressed containers.
++DiscStatus ExamineDisc(const DiscIO::VolumeDisc& volume);
++
++// Attaches the built-in payload to a disc boot if it is a PBR disc we support. Returns true if
++// patches were attached. Safe to call for every boot: non-PBR titles are ignored.
++bool ApplyToBootParameters(BootParameters* boot_params);
++}  // namespace XDNetplay::PbrWiimmfi
+diff --git a/Source/Core/Core/XDNetplay/PbrWiimmfiData.h b/Source/Core/Core/XDNetplay/PbrWiimmfiData.h
+new file mode 100644
+index 0000000..33b1153
+--- /dev/null
++++ b/Source/Core/Core/XDNetplay/PbrWiimmfiData.h
+@@ -0,0 +1,334 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++// AUTOGENERATED -- DO NOT EDIT BY HAND.
++//
++// Wiimmfi redirection payload for Pokemon Battle Revolution, expressed as in-place byte
++// writes into the game's main.dol image (section data5 in both regions). The payload is
++// identical to what the official Wiimmfi patcher (`wit --wiimmfi`) produces: 30 string
++// rewrites per region and no code changes at all.
++//
++//   25x  *.gs.nintendowifi.net  ->  *.gs.wiimmfi.de
++//    4x  "https://"             ->  "http://"
++//    1x  NAS User-Agent "RVL SDK/1.0" -> "D-3-0"
++//
++// Every replacement is NUL-padded out to the length of the string it replaces, so the
++// surrounding string pool is never disturbed and re-applying the payload to an already
++// patched image writes back byte-identical data (i.e. it is idempotent).
++//
++// There is no Japanese (RPBJ01) payload: Wiimmfi does not carry PBR-JP.
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++namespace XDNetplay::PbrWiimmfi
++{
++struct MemoryWrite
++{
++  // Absolute PowerPC virtual address of the field being rewritten.
++  u32 address;
++  // Replacement bytes, including the NUL padding that fills the original field.
++  const u8* bytes;
++  u32 length;
++};
++
++// RPBE01 -- USA (NTSC-U), 30 writes, 824 bytes total.
++constexpr u8 RPBE01_DATA[] = {
++    0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F,
++    0x70, 0x6F, 0x6B, 0x65, 0x62, 0x61, 0x74, 0x74, 0x6C, 0x65, 0x77, 0x69, 0x69, 0x2F, 0x77, 0x65,
++    0x62, 0x2F, 0x70, 0x62, 0x72, 0x63, 0x68, 0x65, 0x63, 0x6B, 0x2F, 0x63, 0x68, 0x65, 0x63, 0x6B,
++    0x2E, 0x61, 0x73, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F,
++    0x2F, 0x00, 0x67, 0x70, 0x63, 0x6D, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x70, 0x73, 0x70, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x2E, 0x67, 0x73, 0x2E, 0x77,
++    0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67,
++    0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x61, 0x76, 0x61, 0x69, 0x6C, 0x61, 0x62, 0x6C, 0x65, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x31, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D,
++    0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6E, 0x61,
++    0x74, 0x6E, 0x65, 0x67, 0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69,
++    0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6E, 0x61, 0x74, 0x6E,
++    0x65, 0x67, 0x33, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x61, 0x73, 0x74, 0x65, 0x72,
++    0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x73, 0x25, 0x64, 0x2E, 0x67, 0x73, 0x2E,
++    0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x6E, 0x61, 0x73, 0x2E, 0x74, 0x65, 0x73, 0x74, 0x2E,
++    0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F, 0x61, 0x63, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x6E, 0x61,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F, 0x61, 0x63, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F,
++    0x6E, 0x61, 0x73, 0x2E, 0x64, 0x65, 0x76, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E,
++    0x64, 0x65, 0x2F, 0x61, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44,
++    0x2D, 0x33, 0x2D, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x61, 0x76, 0x61,
++    0x69, 0x6C, 0x61, 0x62, 0x6C, 0x65, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x70, 0x63, 0x6D, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x67, 0x70, 0x73, 0x70, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x61, 0x73,
++    0x74, 0x65, 0x72, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x68,
++    0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x67,
++    0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D,
++    0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E,
++    0x65, 0x67, 0x31, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x32, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x33, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x6D, 0x73, 0x25, 0x64, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E,
++    0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++constexpr MemoryWrite RPBE01_WRITES[] = {
++    // "http://gamestats2.gs.nintendowifi.net/pokebattlewii/web/pbrcheck/check.asp"
++    //  -> "http://gamestats2.gs.wiimmfi.de/pokebattlewii/web/pbrcheck/check.asp"
++    {0x80414648, &RPBE01_DATA[0], 74},
++    // "https://"
++    //  -> "http://"
++    {0x80435358, &RPBE01_DATA[74], 8},
++    // "gpcm.gs.nintendowifi.net"
++    //  -> "gpcm.gs.wiimmfi.de"
++    {0x80435A6C, &RPBE01_DATA[82], 24},
++    // "gpsp.gs.nintendowifi.net"
++    //  -> "gpsp.gs.wiimmfi.de"
++    {0x80435A88, &RPBE01_DATA[106], 24},
++    // "gamestats.gs.nintendowifi.net"
++    //  -> "gamestats.gs.wiimmfi.de"
++    {0x80435AA4, &RPBE01_DATA[130], 29},
++    // "gamestats2.gs.nintendowifi.net"
++    //  -> "gamestats2.gs.wiimmfi.de"
++    {0x80435AC4, &RPBE01_DATA[159], 30},
++    // "%s.available.gs.nintendowifi.net"
++    //  -> "%s.available.gs.wiimmfi.de"
++    {0x80435AE4, &RPBE01_DATA[189], 32},
++    // "%s.natneg1.gs.nintendowifi.net"
++    //  -> "%s.natneg1.gs.wiimmfi.de"
++    {0x80435B08, &RPBE01_DATA[221], 30},
++    // "%s.natneg2.gs.nintendowifi.net"
++    //  -> "%s.natneg2.gs.wiimmfi.de"
++    {0x80435B28, &RPBE01_DATA[251], 30},
++    // "%s.natneg3.gs.nintendowifi.net"
++    //  -> "%s.natneg3.gs.wiimmfi.de"
++    {0x80435B48, &RPBE01_DATA[281], 30},
++    // "%s.master.gs.nintendowifi.net"
++    //  -> "%s.master.gs.wiimmfi.de"
++    {0x80435B68, &RPBE01_DATA[311], 29},
++    // "%s.gamestats.gs.nintendowifi.net"
++    //  -> "%s.gamestats.gs.wiimmfi.de"
++    {0x80435B88, &RPBE01_DATA[340], 32},
++    // "%s.gamestats2.gs.nintendowifi.net"
++    //  -> "%s.gamestats2.gs.wiimmfi.de"
++    {0x80435BAC, &RPBE01_DATA[372], 33},
++    // "%s.ms%d.gs.nintendowifi.net"
++    //  -> "%s.ms%d.gs.wiimmfi.de"
++    {0x80435BD0, &RPBE01_DATA[405], 27},
++    // "https://naswii.test.nintendowifi.net/ac"
++    //  -> "http://nas.test.wiimmfi.de/ac"
++    {0x80438FD0, &RPBE01_DATA[432], 39},
++    // "https://naswii.nintendowifi.net/ac"
++    //  -> "http://nas.wiimmfi.de/ac"
++    {0x80438FF8, &RPBE01_DATA[471], 34},
++    // "https://naswii.dev.nintendowifi.net/ac"
++    //  -> "http://nas.dev.wiimmfi.de/ac"
++    {0x8043901C, &RPBE01_DATA[505], 38},
++    // "RVL SDK/1.0"
++    //  -> "D-3-0"
++    {0x80439250, &RPBE01_DATA[543], 11},
++    // "%s.available.gs.nintendowifi.net"
++    //  -> "%s.available.gs.wiimmfi.de"
++    {0x804396D0, &RPBE01_DATA[554], 32},
++    // "gpcm.gs.nintendowifi.net"
++    //  -> "gpcm.gs.wiimmfi.de"
++    {0x80439AC0, &RPBE01_DATA[586], 24},
++    // "gpsp.gs.nintendowifi.net"
++    //  -> "gpsp.gs.wiimmfi.de"
++    {0x8043A4C8, &RPBE01_DATA[610], 24},
++    // "%s.master.gs.nintendowifi.net"
++    //  -> "%s.master.gs.wiimmfi.de"
++    {0x8043AC3C, &RPBE01_DATA[634], 29},
++    // "https://"
++    //  -> "http://"
++    {0x8043B210, &RPBE01_DATA[663], 8},
++    // "https://"
++    //  -> "http://"
++    {0x8043B220, &RPBE01_DATA[671], 8},
++    // "https://"
++    //  -> "http://"
++    {0x8043B4D8, &RPBE01_DATA[679], 8},
++    // "gamestats.gs.nintendowifi.net"
++    //  -> "gamestats.gs.wiimmfi.de"
++    {0x8043B5D8, &RPBE01_DATA[687], 29},
++    // "natneg1.gs.nintendowifi.net"
++    //  -> "natneg1.gs.wiimmfi.de"
++    {0x8043B800, &RPBE01_DATA[716], 27},
++    // "natneg2.gs.nintendowifi.net"
++    //  -> "natneg2.gs.wiimmfi.de"
++    {0x8043B81C, &RPBE01_DATA[743], 27},
++    // "natneg3.gs.nintendowifi.net"
++    //  -> "natneg3.gs.wiimmfi.de"
++    {0x8043B838, &RPBE01_DATA[770], 27},
++    // "%s.ms%d.gs.nintendowifi.net"
++    //  -> "%s.ms%d.gs.wiimmfi.de"
++    {0x8043B8C0, &RPBE01_DATA[797], 27},
++};
++
++// RPBP01 -- PAL, 30 writes, 824 bytes total.
++constexpr u8 RPBP01_DATA[] = {
++    0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F,
++    0x70, 0x6F, 0x6B, 0x65, 0x62, 0x61, 0x74, 0x74, 0x6C, 0x65, 0x77, 0x69, 0x69, 0x2F, 0x77, 0x65,
++    0x62, 0x2F, 0x70, 0x62, 0x72, 0x63, 0x68, 0x65, 0x63, 0x6B, 0x2F, 0x63, 0x68, 0x65, 0x63, 0x6B,
++    0x2E, 0x61, 0x73, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F,
++    0x2F, 0x00, 0x67, 0x70, 0x63, 0x6D, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x70, 0x73, 0x70, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x2E, 0x67, 0x73, 0x2E, 0x77,
++    0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67,
++    0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x61, 0x76, 0x61, 0x69, 0x6C, 0x61, 0x62, 0x6C, 0x65, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x31, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D,
++    0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6E, 0x61,
++    0x74, 0x6E, 0x65, 0x67, 0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69,
++    0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6E, 0x61, 0x74, 0x6E,
++    0x65, 0x67, 0x33, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x61, 0x73, 0x74, 0x65, 0x72,
++    0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x67, 0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73,
++    0x32, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x73, 0x25, 0x64, 0x2E, 0x67, 0x73, 0x2E,
++    0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++    0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x6E, 0x61, 0x73, 0x2E, 0x74, 0x65, 0x73, 0x74, 0x2E,
++    0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F, 0x61, 0x63, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x6E, 0x61,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x2F, 0x61, 0x63, 0x00,
++    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F,
++    0x6E, 0x61, 0x73, 0x2E, 0x64, 0x65, 0x76, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E,
++    0x64, 0x65, 0x2F, 0x61, 0x63, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x44,
++    0x2D, 0x33, 0x2D, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x61, 0x76, 0x61,
++    0x69, 0x6C, 0x61, 0x62, 0x6C, 0x65, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x67, 0x70, 0x63, 0x6D, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x67, 0x70, 0x73, 0x70, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66,
++    0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E, 0x6D, 0x61, 0x73,
++    0x74, 0x65, 0x72, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x68,
++    0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x68, 0x74, 0x74, 0x70, 0x3A, 0x2F, 0x2F, 0x00, 0x67,
++    0x61, 0x6D, 0x65, 0x73, 0x74, 0x61, 0x74, 0x73, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D,
++    0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E,
++    0x65, 0x67, 0x31, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64,
++    0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x32, 0x2E, 0x67,
++    0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00,
++    0x00, 0x00, 0x6E, 0x61, 0x74, 0x6E, 0x65, 0x67, 0x33, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69,
++    0x6D, 0x6D, 0x66, 0x69, 0x2E, 0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x25, 0x73, 0x2E,
++    0x6D, 0x73, 0x25, 0x64, 0x2E, 0x67, 0x73, 0x2E, 0x77, 0x69, 0x69, 0x6D, 0x6D, 0x66, 0x69, 0x2E,
++    0x64, 0x65, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++};
++
++constexpr MemoryWrite RPBP01_WRITES[] = {
++    // "http://gamestats2.gs.nintendowifi.net/pokebattlewii/web/pbrcheck/check.asp"
++    //  -> "http://gamestats2.gs.wiimmfi.de/pokebattlewii/web/pbrcheck/check.asp"
++    {0x80425298, &RPBP01_DATA[0], 74},
++    // "https://"
++    //  -> "http://"
++    {0x804460B8, &RPBP01_DATA[74], 8},
++    // "gpcm.gs.nintendowifi.net"
++    //  -> "gpcm.gs.wiimmfi.de"
++    {0x804467CC, &RPBP01_DATA[82], 24},
++    // "gpsp.gs.nintendowifi.net"
++    //  -> "gpsp.gs.wiimmfi.de"
++    {0x804467E8, &RPBP01_DATA[106], 24},
++    // "gamestats.gs.nintendowifi.net"
++    //  -> "gamestats.gs.wiimmfi.de"
++    {0x80446804, &RPBP01_DATA[130], 29},
++    // "gamestats2.gs.nintendowifi.net"
++    //  -> "gamestats2.gs.wiimmfi.de"
++    {0x80446824, &RPBP01_DATA[159], 30},
++    // "%s.available.gs.nintendowifi.net"
++    //  -> "%s.available.gs.wiimmfi.de"
++    {0x80446844, &RPBP01_DATA[189], 32},
++    // "%s.natneg1.gs.nintendowifi.net"
++    //  -> "%s.natneg1.gs.wiimmfi.de"
++    {0x80446868, &RPBP01_DATA[221], 30},
++    // "%s.natneg2.gs.nintendowifi.net"
++    //  -> "%s.natneg2.gs.wiimmfi.de"
++    {0x80446888, &RPBP01_DATA[251], 30},
++    // "%s.natneg3.gs.nintendowifi.net"
++    //  -> "%s.natneg3.gs.wiimmfi.de"
++    {0x804468A8, &RPBP01_DATA[281], 30},
++    // "%s.master.gs.nintendowifi.net"
++    //  -> "%s.master.gs.wiimmfi.de"
++    {0x804468C8, &RPBP01_DATA[311], 29},
++    // "%s.gamestats.gs.nintendowifi.net"
++    //  -> "%s.gamestats.gs.wiimmfi.de"
++    {0x804468E8, &RPBP01_DATA[340], 32},
++    // "%s.gamestats2.gs.nintendowifi.net"
++    //  -> "%s.gamestats2.gs.wiimmfi.de"
++    {0x8044690C, &RPBP01_DATA[372], 33},
++    // "%s.ms%d.gs.nintendowifi.net"
++    //  -> "%s.ms%d.gs.wiimmfi.de"
++    {0x80446930, &RPBP01_DATA[405], 27},
++    // "https://naswii.test.nintendowifi.net/ac"
++    //  -> "http://nas.test.wiimmfi.de/ac"
++    {0x80449D30, &RPBP01_DATA[432], 39},
++    // "https://naswii.nintendowifi.net/ac"
++    //  -> "http://nas.wiimmfi.de/ac"
++    {0x80449D58, &RPBP01_DATA[471], 34},
++    // "https://naswii.dev.nintendowifi.net/ac"
++    //  -> "http://nas.dev.wiimmfi.de/ac"
++    {0x80449D7C, &RPBP01_DATA[505], 38},
++    // "RVL SDK/1.0"
++    //  -> "D-3-0"
++    {0x80449FB0, &RPBP01_DATA[543], 11},
++    // "%s.available.gs.nintendowifi.net"
++    //  -> "%s.available.gs.wiimmfi.de"
++    {0x8044A430, &RPBP01_DATA[554], 32},
++    // "gpcm.gs.nintendowifi.net"
++    //  -> "gpcm.gs.wiimmfi.de"
++    {0x8044A820, &RPBP01_DATA[586], 24},
++    // "gpsp.gs.nintendowifi.net"
++    //  -> "gpsp.gs.wiimmfi.de"
++    {0x8044B228, &RPBP01_DATA[610], 24},
++    // "%s.master.gs.nintendowifi.net"
++    //  -> "%s.master.gs.wiimmfi.de"
++    {0x8044B99C, &RPBP01_DATA[634], 29},
++    // "https://"
++    //  -> "http://"
++    {0x8044BF70, &RPBP01_DATA[663], 8},
++    // "https://"
++    //  -> "http://"
++    {0x8044BF80, &RPBP01_DATA[671], 8},
++    // "https://"
++    //  -> "http://"
++    {0x8044C238, &RPBP01_DATA[679], 8},
++    // "gamestats.gs.nintendowifi.net"
++    //  -> "gamestats.gs.wiimmfi.de"
++    {0x8044C338, &RPBP01_DATA[687], 29},
++    // "natneg1.gs.nintendowifi.net"
++    //  -> "natneg1.gs.wiimmfi.de"
++    {0x8044C560, &RPBP01_DATA[716], 27},
++    // "natneg2.gs.nintendowifi.net"
++    //  -> "natneg2.gs.wiimmfi.de"
++    {0x8044C57C, &RPBP01_DATA[743], 27},
++    // "natneg3.gs.nintendowifi.net"
++    //  -> "natneg3.gs.wiimmfi.de"
++    {0x8044C598, &RPBP01_DATA[770], 27},
++    // "%s.ms%d.gs.nintendowifi.net"
++    //  -> "%s.ms%d.gs.wiimmfi.de"
++    {0x8044C620, &RPBP01_DATA[797], 27},
++};
++
++}  // namespace XDNetplay::PbrWiimmfi
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 99cd8cd..fb8f8ce 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -495,6 +495,8 @@
+     <ClInclude Include="Core\WC24PatchEngine.h" />
+     <ClInclude Include="Core\WiiRoot.h" />
+     <ClInclude Include="Core\WiiUtils.h" />
++    <ClInclude Include="Core\XDNetplay\PbrWiimmfi.h" />
++    <ClInclude Include="Core\XDNetplay\PbrWiimmfiData.h" />
+     <ClInclude Include="DiscIO\Blob.h" />
+     <ClInclude Include="DiscIO\CISOBlob.h" />
+     <ClInclude Include="DiscIO\CachedBlob.h" />
+@@ -1210,6 +1212,7 @@
+     <ClCompile Include="Core\WiiRoot.cpp" />
+     <ClCompile Include="Core\WiiUtils.cpp" />
+     <ClCompile Include="Core\WC24PatchEngine.cpp" />
++    <ClCompile Include="Core\XDNetplay\PbrWiimmfi.cpp" />
+     <ClCompile Include="DiscIO\Blob.cpp" />
+     <ClCompile Include="DiscIO\CISOBlob.cpp" />
+     <ClCompile Include="DiscIO\CachedBlob.cpp" />
+-- 
+2.39.5 (Apple Git-154)
+
