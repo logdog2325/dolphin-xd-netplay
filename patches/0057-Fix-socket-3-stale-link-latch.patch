@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Tue, 28 Jul 2026 10:23:50 -0700
-Subject: [PATCH] Fix socket 3 never linking: don't wedge a port on a stale
- link latch
+Subject: [PATCH] Fix socket 3 never linking, and lock the port once a battle
+ starts
 
 The auto-reset latch was set by (link_now && m_last_data_cmd != 0) and
 never cleared, so it only had to be true once to disable auto-reset on
@@ -17,14 +17,20 @@ before XD ever asks it anything, the window never reopens, and XD sits on
 "checking connection" for socket 3 forever. That matches the report:
 socket 2 links itself, socket 3 never does, in netplay and solo alike.
 
-Two changes make the latch honest and recoverable:
+Three changes:
 
 - Latch on link_now && handshake_active, so it takes a link window plus
   data that is actually flowing right now, not a link window plus the
   memory of a data command from some seconds ago.
-- Clear the latch when XD is probing again with no data for 30 s. During
-  a battle data flows continuously, so this cannot fire mid-fight; the
-  threshold is far above the 8 s handshake window for that reason.
+- Add a permanent battle lock, set once 64 data commands have crossed the
+  link. That only happens when XD has genuinely read a party, and nothing
+  clears it: no auto-reset can fire for the rest of the session. Rebooting
+  Emerald mid-battle drops the link and kills the fight with no message,
+  so that has to be impossible rather than merely unlikely. A stray probe
+  or a boot-time coincidence is a handful of commands and never gets near
+  the threshold.
+- Clear the (non-battle) latch when XD is probing again with no data for
+  30 s, so a port can never stay wedged before a battle has started.
 
 Also make the reset cooldown adaptive. The 6 s floor exists for the slow
 official-BIOS boot (4.78 s vs the bundled BIOS's 2.35 s), but once a link
@@ -32,15 +38,22 @@ window has been observed since the last reset the core has demonstrably
 booted, so the port can re-arm half a second after the window closes
 instead of waiting out the worst case again.
 ---
- Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 58 +++++++++++++++-------
- Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  1 +
- 2 files changed, 42 insertions(+), 17 deletions(-)
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 73 ++++++++++++++++------
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  5 ++
+ 2 files changed, 59 insertions(+), 19 deletions(-)
 
 diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
-index 2f79ac4..52f34de 100644
+index 2f79ac4..63088ba 100644
 --- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
 +++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
-@@ -90,19 +90,46 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+@@ -85,24 +85,62 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         m_last_cmd == EBufferCommands::CMD_WRITE_GBA)
+     {
+       m_last_data_cmd = m_timestamp_sent;
++      if (m_data_cmd_count < DATA_CMDS_FOR_BATTLE)
++        ++m_data_cmd_count;
+     }
+ 
      const u64 tps = static_cast<u64>(m_system.GetSystemTimers().GetTicksPerSecond());
      const bool link_now = m_core->IsLinkEnabled();
  
@@ -78,13 +91,22 @@ index 2f79ac4..52f34de 100644
 +    if (link_now && handshake_active)
        m_link_established = true;
  
++    // Once this much traffic has crossed the link, XD has genuinely read a party
++    // and the battle is underway. From here the port is locked: no auto-reset
++    // for the rest of the session, and no recovery path may re-arm it. Rebooting
++    // Emerald mid-battle drops the link and kills the fight with no message, so
++    // that outcome must be impossible rather than merely unlikely. A stray probe
++    // or a boot-time coincidence is a handful of commands and never gets close.
++    if (m_data_cmd_count >= DATA_CMDS_FOR_BATTLE)
++      m_battle_locked = true;
++
 +    // ...and the latch is not permanent. If XD is probing again with no data
 +    // having flowed for half a minute, the battle this latch was protecting is
 +    // over (or never started) and the port has to be recoverable. The threshold
 +    // is deliberately far longer than the 8 s handshake window: in-battle
 +    // animations can starve data commands for a while, and re-arming the reset
 +    // mid-fight is exactly the crash the latch exists to prevent.
-+    if (m_link_established && probing && !link_now &&
++    if (m_link_established && !m_battle_locked && probing && !link_now &&
 +        (m_last_data_cmd == 0 || m_timestamp_sent - m_last_data_cmd > tps * 30))
 +    {
 +      m_link_established = false;
@@ -93,15 +115,20 @@ index 2f79ac4..52f34de 100644
      // Silence the GBA until its link is actually established: the boot jingle
      // otherwise replays on every auto-reset while XD probes. Under netplay,
      // remote players' GBAs additionally stay muted for the whole session so
-@@ -116,19 +143,15 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
-     m_core->SetLinkAudioMuted(!m_link_established ||
+@@ -113,22 +151,18 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       m_netplay_pad_is_local = NetPlay::GetPadDetails(m_device_number).is_local;
+       m_netplay_locality_cached = true;
+     }
+-    m_core->SetLinkAudioMuted(!m_link_established ||
++    m_core->SetLinkAudioMuted((!m_link_established && !m_battle_locked) ||
                                (m_netplay_locality_cached && !m_netplay_pad_is_local));
  
 -    const bool probing = m_last_cmd == EBufferCommands::CMD_RESET ||
 -                         m_last_cmd == EBufferCommands::CMD_STATUS;
 -    const bool handshake_active =
 -        m_last_data_cmd != 0 && (m_timestamp_sent - m_last_data_cmd) < tps * 8;
-     if (probing && !link_now && !handshake_active && !m_link_established)
+-    if (probing && !link_now && !handshake_active && !m_link_established)
++    if (probing && !link_now && !handshake_active && !m_link_established && !m_battle_locked)
      {
 -      // Must exceed the slowest reset->link-window-open time or the cooldown
 -      // resets the core before Emerald's window ever opens (livelock).
@@ -120,7 +147,7 @@ index 2f79ac4..52f34de 100644
        const bool window_just_closed = m_link_was_enabled;
        const bool cooldown_elapsed =
            m_last_auto_reset == 0 || m_timestamp_sent - m_last_auto_reset > min_interval;
-@@ -154,6 +177,7 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+@@ -154,6 +188,7 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
            Pad::SetGBAReset(details.local_pad, true);
          }
          m_last_auto_reset = m_timestamp_sent;
@@ -129,14 +156,18 @@ index 2f79ac4..52f34de 100644
      }
      m_link_was_enabled = link_now;
 diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
-index 3dbb4fd..730402a 100644
+index 3dbb4fd..aff2220 100644
 --- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
 +++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
-@@ -47,6 +47,7 @@ private:
+@@ -47,6 +47,11 @@ private:
    u64 m_last_data_cmd = 0;
    bool m_link_was_enabled = false;
    bool m_link_established = false;
 +  bool m_window_seen_since_reset = false;
++  // Sustained joybus traffic means a real party exchange, not a stray probe.
++  static constexpr u32 DATA_CMDS_FOR_BATTLE = 64;
++  u32 m_data_cmd_count = 0;
++  bool m_battle_locked = false;
    bool m_netplay_pad_is_local = true;
    bool m_netplay_locality_cached = false;
    u16 m_keys = 0;
