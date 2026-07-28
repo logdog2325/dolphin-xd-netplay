@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
-Date: Tue, 28 Jul 2026 13:14:02 -0700
+Date: Tue, 28 Jul 2026 13:23:45 -0700
 Subject: [PATCH] PBR: show the Wii Remote overlay so the game is playable
 
 PBR is driven entirely by the Wii Remote pointer, but this fork ships the
@@ -19,18 +19,18 @@ config already uses.
  2 files changed, 27 insertions(+)
 
 diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
-index a9f189a..e4a904d 100644
+index 2dac8fb..82e866f 100644
 --- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
 +++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PbrLauncherActivity.kt
-@@ -151,6 +151,23 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+@@ -160,6 +160,23 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
          if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
              BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
          }
 +        // PBR is driven by the Wii Remote pointer, and this fork ships the touch
 +        // overlay off because XD is played with the handheld's physical buttons.
-+        // Without it PBR boots to a menu nothing can aim at, so turn the overlay
++        // Without it PBR boots to menus nothing can aim at, so turn the overlay
 +        // on and give it a Wii Remote to draw. The XD launcher turns it back off
-+        // when that mode is opened, so each mode gets the input it needs.
++        // when that mode opens, so each mode sets up the input it needs.
 +        if (!BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.boolean) {
 +            BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.setBoolean(NativeConfig.LAYER_BASE, true)
 +            changed = true
@@ -46,16 +46,16 @@ index a9f189a..e4a904d 100644
          if (changed) {
              NativeConfig.save(NativeConfig.LAYER_BASE)
          }
-@@ -171,6 +188,10 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
-         // dumps are usually USA (RPBE01) -- accept every region's ID.
+@@ -194,6 +211,10 @@ class PbrLauncherActivity : AppCompatActivity(), ThemeProvider {
+         // region's ID so the checklist can explain an unsupported one.
          val PBR_GAME_IDS = listOf("RPBE01", "RPBP01", "RPBJ01")
  
 +        // InputOverlay.OVERLAY_WIIMOTE / emulated Wiimote source.
 +        private const val OVERLAY_WIIMOTE = 1
 +        private const val WIIMOTE_SOURCE_EMULATED = 1
 +
-         fun findPbrGame() =
-             PBR_GAME_IDS.firstNotNullOfOrNull { GameFileCacheManager.getGameFileByGameId(it) }
+         // Regions we carry a Wiimmfi payload for; keep in sync with PbrWiimmfiData.h.
+         val SUPPORTED_PBR_GAME_IDS = listOf("RPBE01", "RPBP01")
  
 diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
 index 711f9a8..0764612 100644
