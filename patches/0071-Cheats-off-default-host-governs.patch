@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 13:55:23 -0700
+Subject: [PATCH 1/2] Cheats off by default; the host's choice governs both
+ players
+
+Previously the launchers force-enabled the $XD OU Fixes AR code on every
+launch and on every netplay start. That made cheats mandatory and, worse,
+a host/guest mismatch (one side forced on, the other in a different state)
+was a turn-1 desync risk.
+
+Now cheats are OFF by default on both platforms. A launcher control -- a
+checkbox on desktop, a switch on Android -- lets a player enable the
+$XD OU Fixes code. In netplay only the HOST'S choice matters: NETPLAY_SYNC_CODES
+stays on, so if the host enables the code it is synced to the guest and both
+run it; if the host leaves it off, both play clean. The code is never force
+-enabled anywhere, so the two sides can no longer disagree.
+
+This makes Orre Colosseum (cheat-off, its own in-save ruleset) the default
+experience while keeping the OU bring-6-pick-4 format one toggle away. PBR
+mode's own cheat handling is unchanged.
+---
+ .../features/xdnetplay/ui/XDLauncherActivity.kt | 17 +++++++++++------
+ .../features/xdnetplay/ui/XDLauncherScreen.kt   | 17 +++++++++++++++++
+ Source/Android/jni/NetPlay/Netplay.cpp          | 11 +++++------
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp    | 11 +++++++++++
+ .../Core/DolphinQt/XDNetplay/XDLauncherDialog.h |  1 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp     | 10 +++++-----
+ 6 files changed, 50 insertions(+), 17 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 07646128cf..32ac64c515 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -44,6 +44,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var controllerMapped by mutableStateOf(false)
+     private var biosLinkReady by mutableStateOf(false)
+     private var statusMessage by mutableStateOf<String?>(null)
++    private var cheatsEnabled by mutableStateOf(false)
+ 
+     /**
+      * Reads a picked file (extracting the first ROM out of a zip if needed),
+@@ -172,6 +173,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+                     onPlayXd = { bootXd() },
++                    cheatsEnabled = cheatsEnabled,
++                    onCheatsChanged = { on ->
++                        cheatsEnabled = on
++                        BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, on)
++                        NativeConfig.save(NativeConfig.LAYER_BASE)
++                    },
+                     onBattle = { NetplaySetupActivity.launch(this) },
+                     onFindBattles = { FindBattlesActivity.launch(this) },
+                     onOpenSettings = {
+@@ -233,6 +240,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     }
+ 
+     private fun refreshChecks() {
++        cheatsEnabled = BooleanSetting.MAIN_ENABLE_CHEATS.boolean
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+@@ -312,12 +320,9 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+         // The 2-year-stable papajefe XDNetplay bundle runs with cheats ON so the
+         // $XD OU Fixes AR code (enabled in the bundled GXXE01.ini) actually
+-        // applies -- it patches XD's battle-setup code and the OU GBA-vs-GBA
+-        // format depends on it. Match that for both solo boot and hosting; in
+-        // netplay the host's EnableCheats + SyncCodes carry it to the guest.
+-        if (!BooleanSetting.MAIN_ENABLE_CHEATS.boolean) {
+-            BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, true); changed = true
+-        }
++        // Cheats are off by default and controlled by the "$XD OU Fixes" switch
++        // on the launcher (host's choice syncs to the guest in netplay). Don't
++        // force them on here.
+         // PBR mode turns the touch overlay on for the Wii Remote pointer. XD is
+         // played with the handheld's physical buttons, so put it back.
+         if (BooleanSetting.MAIN_SHOW_INPUT_OVERLAY.boolean) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index a8e71d9328..9662cadd6d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -5,6 +5,7 @@ package org.dolphinemu.dolphinemu.features.xdnetplay.ui
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
++import androidx.compose.material3.Switch
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -48,6 +49,8 @@ fun XDLauncherScreen(
+     onTeamEditor: () -> Unit,
+     onPlayXd: () -> Unit,
+     onBattle: () -> Unit,
++    cheatsEnabled: Boolean,
++    onCheatsChanged: (Boolean) -> Unit,
+     onFindBattles: () -> Unit,
+     onOpenSettings: () -> Unit,
+     onOpenDolphin: () -> Unit
+@@ -116,6 +119,20 @@ fun XDLauncherScreen(
+                     Text("Boot Pokémon XD (solo)", style = MaterialTheme.typography.titleMedium)
+                 }
+                 Spacer(Modifier.height(12.dp))
++                Row(
++                    modifier = Modifier.fillMaxWidth(),
++                    verticalAlignment = Alignment.CenterVertically
++                ) {
++                    Column(Modifier.weight(1f)) {
++                        Text("\$XD OU Fixes cheat", style = MaterialTheme.typography.bodyLarge)
++                        Text(
++                            "Off by default. When you host, this applies to both players.",
++                            style = MaterialTheme.typography.bodySmall
++                        )
++                    }
++                    Switch(checked = cheatsEnabled, onCheckedChange = onCheatsChanged)
++                }
++                Spacer(Modifier.height(12.dp))
+                 Button(
+                     onClick = onBattle,
+                     enabled = xdGameFound,
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index 9746f22a22..ea18b067a0 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -239,12 +239,11 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeStartGame(J
+   Config::SetBaseOrCurrent(Config::NETPLAY_SAVEDATA_LOAD, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_HIDE_REMOTE_GBAS, true);
+ 
+-  // The stable XDNetplay bundle plays with the $XD OU Fixes AR code active, so
+-  // XD's battle setup runs the way the format expects. Enable cheats on the
+-  // host and sync the enabled-code list to the guest -- if only one side ran
+-  // the code the two would emulate XD differently and desync on turn 1. Both
+-  // sides carry the same GXXE01.ini (bundled) that defines and enables it.
+-  Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
++  // Cheats are off by default. Sync the enabled-code list from host to guest so
++  // the HOST'S choice governs both sides: if the host enabled the $XD OU Fixes
++  // code (OU format) it carries to the guest; if the host left cheats off, both
++  // run clean. Never force cheats on here -- a host/guest mismatch is exactly
++  // what desyncs turn 1, so the host is the single source of truth.
+   Config::SetBaseOrCurrent(Config::NETPLAY_SYNC_CODES, true);
+ 
+   // SetGBAConfig(update_rom=true) reads MAIN_GBA_ROM_PATHS[1]/[2] (pointed at
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index a05d2a839a..068a56300f 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -188,6 +188,13 @@ void XDLauncherDialog::CreateMainLayout()
+   battle_box->setLayout(battle_layout);
+   layout->addWidget(battle_box);
+ 
++  m_cheats_check = new QCheckBox(tr("Enable $XD OU Fixes cheat (OU format)"));
++  m_cheats_check->setToolTip(
++      tr("Off by default. When you HOST, this choice applies to both players.\n"
++         "Needed for the OU bring-6-pick-4 format; leave off for Orre Colosseum."));
++  m_cheats_check->setChecked(Config::Get(Config::MAIN_ENABLE_CHEATS));
++  layout->addWidget(m_cheats_check);
++
+   m_show_on_startup_check = new QCheckBox(tr("Show this launcher at startup"));
+   m_show_on_startup_check->setChecked(ShowOnStartup());
+   layout->addWidget(m_show_on_startup_check);
+@@ -221,6 +228,10 @@ void XDLauncherDialog::ConnectWidgets()
+   connect(m_browse_button, &QPushButton::clicked, this, [this] { emit BrowsePublic(); });
+   connect(m_team_editor_button, &QPushButton::clicked, this, &XDLauncherDialog::OnTeamEditor);
+ 
++  connect(m_cheats_check, &QCheckBox::toggled, this, [](bool checked) {
++    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, checked);
++    Config::Save();
++  });
+   connect(m_practice_dummy_check, &QCheckBox::toggled, this, [](bool checked) {
+     Config::SetBaseOrCurrent(Config::MAIN_GBA_PRACTICE_DUMMY, checked);
+     Config::Save();
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 689cab74dd..c36b9ffd81 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -85,6 +85,7 @@ private:
+   ChecklistRow m_gba_input_row;
+ 
+   QCheckBox* m_practice_dummy_check;
++  QCheckBox* m_cheats_check;
+   QCheckBox* m_show_on_startup_check;
+   QPushButton* m_boot_button;
+   QPushButton* m_host_button;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index abffe0b896..3768d6981a 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -75,8 +75,8 @@ bool EnsureGbaConfig()
+   Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(2),
+                            SerialInterface::SIDEVICE_GC_GBA_EMULATED);
+ 
+-  // The $XD OU Fixes code must be active locally even for solo boots.
+-  Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
++  // Cheats (the $XD OU Fixes code) are off by default now and governed by the
++  // launcher's "OU rules ($XD OU Fixes)" toggle; don't force them on here.
+ 
+   // Netplay tuned for the XD link: small fixed-delay buffer, no UPnP noise.
+   Config::SetBaseOrCurrent(Config::NETPLAY_BUFFER_SIZE, 5);
+@@ -115,11 +115,11 @@ void ApplyStartForcing(NetPlay::NetPlayServer* server)
+   gba_config[2].enabled = true;
+ 
+   // Sync the host's team saves to the guest, give each player only their own
+-  // GBA window, and keep the $XD OU Fixes code active and synced -- if only
+-  // one side ran it the two would desync on turn 1.
++  // Sync codes so the HOST's cheat choice governs both sides (if the host runs
++  // $XD OU Fixes, the guest gets it too; if not, both run clean). We no longer
++  // force cheats on -- the host's launcher toggle decides.
+   Config::SetBaseOrCurrent(Config::NETPLAY_SAVEDATA_LOAD, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_HIDE_REMOTE_GBAS, true);
+-  Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_SYNC_CODES, true);
+ 
+   // SetGBAConfig(update_rom=true) reads MAIN_GBA_ROM_PATHS[1]/[2] to fill each
+-- 
+2.39.5 (Apple Git-154)
+
