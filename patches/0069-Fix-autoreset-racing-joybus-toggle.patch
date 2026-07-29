@@ -1,0 +1,150 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 11:41:36 -0700
+Subject: [PATCH] GBA: stop the auto-reset from racing Emerald's own JOYBUS
+ toggle
+
+The auto-reset has been rebooting Emerald in the middle of the handshake
+it exists to enable, which is why the bundled open-source BIOS stopped
+being detected while an official dump still worked.
+
+Emerald's GameCubeMultiBoot_Init writes RCNT twice, two instructions
+apart -- JOYBUS off, then JOYBUS on -- and GameCubeMultiBoot_Main branches
+back into Init on every frame while the connection screen waits. So the
+link flag blinks continuously throughout a normal handshake attempt. The
+reset trigger treated any sample where the flag had just gone false as
+"the window closed", and that path deliberately bypassed the cooldown, so
+an SI probe landing in one of those two-instruction gaps rebooted the
+core. With thousands of probes per attempt it fired almost every time:
+link windows opening, resets climbing, and not one data command.
+
+The BIOS only shifted the phase. Reset-to-window is 2.35 s with the open
+BIOS and 4.78 s with the official one, which changes how the probe
+schedule lines up with Emerald's per-frame retries -- enough to look like
+a capability difference when it was a race all along. Two independent
+community builds link fine with no official dump: one ships this same
+BIOS image byte-for-byte, the other ships none at all and runs on the
+same mGBA commit we pin.
+
+Require the link to have been down for a full second before treating it
+as closed, and drop the falling-edge shortcut so resets are driven purely
+by the interval. A second swallows the per-frame toggling while still
+catching the real close at the end of the connection screen.
+
+Also make m_link_enabled a std::atomic_bool. The GBA event thread writes
+it on every RCNT mode change while the CPU thread reads it in the SI
+device; upstream never leaned on the value, but this fork does.
+---
+ Source/Core/Core/HW/GBACore.cpp            |  5 ++++-
+ Source/Core/Core/HW/GBACore.h              |  9 +++++++--
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 21 +++++++++++++++++----
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  1 +
+ 4 files changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 577aa0f3cb..6afc9c5cff 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -794,7 +794,10 @@ void Core::DoState(PointerWrap& p)
+   p.Do(m_last_gc_ticks);
+   p.Do(m_gc_ticks_remainder);
+   p.Do(m_keys);
+-  p.Do(m_link_enabled);
++  // m_link_enabled is atomic (cross-thread), so it can't go through p.Do directly.
++  bool link_enabled = m_link_enabled.load(std::memory_order_relaxed);
++  p.Do(link_enabled);
++  m_link_enabled.store(link_enabled, std::memory_order_relaxed);
+   p.Do(m_response_size);
+   p.Do(m_joybus_buffer);
+ 
+diff --git a/Source/Core/Core/HW/GBACore.h b/Source/Core/Core/HW/GBACore.h
+index e4dfe1c403..e63c6a44f5 100644
+--- a/Source/Core/Core/HW/GBACore.h
++++ b/Source/Core/Core/HW/GBACore.h
+@@ -3,6 +3,8 @@
+ 
+ #pragma once
+ 
++#include <atomic>
++
+ #ifdef HAS_LIBMGBA
+ 
+ #include <array>
+@@ -78,7 +80,7 @@ public:
+   // in a synchronous host frame callback.
+   void RequestReset(u64 gc_ticks);
+   bool IsStarted() const;
+-  bool IsLinkEnabled() const { return m_link_enabled; }
++  bool IsLinkEnabled() const { return m_link_enabled.load(std::memory_order_relaxed); }
+   CoreInfo GetCoreInfo() const;
+ 
+   // Host-side audio gate: while true this core's samples are dropped before
+@@ -164,7 +166,10 @@ private:
+   u64 m_last_gc_ticks = 0;
+   u64 m_gc_ticks_remainder = 0;
+   u16 m_keys = 0;
+-  bool m_link_enabled = false;
++  // Written by the GBA event thread on every RCNT mode change, read by the CPU
++  // thread in the SI device. Emerald toggles JOYBUS off/on two instructions
++  // apart, so this flips constantly during a handshake.
++  std::atomic_bool m_link_enabled{false};
+   bool m_force_disconnect = false;
+ 
+   std::weak_ptr<GBAHostInterface> m_host;
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index f8dfc81516..ef38463563 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -113,6 +113,17 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     const auto elapsed_since = [this](u64 then) -> u64 {
+       return (then == 0 || m_timestamp_sent < then) ? 0 : m_timestamp_sent - then;
+     };
++    // Emerald's GameCubeMultiBoot_Init turns JOYBUS mode OFF and immediately back
++    // ON (two adjacent stores to RCNT) and re-runs that every frame while it
++    // waits for the GameCube. The link flag therefore blinks constantly during a
++    // normal handshake, and an SI probe landing in one of those gaps used to
++    // look exactly like "the window just closed" -- which rebooted Emerald in
++    // the middle of the handshake it was trying to complete, thousands of times
++    // per attempt. Require the link to have been down for a full second before
++    // treating it as genuinely closed; that swallows the per-frame toggling
++    // while still noticing the real close at the end of the connection screen.
++    if (link_now)
++      m_last_link_seen = m_timestamp_sent;
+     const bool handshake_active = m_last_data_cmd != 0 && elapsed_since(m_last_data_cmd) < tps * 8;
+ 
+     // Count data commands only while the link is actually up, and only within
+@@ -180,13 +191,15 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       // Must exceed the slowest reset->link-window-open time, or the cooldown
+       // resets the core before Emerald's window ever opens (livelock). Measured:
+       // bundled open-source BIOS 2.35 s, official BIOS 4.78 s. The steady-state
+-      // cadence comes from the window_just_closed edge, so this floor only
+-      // gates the bootstrap and missed-edge recovery paths.
++      // cadence is now purely this interval, so keep it comfortably above the
++      // slowest boot while still retrying often enough to catch XD's probes.
+       const u64 min_interval = tps * 6;
+-      const bool window_just_closed = m_link_was_enabled;
++      // Timer only -- no falling-edge shortcut. The edge trigger is what raced
++      // Emerald's own RCNT toggling; a plain interval cannot.
++      const bool link_idle = m_last_link_seen == 0 || elapsed_since(m_last_link_seen) > tps;
+       const bool cooldown_elapsed =
+           m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > min_interval;
+-      if (window_just_closed || cooldown_elapsed)
++      if (link_idle && cooldown_elapsed)
+       {
+         if (!NetPlay::IsNetPlayRunning())
+         {
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 2146d325e0..e84ad8ab93 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -83,6 +83,7 @@ private:
+   u64 m_last_auto_reset = 0;
+   u64 m_last_data_cmd = 0;
+   bool m_link_was_enabled = false;
++  u64 m_last_link_seen = 0;
+   bool m_link_established = false;
+   // Sustained joybus traffic means a real party exchange, not a stray probe.
+   static constexpr u32 DATA_CMDS_FOR_BATTLE = 64;
+-- 
+2.39.5 (Apple Git-154)
+
