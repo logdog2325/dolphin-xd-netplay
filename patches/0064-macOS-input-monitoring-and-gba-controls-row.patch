@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 18:10:13 -0700
+Subject: [PATCH] macOS: ask for Input Monitoring, and make the GBA controls
+ row real
+
+Field report: a tester's keyboard did nothing at all in a netplay match on
+macOS, with no error anywhere.
+
+Cause: the Quartz backend reads the keyboard with CGEventSourceKeyState,
+which macOS answers as "no keys pressed" until the app holds Input
+Monitoring permission. Nothing in the tree ever requested it, and an
+unsigned build a tester drags out of a zip has never been granted it, so
+every key silently does nothing. Their other (long-installed) emulator
+worked, which made it look like a mapping problem.
+
+- Request Input Monitoring when the backend populates devices, so the
+  system prompt appears (and the app lands in Privacy & Security) instead
+  of failing silently. Log a clear warning if it is refused.
+- Declare NSInputMonitoringUsageDescription so the prompt explains itself.
+- Link IOKit into inputcommon for IOHIDRequestAccess/IOHIDCheckAccess.
+
+The launcher's "GBA input" row was informational, which was no help to
+someone whose controls were dead. It now reports whether GBA 1 actually
+has a mapping and offers a one-click "Use defaults" that applies the
+standard keyboard layout and spells it out, since the joiner's GBA being
+"GBA 1" rather than GBA 3 is its own source of confusion.
+---
+ Source/Core/DolphinQt/Info.plist.in           |  2 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 30 ++++++++++++--
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  1 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   | 40 +++++++++++++++++++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |  6 +++
+ Source/Core/InputCommon/CMakeLists.txt        |  1 +
+ .../ControllerInterface/Quartz/Quartz.mm      | 29 ++++++++++++++
+ 7 files changed, 105 insertions(+), 4 deletions(-)
+
+diff --git a/Source/Core/DolphinQt/Info.plist.in b/Source/Core/DolphinQt/Info.plist.in
+index 034d472a1d..96137af3ea 100644
+--- a/Source/Core/DolphinQt/Info.plist.in
++++ b/Source/Core/DolphinQt/Info.plist.in
+@@ -30,6 +30,8 @@
+             <string>Viewer</string>
+         </dict>
+     </array>
++    <key>NSInputMonitoringUsageDescription</key>
++    <string>Dolphin reads the keyboard directly so it can be used as a game controller. Without this permission keyboard controls do nothing.</string>
+     <key>CFBundleExecutable</key>
+     <string>DolphinQt</string>
+     <key>CFBundleIconFile</key>
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 94d45409d5..924b549e90 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -161,9 +161,7 @@ void XDLauncherDialog::CreateMainLayout()
+   add_row(&m_bios_row, tr("Official GBA BIOS"), tr("Choose BIOS..."));
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+-  add_row(&m_gba_input_row, tr("GBA input"), tr("Controllers..."));
+-  m_gba_input_row.status->setText(QStringLiteral("•"));
+-  m_gba_input_row.status->setStyleSheet(QString());
++  add_row(&m_gba_input_row, tr("GBA controls"), tr("Use defaults"));
+   checklist_layout->setColumnStretch(1, 1);
+   checklist_box->setLayout(checklist_layout);
+   layout->addWidget(checklist_box);
+@@ -209,6 +207,8 @@ void XDLauncherDialog::ConnectWidgets()
+   connect(m_game_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixGamePath);
+   connect(m_rom_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixEmeraldRom);
+   connect(m_bios_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixBios);
++  connect(m_gba_input_row.fix_button, &QPushButton::clicked, this,
++          &XDLauncherDialog::OnFixGbaInput);
+   connect(m_team_saves_row.fix_button, &QPushButton::clicked, this,
+           &XDLauncherDialog::OnFixTeamSaves);
+   connect(m_vs_save_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixVsSave);
+@@ -261,7 +261,11 @@ void XDLauncherDialog::RefreshChecklist()
+           tr("Official GBA BIOS required — XD cannot detect the GBA without it"));
+   SetRowState(m_team_saves_row.status, TeamSavesInstalled());
+   SetRowState(m_vs_save_row.status, VsSaveInstalled());
+-  // m_gba_input_row stays informational.
++  const bool input_mapped = XDNetplay::GbaInputMapped();
++  SetRowState(m_gba_input_row.status, input_mapped);
++  m_gba_input_row.description->setText(
++      input_mapped ? tr("GBA controls mapped (your GBA is \"GBA 1\" in Controllers)") :
++                     tr("GBA controls not mapped — your GBA will not respond to input"));
+ }
+ 
+ void XDLauncherDialog::AutoDiscoverFromGameFolder()
+@@ -340,6 +344,24 @@ void XDLauncherDialog::OnFixGamePath()
+ }
+ 
+ 
++void XDLauncherDialog::OnFixGbaInput()
++{
++  if (!XDNetplay::ApplyDefaultGbaInput())
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("Could not set default GBA controls. Map them under Controllers > GBA Ports > GBA 1."));
++    return;
++  }
++  ModalMessageBox::information(
++      this, tr("XD Netplay"),
++      tr("Default GBA controls applied to GBA 1:\n\n"
++         "A = X,  B = Z,  Start = Enter,  Select = Backspace\n"
++         "D-Pad = T / G / F / H,  L = Q,  R = W\n\n"
++         "Change them any time under Controllers > GBA Ports > GBA 1."));
++  RefreshChecklist();
++}
++
+ void XDLauncherDialog::OnFixBios()
+ {
+   const QString path = QFileDialog::getOpenFileName(this, tr("Select the official GBA BIOS"),
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 97369d9a34..689cab74dd 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -65,6 +65,7 @@ private:
+   void OnFixGamePath();
+   void OnFixEmeraldRom();
+   void OnFixBios();
++  void OnFixGbaInput();
+   void OnFixTeamSaves();
+   void OnFixVsSave();
+   void OnGbaInputInfo();
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 58502e60a7..abffe0b896 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -13,7 +13,15 @@
+ #include "Common/IOFile.h"
+ #include "Common/StringUtil.h"
+ 
++#include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
++#include "InputCommon/ControllerEmu/ControllerEmu.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/ControlReference/ControlReference.h"
++#include "InputCommon/InputConfig.h"
++
+ #include "Core/Config/MainSettings.h"
++#include "Core/HW/GBAPad.h"
++#include "Core/HW/GBAPadEmu.h"
+ #include "Core/Config/NetplaySettings.h"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/SI/SI_Device.h"
+@@ -195,6 +203,38 @@ bool AutoImportOfficialBios(const std::string& directory)
+   return false;
+ }
+ 
++bool GbaInputMapped()
++{
++  if (!Pad::IsGBAInitialized())
++    return false;
++
++  const ControllerEmu::ControlGroup* buttons = Pad::GetGBAGroup(0, GBAPadGroup::Buttons);
++  if (!buttons)
++    return false;
++
++  for (const auto& control : buttons->controls)
++  {
++    if (control->control_ref && !control->control_ref->GetExpression().empty())
++      return true;
++  }
++  return false;
++}
++
++bool ApplyDefaultGbaInput()
++{
++  if (!Pad::IsGBAInitialized())
++    return false;
++
++  InputConfig* const config = Pad::GetGBAConfig();
++  ControllerEmu::EmulatedController* const controller = config->GetController(0);
++  if (!controller)
++    return false;
++
++  controller->LoadDefaults(g_controller_interface);
++  config->SaveConfig();
++  return GbaInputMapped();
++}
++
+ bool SeedTeamSaves()
+ {
+ #ifdef HAS_LIBMGBA
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index ff94cc1e32..783d050d0e 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -57,6 +57,12 @@ bool AutoImportOfficialBios(const std::string& directory);
+ // GBA user dir + config). Returns false if it is not the official dump.
+ bool ImportOfficialBios(const std::string& path);
+ 
++// True when the local player's GBA (GBA 1) has at least one button mapped.
++bool GbaInputMapped();
++
++// Loads Dolphin's default keyboard/controller mapping onto GBA 1 and saves it.
++bool ApplyDefaultGbaInput();
++
+ // Copy the bundled EMERALD-2/3.sav templates next to the imported Emerald
+ // dump's derived save paths for ports 2 and 3. Existing saves are never
+ // overwritten; missing Sys templates are tolerated.
+diff --git a/Source/Core/InputCommon/CMakeLists.txt b/Source/Core/InputCommon/CMakeLists.txt
+index 0e5612f353..d2dcf45657 100644
+--- a/Source/Core/InputCommon/CMakeLists.txt
++++ b/Source/Core/InputCommon/CMakeLists.txt
+@@ -120,6 +120,7 @@ elseif(APPLE)
+     ${CARBON_LIBRARY}
+     ${COCOA_LIBRARY}
+     ${FORCEFEEDBACK_LIBRARY}
++    ${IOK_LIBRARY}
+   )
+   target_compile_options(inputcommon PRIVATE
+     -fobjc-arc
+diff --git a/Source/Core/InputCommon/ControllerInterface/Quartz/Quartz.mm b/Source/Core/InputCommon/ControllerInterface/Quartz/Quartz.mm
+index e0a504604a..b228290756 100644
+--- a/Source/Core/InputCommon/ControllerInterface/Quartz/Quartz.mm
++++ b/Source/Core/InputCommon/ControllerInterface/Quartz/Quartz.mm
+@@ -3,6 +3,9 @@
+ 
+ #include "InputCommon/ControllerInterface/Quartz/Quartz.h"
+ 
++#include <IOKit/hidsystem/IOHIDLib.h>
++
++#include "Common/Logging/Log.h"
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
+ #include "InputCommon/ControllerInterface/Quartz/QuartzKeyboardAndMouse.h"
+ 
+@@ -41,6 +44,32 @@
+   if (wsi.type != WindowSystemType::MacOS)
+     return;
+ 
++  // The keyboard is read with CGEventSourceKeyState, which macOS silently
++  // answers "nothing is pressed" for until the app holds Input Monitoring
++  // permission -- keyboard controls simply do nothing, with no error anywhere.
++  // Asking for it here surfaces the system prompt (and the entry in Privacy &
++  // Security) the first time input is set up, instead of leaving the user with
++  // a dead keyboard. Only prompts once; later launches return the stored answer.
++  static bool s_requested_input_monitoring = false;
++  if (!s_requested_input_monitoring)
++  {
++    s_requested_input_monitoring = true;
++    if (__builtin_available(macOS 10.15, *))
++    {
++      if (IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted)
++      {
++        const bool granted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
++        if (!granted)
++        {
++          WARN_LOG_FMT(CONTROLLERINTERFACE,
++                       "Input Monitoring permission not granted; keyboard controls will not "
++                       "respond. Enable Dolphin under System Settings > Privacy & Security > "
++                       "Input Monitoring, then restart Dolphin.");
++        }
++      }
++    }
++  }
++
+   GetControllerInterface().AddDevice(std::make_shared<KeyboardAndMouse>(wsi.render_window));
+ }
+ 
+-- 
+2.39.5 (Apple Git-154)
+
