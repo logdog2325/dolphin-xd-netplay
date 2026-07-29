@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 14:05:45 -0700
+Subject: [PATCH 2/2] Zero-BIOS confirmed: bundled BIOS works, official never
+ required
+
+The quiet-window reset fix (SI_DeviceGBAEmu) let the bundled open-source
+BIOS complete XD's handshake on device, so the official dump is no longer
+required. The launcher BIOS rows say so again on both platforms (optional,
+green either way).
+
+In netplay, force the bundled BIOS on every GBA core: it is byte-identical
+on all clients, so no player needs any BIOS file and an official dump on
+one side can never desync against a bundled one on the other. Solo still
+uses a configured official dump if present. Correct the stale comments
+that blamed the BIOS content -- the auto-reset race was always the cause.
+
+Also ship the Adreno graphics stability preset for XD (GXXE01.ini):
+ShaderCompilationMode = 0 + WaitForShadersBeforeStarting to stop the
+ubershader GPU submissions that trip Adreno's watchdog mid-battle
+(VK_ERROR_DEVICE_LOST, which Dolphin cannot recover from), plus native
+resolution and CPU culling for thermal headroom. None affect determinism.
+---
+ Data/Sys/GameSettings/GXXE01.ini              | 14 ++++-
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  7 ++-
+ Source/Core/Core/HW/GBACore.cpp               | 56 ++++++-------------
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 18 +++---
+ 4 files changed, 42 insertions(+), 53 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index f53ccb8c7a..f0e9c182ad 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -44,5 +44,15 @@ $16:9 Widescreen
+ $60 FPS
+ 
+ [Video_Settings]
+-InternalResolution = 2
+-ShaderCompilationMode = 2
+\ No newline at end of file
++# Stability preset for Adreno (AYN Thor). The GameCube renders on the top
++# screen via Vulkan; ubershaders (ShaderCompilationMode = 2) produce GPU
++# submissions long enough to trip Adreno's watchdog when a new move/effect
++# first appears mid-battle -> VK_ERROR_DEVICE_LOST, which Dolphin cannot
++# recover from (the top screen freezes for the session). Specialized
++# shaders + pre-warming the cache avoid that entirely; native resolution
++# and CPU-side culling give thermal/submission headroom. None of these
++# affect netplay determinism.
++ShaderCompilationMode = 0
++WaitForShadersBeforeStarting = True
++InternalResolution = 1
++CPUCull = True
+\ No newline at end of file
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 9662cadd6d..7c680875ec 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -209,9 +209,10 @@ private fun ReadinessCard(
+                 onFix = onOpenSettings
+             )
+             CheckRow(
+-                ok = biosLinkReady,
+-                okText = "Official GBA BIOS configured",
+-                missingText = "Official GBA BIOS required — the game cannot detect the GBA without it",
++                ok = true,
++                okText = if (biosLinkReady) "GBA BIOS: using your official dump"
++                         else "GBA BIOS: none needed — the bundled one works (optional)",
++                missingText = "",
+                 fixLabel = "Choose BIOS…",
+                 onFix = onPickGbaBios
+             )
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 6afc9c5cff..21e97ef8fe 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -233,21 +233,12 @@ bool Core::Start(u64 gc_ticks)
+ 
+   if (m_core->platform(m_core) == mPLATFORM_GBA)
+   {
+-    // BIOS selection is detection-critical, and the rule is: the official dump
+-    // if the user has it, otherwise NO bios file at all (mGBA's HLE BIOS).
+-    //
+-    // Measured in a standalone mGBA harness at this core's pinned commit, and
+-    // consistent with the on-device reports: XD's GameCube-side detection is the
+-    // SDK JoyBoot ladder, which requires the JOY-bus status byte to equal exactly
+-    // 0x08 (SEND) right after its reset command. That bit is only set when the
+-    // GBA writes JOY_TRANS, which Emerald does via RegisterRamReset at startup.
+-    // The bundled open-source BIOS is an old build whose RegisterRamReset is
+-    // missing the SIO branch, so JOY_TRANS is never written, the status byte
+-    // stays 0x00, and the ladder aborts before it ever transfers anything --
+-    // exactly the "window opens, thousands of probes, no handshake" telemetry.
+-    // mGBA's HLE BIOS performs that SIO reset correctly and was detected on the
+-    // first attempt in the harness, with the shortest boot-to-window time of any
+-    // mode tested. So loading the bundled BIOS can only hurt: never do it.
++    // BIOS selection. XD detects the emulated GBA with either the official dump
++    // or the bundled open-source BIOS -- confirmed on device once the auto-reset
++    // stopped racing Emerald's connection handshake (that race, not the BIOS,
++    // was why detection used to fail; see SI_DeviceGBAEmu's quiet-window reset).
++    // So an official dump is never required. Solo uses it if present for
++    // accuracy; otherwise the bundled BIOS boots the GBA.
+     const std::string user_bios = File::GetUserPath(F_GBABIOS_IDX);
+     bool official_bios = false;
+     {
+@@ -266,16 +257,19 @@ bool Core::Start(u64 gc_ticks)
+       }
+     }
+ 
+-    // Without an official dump, fall back to the BIOS bundled in Sys. That file
+-    // is now a current Cult-of-GBA build, which contains the RegisterRamReset
+-    // SIO branch (the 0x04000120 reset) that the previous bundled build was
+-    // missing -- the missing reset is why the old one could never be detected.
+-    // mGBA's HLE BIOS was tried here first and behaved the same as the old
+-    // bundled build on device (link window opens, handshake never starts), so
+-    // an actual BIOS image it is. Bundled means byte-identical on every client,
+-    // which also keeps netplay deterministic when nobody has an official dump.
+     const std::string sys_bios = File::GetSysDirectory() + "GBA" DIR_SEP "gba_bios.bin";
+-    if (official_bios)
++
++    // Netplay mirrors every GBA on every client, so every client must boot the
++    // exact same BIOS or they diverge. Force the bundled image, which is
++    // byte-identical everywhere: no player needs a BIOS file, and an official
++    // dump on one side can't desync against a bundled one on the other.
++    if (NetPlay::IsNetPlayRunning() && File::Exists(sys_bios))
++    {
++      LoadBIOS(sys_bios.c_str());
++      NOTICE_LOG_FMT(CORE, "GBA{} netplay: bundled BIOS (identical on all clients)",
++                     m_device_number + 1);
++    }
++    else if (official_bios)
+     {
+       LoadBIOS(user_bios.c_str());
+     }
+@@ -283,20 +277,6 @@ bool Core::Start(u64 gc_ticks)
+     {
+       LoadBIOS(sys_bios.c_str());
+     }
+-
+-    // Netplay mirrors every GBA on every client, so all clients have to boot the
+-    // same way. That holds when everyone has the official dump, and equally when
+-    // nobody does (the bundled image is identical everywhere) -- a mix diverges.
+-    if (NetPlay::IsNetPlayRunning())
+-    {
+-      NOTICE_LOG_FMT(CORE, "GBA{} netplay BIOS mode: {}", m_device_number + 1,
+-                     official_bios ? "official dump" : "bundled open-source BIOS");
+-      // Show it, so two players can compare at a glance if a session misbehaves.
+-      OSD::AddMessage(fmt::format("GBA{}: BIOS mode {} - both players must be on the same mode.",
+-                                  m_device_number + 1,
+-                                  official_bios ? "OFFICIAL" : "BUNDLED"),
+-                      OSD::Duration::VERY_LONG, OSD::Color::CYAN);
+-    }
+   }
+ 
+   if (rom)
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 068a56300f..a04d67b047 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -158,7 +158,7 @@ void XDLauncherDialog::CreateMainLayout()
+   };
+   add_row(&m_game_row, tr("Pokémon XD (USA) — choose your XD ISO file"), tr("Choose ISO..."));
+   add_row(&m_rom_row, tr("Emerald ROM configured"), tr("Choose ROM..."));
+-  add_row(&m_bios_row, tr("Official GBA BIOS"), tr("Choose BIOS..."));
++  add_row(&m_bios_row, tr("GBA BIOS (optional)"), tr("Choose BIOS..."));
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+   add_row(&m_gba_input_row, tr("GBA controls"), tr("Use defaults"));
+@@ -265,17 +265,15 @@ void XDLauncherDialog::RefreshChecklist()
+ 
+   SetRowState(m_game_row.status, FindXdGame() != nullptr);
+   SetRowState(m_rom_row.status, EmeraldRomConfigured());
+-  // Required, and settled the hard way: the official dump is the only BIOS the
+-  // game will accept. Its boot code contains Nintendo's own JoyBus listener,
+-  // which is what answers the GameCube's handshake -- no open-source BIOS
+-  // reimplements it, and mGBA's HLE BIOS does not either. Tested on device:
+-  // the old bundled build, a current Cult-of-GBA build and HLE all leave the
+-  // link window opening while the handshake never starts.
++  // Not required. The bundled open-source BIOS links fine now that the
++  // auto-reset no longer races Emerald's connection handshake (the reset was
++  // the real problem, never the BIOS). An official dump is still used if the
++  // user has one; otherwise the bundled BIOS boots the GBA.
+   const bool official_bios = XDNetplay::CheckOfficialBios(nullptr);
+-  SetRowState(m_bios_row.status, official_bios);
++  SetRowState(m_bios_row.status, true);
+   m_bios_row.description->setText(
+-      official_bios ? tr("Official GBA BIOS configured") :
+-                      tr("Official GBA BIOS required — the game cannot detect the GBA without it"));
++      official_bios ? tr("GBA BIOS: using your official dump") :
++                      tr("GBA BIOS: none needed — the bundled one works (optional)"));
+   SetRowState(m_team_saves_row.status, TeamSavesInstalled());
+   SetRowState(m_vs_save_row.status, VsSaveInstalled());
+   const bool input_mapped = XDNetplay::GbaInputMapped();
+-- 
+2.39.5 (Apple Git-154)
+
