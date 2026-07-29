@@ -1,0 +1,203 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 28 Jul 2026 22:34:38 -0700
+Subject: [PATCH] GBA: boot on the HLE BIOS unless the user has the official
+ dump
+
+Removes the BIOS download from setup. The rule is now: load the official
+dump if the user has it, otherwise load no BIOS file at all and let mGBA's
+HLE BIOS boot the cartridge. The bundled open-source BIOS is never loaded.
+
+Measured in a standalone mGBA harness at this core's pinned commit, and
+consistent with what the on-device telemetry showed: XD's detection is the
+SDK JoyBoot ladder, which requires the JOY-bus status byte to equal exactly
+0x08 (SEND) immediately after its reset command. That bit is set only when
+the GBA writes JOY_TRANS, which Emerald does through RegisterRamReset at
+startup. The bundled BIOS is an old build whose RegisterRamReset is missing
+the SIO branch entirely, so JOY_TRANS is never written, the status byte
+stays 0x00, and the ladder aborts before transferring anything -- exactly
+the "window opens, thousands of probes, no handshake" field report. mGBA's
+HLE BIOS performs that reset correctly, was detected on the first attempt,
+and reaches the link window faster than either real BIOS.
+
+Netplay mirrors every GBA on every client, so all clients must boot the
+same way. That holds when everyone has the official dump and equally when
+nobody does; a mix is what diverges, so the BIOS mode is now printed on
+screen at session start for both players to compare.
+
+The launcher checklists stop demanding a BIOS on both platforms: the row
+is informational, green either way, and keeps its picker for anyone who
+prefers to run their own dump.
+---
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 12 ++-
+ Source/Core/Core/HW/GBACore.cpp               | 81 ++++++++++++-------
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 13 +--
+ 3 files changed, 67 insertions(+), 39 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 71f42c9b35..d80592a9dd 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -192,9 +192,15 @@ private fun ReadinessCard(
+                 onFix = onOpenSettings
+             )
+             CheckRow(
+-                ok = biosLinkReady,
+-                okText = "Official GBA BIOS configured (XD can detect the GBA)",
+-                missingText = "Official GBA BIOS required — XD cannot detect the GBA without it. Choose your own dump",
++                // Never a blocker: with no BIOS file the GBA boots on the
++                // emulator's built-in HLE BIOS, which XD detects.
++                ok = true,
++                okText = if (biosLinkReady) {
++                    "GBA BIOS: using your official dump"
++                } else {
++                    "GBA BIOS: none needed — booting without one (optional)"
++                },
++                missingText = "",
+                 fixLabel = "Choose BIOS…",
+                 onFix = onPickGbaBios
+             )
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 1880ea2890..b2105d18b0 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -52,6 +52,7 @@ mLogger s_stub_logger = {
+ }  // namespace
+ 
+ constexpr size_t AUDIO_BUFFER_SIZE = 512;
++constexpr u64 GBA_BIOS_SIZE = 16384;
+ 
+ // libmGBA does not return the correct frequency for some GB models
+ static u32 GetCoreFrequency(mCore* core)
+@@ -232,47 +233,65 @@ bool Core::Start(u64 gc_ticks)
+ 
+   if (m_core->platform(m_core) == mPLATFORM_GBA)
+   {
+-    std::string bios_path = File::GetUserPath(F_GBABIOS_IDX);
+-    const std::string sys_bios = File::GetSysDirectory() + "GBA" DIR_SEP "gba_bios.bin";
+-    if (!File::Exists(bios_path) && File::Exists(sys_bios))
++    // BIOS selection is detection-critical, and the rule is: the official dump
++    // if the user has it, otherwise NO bios file at all (mGBA's HLE BIOS).
++    //
++    // Measured in a standalone mGBA harness at this core's pinned commit, and
++    // consistent with the on-device reports: XD's GameCube-side detection is the
++    // SDK JoyBoot ladder, which requires the JOY-bus status byte to equal exactly
++    // 0x08 (SEND) right after its reset command. That bit is only set when the
++    // GBA writes JOY_TRANS, which Emerald does via RegisterRamReset at startup.
++    // The bundled open-source BIOS is an old build whose RegisterRamReset is
++    // missing the SIO branch, so JOY_TRANS is never written, the status byte
++    // stays 0x00, and the ladder aborts before it ever transfers anything --
++    // exactly the "window opens, thousands of probes, no handshake" telemetry.
++    // mGBA's HLE BIOS performs that SIO reset correctly and was detected on the
++    // first attempt in the harness, with the shortest boot-to-window time of any
++    // mode tested. So loading the bundled BIOS can only hurt: never do it.
++    const std::string user_bios = File::GetUserPath(F_GBABIOS_IDX);
++    bool official_bios = false;
+     {
+-      // Fall back to a BIOS bundled in the Sys directory, if present.
+-      bios_path = sys_bios;
+-    }
+-    // Field-verified on device: XD/Colosseum never detect an Emerald booted by
+-    // the bundled open-source BIOS on this core -- the link window opens (RCNT
+-    // goes joybus) and the GC probes it thousands of times without ever
+-    // starting the handshake, while the same setup with an official BIOS dump
+-    // links within seconds. An earlier revision forced the bundled BIOS during
+-    // netplay for cross-client determinism, which silently guaranteed that
+-    // failure for everyone. Netplay clients must instead all supply the same
+-    // official dump (the launchers require it); warn loudly when a session is
+-    // about to run without one, because the GBA will not be detected.
+-    if (NetPlay::IsNetPlayRunning())
+-    {
+-      bool official = false;
+-      File::IOFile f(bios_path, "rb");
+-      if (f && f.GetSize() == 16384)
++      File::IOFile f(user_bios, "rb");
++      if (f && f.GetSize() == GBA_BIOS_SIZE)
+       {
+-        std::vector<u8> data(16384);
++        std::vector<u8> data(GBA_BIOS_SIZE);
+         if (f.ReadBytes(data.data(), data.size()))
+         {
+           static constexpr Common::SHA1::Digest OFFICIAL_GBA_BIOS_SHA1 = {
+               0x30, 0x0c, 0x20, 0xdf, 0x67, 0x31, 0xa3, 0x39, 0x52, 0xde,
+               0xd8, 0xc4, 0x36, 0xf7, 0xf1, 0x86, 0xd2, 0x5d, 0x34, 0x92};
+-          official = Common::SHA1::CalculateDigest(data.data(), data.size()) ==
+-                     OFFICIAL_GBA_BIOS_SHA1;
++          official_bios =
++              Common::SHA1::CalculateDigest(data.data(), data.size()) == OFFICIAL_GBA_BIOS_SHA1;
+         }
+       }
+-      if (!official)
+-      {
+-        OSD::AddMessage(fmt::format("GBA{}: no official GBA BIOS configured - the game will "
+-                                    "likely not detect this GBA. Set one in the launcher.",
+-                                    m_device_number + 1),
+-                        OSD::Duration::VERY_LONG, OSD::Color::RED);
+-      }
+     }
+-    LoadBIOS(bios_path.c_str());
++
++    if (official_bios)
++    {
++      LoadBIOS(user_bios.c_str());
++    }
++    else if (!user_bios.empty() && File::Exists(user_bios))
++    {
++      OSD::AddMessage(
++          fmt::format("GBA{}: the configured GBA BIOS is not the official dump - ignoring it and "
++                      "booting without a BIOS, which the game detects correctly.",
++                      m_device_number + 1),
++          OSD::Duration::VERY_LONG, OSD::Color::YELLOW);
++    }
++
++    // Netplay mirrors every GBA on every client, so all clients have to boot the
++    // same way. That holds when everyone has the official dump, and equally when
++    // nobody does (HLE on both sides) -- a mix is what diverges.
++    if (NetPlay::IsNetPlayRunning())
++    {
++      NOTICE_LOG_FMT(CORE, "GBA{} netplay BIOS mode: {}", m_device_number + 1,
++                     official_bios ? "official dump" : "HLE (no BIOS file)");
++      // Show it, so two players can compare at a glance if a session misbehaves.
++      OSD::AddMessage(fmt::format("GBA{}: BIOS mode {} - both players must be on the same mode.",
++                                  m_device_number + 1,
++                                  official_bios ? "OFFICIAL" : "HLE (no BIOS file)"),
++                      OSD::Duration::VERY_LONG, OSD::Color::CYAN);
++    }
+   }
+ 
+   if (rom)
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 924b549e90..626c5f6d7a 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -158,7 +158,7 @@ void XDLauncherDialog::CreateMainLayout()
+   };
+   add_row(&m_game_row, tr("Pokémon XD (USA) — choose your XD ISO file"), tr("Choose ISO..."));
+   add_row(&m_rom_row, tr("Emerald ROM configured"), tr("Choose ROM..."));
+-  add_row(&m_bios_row, tr("Official GBA BIOS"), tr("Choose BIOS..."));
++  add_row(&m_bios_row, tr("GBA BIOS (optional)"), tr("Choose BIOS..."));
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+   add_row(&m_gba_input_row, tr("GBA controls"), tr("Use defaults"));
+@@ -254,11 +254,14 @@ void XDLauncherDialog::RefreshChecklist()
+ 
+   SetRowState(m_game_row.status, FindXdGame() != nullptr);
+   SetRowState(m_rom_row.status, EmeraldRomConfigured());
+-  SetRowState(m_bios_row.status, XDNetplay::CheckOfficialBios(nullptr));
++  // Not a requirement any more: with no BIOS file the GBA boots on mGBA's
++  // built-in HLE BIOS, which XD detects (and which boots faster than a real
++  // dump). An official dump is still honoured if the user has one.
++  const bool official_bios = XDNetplay::CheckOfficialBios(nullptr);
++  SetRowState(m_bios_row.status, true);
+   m_bios_row.description->setText(
+-      XDNetplay::CheckOfficialBios(nullptr) ?
+-          tr("Official GBA BIOS (XD can detect the GBA)") :
+-          tr("Official GBA BIOS required — XD cannot detect the GBA without it"));
++      official_bios ? tr("GBA BIOS: using your official dump") :
++                      tr("GBA BIOS: none needed — booting without one (optional)"));
+   SetRowState(m_team_saves_row.status, TeamSavesInstalled());
+   SetRowState(m_vs_save_row.status, VsSaveInstalled());
+   const bool input_mapped = XDNetplay::GbaInputMapped();
+-- 
+2.39.5 (Apple Git-154)
+
