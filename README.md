@@ -20,13 +20,16 @@ We can't distribute any of these.
 
 ### Why the official BIOS is required
 
-XD detects a linked GBA only during a short window while Emerald boots, and the
-app reboots the emulated GBA repeatedly to reopen that window until XD notices.
-On this emulator core, an Emerald booted by the common open-source BIOS opens
-that window but XD **never** completes the handshake — verified on device: the
-window opened repeatedly and the game probed it thousands of times without ever
-starting a transfer, while an official dump linked in seconds. The launcher
-checks the file's hash, so a wrong file is caught immediately.
+The GameCube performs a handshake before it will talk to a GBA, and on real
+hardware the **GBA's own BIOS answers it** — Nintendo's boot code contains a
+JoyBus listener for exactly this. No clean-room BIOS reimplements that, so no
+replacement works here. Tested on device: the previously bundled open-source
+BIOS, a current [Cult-of-GBA](https://github.com/Cult-of-GBA/BIOS) build, and
+mGBA's built-in HLE BIOS all fail the same way — the GBA's link window opens
+over and over while the handshake never begins.
+
+An official dump works every time. The launcher checks the file's hash, so a
+wrong file is caught immediately instead of failing mysteriously.
 
 ## Getting started
 
