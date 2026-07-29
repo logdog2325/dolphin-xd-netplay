@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 12:57:05 -0700
+Subject: [PATCH] GBA: give the cartridge quiet after a reset so it can finish
+ connecting
+
+Socket 2 now links on the bundled BIOS, socket 3 still does not, and the
+telemetry shows why: socket 2 reached est=1 after nine reboots, socket 3
+has taken forty-two and counting while the GameCube probes it about eight
+thousand times.
+
+Emerald's GameCubeMultiBoot_Main only re-runs its Init after roughly
+eleven frames with no serial interrupt, and every joybus command clears
+that counter. XD probes whichever socket it is waiting on continuously,
+so the port it wants most is the one that never gets the quiet it needs:
+the window opens, but the cartridge behind it is never ready and the
+handshake never starts. A socket the game is not yet hammering gets that
+quiet for free, which is why socket 2 works and socket 3 does not.
+
+After an auto-reset, hold joybus commands back from that core until it has
+reopened its window, with a six second ceiling so a core that never comes
+back cannot wedge itself out of contact. Only the command is withheld --
+the core is still time-synced and SI keeps its cadence, so the poll simply
+reports "no GBA answered", which is what it already does while a core is
+booting.
+---
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp | 23 +++++++++++++++++++++-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h   |  1 +
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index ef38463563..9fa8548036 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -226,6 +226,15 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         }
+         m_last_auto_reset = m_timestamp_sent;
+         m_data_cmd_count = 0;
++        // Emerald's GameCubeMultiBoot_Main only re-runs its Init after roughly
++        // eleven frames with no serial interrupt: every joybus command the
++        // GameCube sends resets that counter. XD probes a socket it is waiting
++        // on continuously (thousands of times per attempt), which starves the
++        // cartridge of the quiet it needs and leaves it never ready -- windows
++        // open, but the handshake never begins. Hold the commands back until
++        // this core has actually reopened its window, so the reboot lands in
++        // silence the way it does for a socket the game is not yet hammering.
++        m_quiet_until = m_timestamp_sent + tps * 6;
+       }
+     }
+     // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
+@@ -245,7 +254,19 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     m_diag_prev_link = link_now;
+ 
+     m_link_was_enabled = link_now;
+-    m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
++
++    // The quiet window ends as soon as the link is back up (the cartridge has
++    // run its Init and is listening) or when it times out, so a core that never
++    // reopens can't wedge itself out of contact.
++    if (m_quiet_until != 0 && (link_now || m_timestamp_sent >= m_quiet_until))
++      m_quiet_until = 0;
++
++    // Withhold only the command itself. Everything below still runs, so the
++    // core keeps being time-synced and SI keeps its cadence; the poll simply
++    // finds no response and reports "no GBA answered", exactly as it already
++    // does while a core is booting.
++    if (m_quiet_until == 0)
++      m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
+ 
+     auto& si = m_system.GetSerialInterface();
+     si.RemoveEvent(m_device_number);
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index e84ad8ab93..4e5778cf5e 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -84,6 +84,7 @@ private:
+   u64 m_last_data_cmd = 0;
+   bool m_link_was_enabled = false;
+   u64 m_last_link_seen = 0;
++  u64 m_quiet_until = 0;
+   bool m_link_established = false;
+   // Sustained joybus traffic means a real party exchange, not a stray probe.
+   static constexpr u32 DATA_CMDS_FOR_BATTLE = 64;
+-- 
+2.39.5 (Apple Git-154)
+
