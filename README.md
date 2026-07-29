@@ -1,36 +1,106 @@
-# XD Netplay for Android
+# XD Netplay
 
-Builds of Dolphin for Pokémon XD: Gale of Darkness GBA-vs-GBA netplay battles
-on Android handhelds (built for the AYN Thor's dual screens, works on
-single-screen devices too), plus a matching Windows desktop client so both
-sides of a netplay session run the identical version.
+Dolphin builds for **Pokémon XD: Gale of Darkness GBA-vs-GBA netplay battles** —
+two players, each with their own emulated Game Boy Advance running Emerald,
+battling over the internet.
 
-## What's in the build
+Runs on **Android** (built for the AYN Thor's dual screens, works on
+single-screen devices), **macOS** (Apple Silicon) and **Windows**. All three are
+built from the same commit so any two players can battle each other.
 
-The `xd-netplay` branch is constructed by CI from:
+## What you need
 
-- `dolphin-emu/dolphin` master (includes the Android netplay UI merged
-  2026-06-28 in PR #14647)
-- PR #14745 — Android dual-screen / GBA (Integrated) screen and input support
-- `patches/0001` — implements the Android netplay GBA callbacks
-  (`FindGBARomPath` config-slot lookup and GBA ROM chat notices)
-- `patches/0002` — CI trim: arm64-v8a only, no C++ unit tests
+| | |
+|---|---|
+| **Pokémon XD** | Clean **USA** disc image (game ID `GXXE01`) |
+| **Pokémon Emerald** | The standard clean English dump (No-Intro "USA, Europe", `BPEE`). **Both players need the same dump.** |
+| **Official GBA BIOS** | `gba_bios.bin`, 16 KB. **Required** — see below. |
 
-Dolphin netplay requires every player to run the same build (the git revision
-is checked at connect), which is why the Windows client is built from the very
-same commit.
+We can't distribute any of these.
 
-## Builds
+### Why the official BIOS is required
 
-Push to `main` (or run the workflow manually) to build the Android APK.
-Tick `build_windows` on a manual run to also produce the Windows desktop zip.
-Artifacts appear on the workflow run page. The APK is a debug-type build
-(native code is still optimized RelWithDebInfo) and installs alongside any
-official Dolphin app.
+XD detects a linked GBA only during a short window while Emerald boots, and the
+app reboots the emulated GBA repeatedly to reopen that window until XD notices.
+On this emulator core, an Emerald booted by the common open-source BIOS opens
+that window but XD **never** completes the handshake — verified on device: the
+window opened repeatedly and the game probed it thousands of times without ever
+starting a transfer, while an official dump linked in seconds. The launcher
+checks the file's hash, so a wrong file is caught immediately.
 
-## Setup for XD battles
+## Getting started
 
-Same idea as the original XDNetplay package (stock Dolphin + config files):
-you need an NTSC Pokémon XD ISO (GXXE01), an English Emerald ROM, a GBA BIOS,
-and the XD OU config/save files. See the `configs/` folder (added separately)
-and the setup guide.
+1. Grab the build for your platform from
+   [Releases](https://github.com/logdog2325/dolphin-xd-netplay/releases) — every
+   player must be on the **same version**; netplay refuses mismatched builds.
+2. **Desktop:** put the XD disc image, the Emerald ROM and the BIOS in one
+   folder. Open the app — the **XD Netplay Launcher** appears on startup and
+   configures itself from that folder. **Android:** open the app → **XD Netplay**
+   and work the checklist green.
+3. Build a team in the **Team Editor** (paste a Showdown export or a
+   pokepast.es link).
+4. **Host** and share your code, or paste a code and **Join**. The host presses
+   **Start**.
+5. On XD's GBA Connection screen, **touch nothing** — both GBAs link themselves
+   in about 10–20 seconds. Each player sees and controls only their own GBA.
+
+## Good to know
+
+- **Two devices in the same house usually cannot connect to each other** over
+  the traversal server — most routers won't loop a connection back on
+  themselves. That is not a bug in the app. Test with someone on a different
+  network, or put one device on a phone hotspot.
+- **Your GBA is "GBA 1"** in the desktop Controllers window, even when you are
+  the joiner on socket 3. Default keys: `A`=X, `B`=Z, Start=Enter,
+  Select=Backspace, D-pad=T/G/F/H, L/R=Q/W. The launcher's *GBA controls* row
+  applies these in one click.
+- **macOS**: the app needs **Input Monitoring** permission to read the keyboard
+  at all. It asks on first launch; if it was denied, enable *DolphinQt* under
+  System Settings → Privacy & Security → Input Monitoring and relaunch.
+- **Lag**: netplay uses almost no bandwidth, so only latency matters — close
+  downloads and uploads during a match. Same region: the host can lower the
+  netplay **Buffer** (default 5). Long distance: **raise** it (8–10) — a buffer
+  too low for the round trip causes constant stutter.
+- Once a GBA has linked it is never auto-reset again for that session, so team
+  preview can take as long as you like.
+
+## Reporting problems
+
+On Android the bottom GBA screen shows a diagnostic line per GBA:
+
+```
+GBA3: rom=1 gba=1 loc=1 lk=1 win=45 rst=86 prb=55055 est=1 lck=1 cmd=14
+```
+
+`lk` link open now · `win` link windows opened · `rst` GBA reboots · `prb` times
+the game probed · `est`/`lck` link state · `cmd` last command. **Include this
+line in any GBA-related report** — it says exactly where detection stopped.
+Long-press the bottom screen to switch which of your GBAs it shows (solo only;
+in netplay it can never show a GBA you don't own).
+
+## PBR Online (bonus mode)
+
+Pokémon Battle Revolution over the community Wiimmfi servers. Point the app at a
+clean PBR disc of any region — the online patches are applied in memory at boot,
+so the disc on disk is never modified. Online play additionally needs a NAND
+backup **from your own Wii**; shared or generated NANDs are rejected and banned
+by the server. Offline play works without one. Matchmaking happens inside the
+game, not in this app.
+
+## How the builds are made
+
+This repository holds no Dolphin source. CI reconstructs the `xd-netplay` branch
+on every run from:
+
+- `dolphin-emu/dolphin` master at a pinned commit
+- PR **#14745** — Android dual-screen / integrated-GBA screen and input support
+- the `patches/` series, applied in order with `git am`
+
+Then it builds the Android APK, and the macOS and Windows clients when those
+inputs are ticked on a manual run. Because Dolphin checks the git revision when
+connecting, all three platforms are built from one run so they can interoperate.
+
+`configs/` holds reference configuration for the desktop portable layout.
+
+To build: run the **build** workflow from the Actions tab (tick `build_macos`
+and `build_windows` as needed). Artifacts appear on the run page.
