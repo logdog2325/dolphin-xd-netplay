@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 23:49:38 -0700
+Subject: [PATCH] Fix solo GBA detection (shader mode) and joiner controls
+ (auto-map)
+
+Two device-confirmed bugs, both Android weak-point issues:
+
+1. Solo detection regressed in v0.4.29 because the XD graphics preset set
+   ShaderCompilationMode=0 (synchronous specialized). On a cold Adreno
+   shader cache, synchronous pipeline compiles on the GC video thread hold
+   the shared Vulkan queue and back-pressure the GBA core's frame callback
+   (the code already warns the event thread 'can stall in the synchronous
+   frame callback'), starving Emerald's link-init frames so the joybus
+   handshake never latches -- telemetry: win/rst/prb climbing, est=0. It was
+   never the cheats or the BIOS. Switch to ShaderCompilationMode=3
+   (async-skip): still no ubershaders, so the Adreno DEVICE_LOST crash stays
+   fixed, but shaders compile in the background so the GBA is never starved.
+
+2. The Android auto-mapper mapped GBA pads 1 and 2 but not pad 0, and a
+   netplay joiner's local GBA is pad 0 -- so the joiner's physical buttons
+   did nothing and only touch worked. Map all four pads.
+---
+ Data/Sys/GameSettings/GXXE01.ini                          | 8 +++++++-
+ .../dolphinemu/features/xdnetplay/input/AutoMapper.kt     | 6 +++++-
+ 2 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index f0e9c182ad..0cf4d9f184 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -52,7 +52,13 @@ $60 FPS
+ # shaders + pre-warming the cache avoid that entirely; native resolution
+ # and CPU-side culling give thermal/submission headroom. None of these
+ # affect netplay determinism.
+-ShaderCompilationMode = 0
++# Async-skip (3), not synchronous specialized (0): specialized shaders (no
++# ubershaders) keep the Adreno DEVICE_LOST watchdog crash fixed, but compiling
++# them SYNCHRONOUSLY on a cold cache holds the shared Vulkan queue and
++# back-pressures the GBA core's frame callback -- starving Emerald's link-init
++# frames so XD never detects the GBA. Async-skip compiles in the background
++# (brief visual pop-in on first use) and never stalls the GBA. Fixes both.
++ShaderCompilationMode = 3
+ WaitForShadersBeforeStarting = True
+ InternalResolution = 1
+ CPUCull = True
+\ No newline at end of file
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+index 762a9b3c33..acfdda05b2 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+@@ -120,7 +120,11 @@ object AutoMapper {
+      */
+     fun autoMap(): Boolean {
+         val gcPad = EmulatedController.getGcPad(0)
+-        val gbaPads = listOf(EmulatedController.getGbaPad(1), EmulatedController.getGbaPad(2))
++        // Map ALL four GBA pads, not just 1 and 2. In netplay the JOINER's local
++        // GBA is pad index 0, which was left unmapped -- so the joiner's physical
++        // buttons reached nothing and only on-screen touch worked. Mapping the
++        // unused pads is harmless (only the active local GBA's input is read).
++        val gbaPads = (0..3).map { EmulatedController.getGbaPad(it) }
+ 
+         val gcNeedsMapping = !isControllerMapped(gcPad)
+         val gbaNeedingMapping = gbaPads.filterNot { isControllerMapped(it) }
+-- 
+2.39.5 (Apple Git-154)
+
