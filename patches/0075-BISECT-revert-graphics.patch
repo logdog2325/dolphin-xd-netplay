@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Wed, 29 Jul 2026 23:30:35 -0700
+Subject: [PATCH] BISECT: revert XD graphics to v0.4.28 to test the
+ solo-detection regression
+
+Throwaway test patch. v0.4.28 solo detected the GBA; v0.4.30 does not, and
+cheats (patch 71) is ruled out by an on-device toggle test. Patch 73's reset
+path is verified unchanged. This reverts patch 72's graphics preset to the
+v0.4.28 values to confirm whether the graphics change is what broke detection.
+If solo detection works with this build, the graphics preset is the cause.
+---
+ Data/Sys/GameSettings/GXXE01.ini | 16 ++++------------
+ 1 file changed, 4 insertions(+), 12 deletions(-)
+
+diff --git a/Data/Sys/GameSettings/GXXE01.ini b/Data/Sys/GameSettings/GXXE01.ini
+index f0e9c182ad..bd631a3066 100644
+--- a/Data/Sys/GameSettings/GXXE01.ini
++++ b/Data/Sys/GameSettings/GXXE01.ini
+@@ -44,15 +44,7 @@ $16:9 Widescreen
+ $60 FPS
+ 
+ [Video_Settings]
+-# Stability preset for Adreno (AYN Thor). The GameCube renders on the top
+-# screen via Vulkan; ubershaders (ShaderCompilationMode = 2) produce GPU
+-# submissions long enough to trip Adreno's watchdog when a new move/effect
+-# first appears mid-battle -> VK_ERROR_DEVICE_LOST, which Dolphin cannot
+-# recover from (the top screen freezes for the session). Specialized
+-# shaders + pre-warming the cache avoid that entirely; native resolution
+-# and CPU-side culling give thermal/submission headroom. None of these
+-# affect netplay determinism.
+-ShaderCompilationMode = 0
+-WaitForShadersBeforeStarting = True
+-InternalResolution = 1
+-CPUCull = True
+\ No newline at end of file
++# BISECT TEST: graphics reverted to v0.4.28 values to check if patch 72
++# broke GBA detection. (Ubershaders/2x -- reintroduces the GPU crash; test only.)
++InternalResolution = 2
++ShaderCompilationMode = 2
+-- 
+2.39.5 (Apple Git-154)
+
