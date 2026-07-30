@@ -1,0 +1,788 @@
+From e5321167d7ed2c12fca0cb01f7e241a4fac15540 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Thu, 30 Jul 2026 15:39:21 -0700
+Subject: [PATCH] Require the official GBA BIOS again + on-device GBA-detection
+ diagnostic log
+
+The bundled open-source BIOS never linked reliably (one lucky v0.4.28 solo
+boot; socket 3 fails on retry). Revert to requiring the official 16 KB dump
+on both platforms -- the proven-reliable path (v0.4.26) -- and load it for
+solo and netplay alike so every client boots the byte-identical image. In
+netplay a client without it refuses to boot rather than silently desync; the
+launchers block Host/Boot/Join up front on desktop and Android.
+
+Add a self-contained, thread-safe, bounded GBA-detection log (gba_detect.log
+in the user GBA dir; path shown on the OSD at boot; Android "Share log"
+button). It records, per SI socket, the BIOS loaded and every detection
+transition (window-open, auto-reset, quiet enter/exit, link-established,
+battle-locked, rematch-release) plus the joybus handshake bytes and a 1/sec
+telemetry summary, so a socket-3 stall can be pinpointed (XD-never-handshakes
+vs GBA-never-answers). Written transition-only + rate-limited from the CPU
+thread through one mutex; never per-poll; not serialized in DoState; no effect
+on emulated state or netplay determinism. A withheld (quiet-window) command is
+never scored as GBA silence. Works in solo and netplay (each client logs
+locally, labeled host/joiner + socket).
+---
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  24 ++-
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  16 +-
+ Source/Core/Core/CMakeLists.txt               |   2 +
+ Source/Core/Core/HW/GBACore.cpp               |  52 ++++--
+ Source/Core/Core/HW/GBADetectLog.cpp          | 161 ++++++++++++++++++
+ Source/Core/Core/HW/GBADetectLog.h            |  48 ++++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 126 +++++++++++++-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  15 ++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  41 ++++-
+ 9 files changed, 454 insertions(+), 31 deletions(-)
+ create mode 100644 Source/Core/Core/HW/GBADetectLog.cpp
+ create mode 100644 Source/Core/Core/HW/GBADetectLog.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 32ac64c..e9d8289 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -186,12 +186,34 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     },
+                     onOpenDolphin = {
+                         startActivity(Intent(this, MainActivity::class.java))
+-                    }
++                    },
++                    onShareDetectLog = { shareDetectLog() }
+                 )
+             }
+         }
+     }
+ 
++    /** Share the GBA-detection diagnostic log (written to GBA/gba_detect.log in
++     * the app's external files dir, which the stock Files app hides on Android
++     * 11+) via the FileProvider so the user can hand it to us. */
++    private fun shareDetectLog() {
++        val log = java.io.File(getExternalFilesDir(null), "GBA/gba_detect.log")
++        if (!log.exists()) {
++            android.widget.Toast.makeText(
++                this, "No detect log yet — boot XD once, then share.",
++                android.widget.Toast.LENGTH_LONG).show()
++            return
++        }
++        val uri = androidx.core.content.FileProvider.getUriForFile(
++            this, "$packageName.xdshare", log)
++        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
++            type = "text/plain"
++            putExtra(android.content.Intent.EXTRA_STREAM, uri)
++            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
++        }
++        startActivity(android.content.Intent.createChooser(send, "Share detect log"))
++    }
++
+     /** Boot Pokemon XD directly by game ID, bypassing the game picker (which
+      * would otherwise default to whatever ISO sorts first in the folder). */
+     private fun bootXd() {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 7c68087..f6c179a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -53,7 +53,8 @@ fun XDLauncherScreen(
+     onCheatsChanged: (Boolean) -> Unit,
+     onFindBattles: () -> Unit,
+     onOpenSettings: () -> Unit,
+-    onOpenDolphin: () -> Unit
++    onOpenDolphin: () -> Unit,
++    onShareDetectLog: () -> Unit
+ ) {
+     Scaffold { padding ->
+         Column(
+@@ -113,7 +114,7 @@ fun XDLauncherScreen(
+                 Spacer(Modifier.height(12.dp))
+                 Button(
+                     onClick = onPlayXd,
+-                    enabled = xdGameFound,
++                    enabled = xdGameFound && biosLinkReady,
+                     modifier = Modifier.fillMaxWidth()
+                 ) {
+                     Text("Boot Pokémon XD (solo)", style = MaterialTheme.typography.titleMedium)
+@@ -135,7 +136,7 @@ fun XDLauncherScreen(
+                 Spacer(Modifier.height(12.dp))
+                 Button(
+                     onClick = onBattle,
+-                    enabled = xdGameFound,
++                    enabled = xdGameFound && biosLinkReady,
+                     modifier = Modifier.fillMaxWidth()
+                 ) {
+                     Text("Battle  —  Host or Join", style = MaterialTheme.typography.titleMedium)
+@@ -154,6 +155,8 @@ fun XDLauncherScreen(
+                     OutlinedButton(onClick = onOpenSettings) { Text("Settings") }
+                     Spacer(Modifier.width(12.dp))
+                     TextButton(onClick = onOpenDolphin) { Text("Full Dolphin") }
++                    Spacer(Modifier.width(12.dp))
++                    TextButton(onClick = onShareDetectLog) { Text("Share log") }
+                 }
+             }
+             Spacer(Modifier.height(16.dp))
+@@ -209,10 +212,9 @@ private fun ReadinessCard(
+                 onFix = onOpenSettings
+             )
+             CheckRow(
+-                ok = true,
+-                okText = if (biosLinkReady) "GBA BIOS: using your official dump"
+-                         else "GBA BIOS: none needed — the bundled one works (optional)",
+-                missingText = "",
++                ok = biosLinkReady,
++                okText = "Official GBA BIOS configured",
++                missingText = "Official GBA BIOS required — the game cannot detect the GBA without it",
+                 fixLabel = "Choose BIOS…",
+                 onFix = onPickGbaBios
+             )
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 20a96cf..8a49218 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -748,6 +748,8 @@ if(USE_MGBA)
+   target_sources(core PRIVATE
+     HW/GBACore.cpp
+     HW/GBACore.h
++    HW/GBADetectLog.cpp
++    HW/GBADetectLog.h
+     HW/SI/SI_DeviceGBAEmu.cpp
+     HW/SI/SI_DeviceGBAEmu.h
+   )
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index 21e97ef..bd5440d 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -32,6 +32,7 @@
+ #include "Core/Config/MainSettings.h"
+ #include "Core/ConfigManager.h"
+ #include "Core/Core.h"
++#include "Core/HW/GBADetectLog.h"
+ #include "Core/HW/SystemTimers.h"
+ #include "Core/Host.h"
+ #include "Core/NetPlayProto.h"
+@@ -233,12 +234,17 @@ bool Core::Start(u64 gc_ticks)
+ 
+   if (m_core->platform(m_core) == mPLATFORM_GBA)
+   {
+-    // BIOS selection. XD detects the emulated GBA with either the official dump
+-    // or the bundled open-source BIOS -- confirmed on device once the auto-reset
+-    // stopped racing Emerald's connection handshake (that race, not the BIOS,
+-    // was why detection used to fail; see SI_DeviceGBAEmu's quiet-window reset).
+-    // So an official dump is never required. Solo uses it if present for
+-    // accuracy; otherwise the bundled BIOS boots the GBA.
++    // BIOS selection is detection-critical: XD only completes its JoyBus boot
++    // handshake against the official GBA dump, whose boot code carries
++    // Nintendo's own JoyBus listener. No open-source BIOS reimplements it and
++    // mGBA's HLE BIOS does not either, so the official dump is required for a
++    // link -- the launchers enforce that before boot. Here we load the official
++    // dump whenever it is present (solo and netplay alike) so every netplay
++    // client boots the exact same 16 KB image and stays deterministic. In
++    // netplay we HARD-REQUIRE it: a client without the official dump refuses to
++    // boot rather than silently fall back and desync. The bundled open-source
++    // image survives only as a last-resort solo fallback; it cannot complete the
++    // handshake.
+     const std::string user_bios = File::GetUserPath(F_GBABIOS_IDX);
+     bool official_bios = false;
+     {
+@@ -259,23 +265,35 @@ bool Core::Start(u64 gc_ticks)
+ 
+     const std::string sys_bios = File::GetSysDirectory() + "GBA" DIR_SEP "gba_bios.bin";
+ 
+-    // Netplay mirrors every GBA on every client, so every client must boot the
+-    // exact same BIOS or they diverge. Force the bundled image, which is
+-    // byte-identical everywhere: no player needs a BIOS file, and an official
+-    // dump on one side can't desync against a bundled one on the other.
+-    if (NetPlay::IsNetPlayRunning() && File::Exists(sys_bios))
++    if (official_bios)
+     {
+-      LoadBIOS(sys_bios.c_str());
+-      NOTICE_LOG_FMT(CORE, "GBA{} netplay: bundled BIOS (identical on all clients)",
+-                     m_device_number + 1);
++      const bool ok = LoadBIOS(user_bios.c_str());
++      GBADetectLog::LogBios(m_device_number, true, user_bios, File::GetSize(user_bios),
++                            NetPlay::IsNetPlayRunning(), ok);
+     }
+-    else if (official_bios)
++    else if (NetPlay::IsNetPlayRunning())
+     {
+-      LoadBIOS(user_bios.c_str());
++      // Determinism guard (defense in depth beyond the launcher gate, Review #1
++      // I1): every netplay client must boot the byte-identical official 16 KB
++      // dump or the two mGBA cores diverge on the first BIOS-dependent
++      // instruction. Refuse to boot rather than silently fall back to the
++      // bundled image and desync. The XD launcher blocks this case up front on
++      // both platforms; this also covers a GBA netplay session started through
++      // the standard Dolphin UI, which the launcher gate cannot see.
++      GBADetectLog::LogBios(m_device_number, false, std::string{}, 0, true, false);
++      PanicAlertFmtT("GBA{0}: the official GBA BIOS is required for netplay. "
++                     "Configure it and reconnect.",
++                     m_device_number + 1);
++      return false;
+     }
+     else if (File::Exists(sys_bios))
+     {
+-      LoadBIOS(sys_bios.c_str());
++      const bool ok = LoadBIOS(sys_bios.c_str());
++      GBADetectLog::LogBios(m_device_number, false, sys_bios, File::GetSize(sys_bios), false, ok);
++    }
++    else
++    {
++      GBADetectLog::LogBios(m_device_number, false, std::string{}, 0, false, false);
+     }
+   }
+ 
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+new file mode 100644
+index 0000000..54f900e
+--- /dev/null
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -0,0 +1,161 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/HW/GBADetectLog.h"
++
++#include <atomic>
++#include <ctime>
++#include <fstream>
++#include <mutex>
++
++#include <fmt/format.h>
++
++#include "Common/CommonPaths.h"
++#include "Common/FileUtil.h"
++
++#include "VideoCommon/OnScreenDisplay.h"
++
++namespace GBADetectLog
++{
++namespace
++{
++// Hard ceiling on one session's file, so a wedged session that emits summaries
++// for hours can never fill the disk. 1 MiB is tens of thousands of lines.
++constexpr u64 MAX_LOG_BYTES = 1u << 20;
++
++std::mutex s_mutex;
++std::ofstream s_file;    // held open for the session; never fopen'd per line
++std::string s_path;
++u64 s_bytes = 0;         // running size, enforces the cap
++int s_live_devices = 0;  // ref-count -> session begin/end
++// Atomic so every Log* can early-out lock-free and stop FORMATTING once capped
++// (Review #1 I5: the byte cap must bound CPU/lock cost, not just disk).
++std::atomic<bool> s_capped{false};
++
++std::string Timestamp()
++{
++  const std::time_t now = std::time(nullptr);
++  std::tm tm{};
++#ifdef _WIN32
++  localtime_s(&tm, &now);
++#else
++  localtime_r(&now, &tm);
++#endif
++  char buf[32] = {};
++  std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
++  return buf;
++}
++
++// Must hold s_mutex. Appends one line (adds '\n'), enforces the byte cap, never
++// throws. `flush` forces the stream to disk for rare, important lines.
++void WriteLine(const std::string& line, bool flush)
++{
++  if (!s_file.is_open())
++    return;
++  if (s_bytes >= MAX_LOG_BYTES)
++  {
++    if (!s_capped.load(std::memory_order_relaxed))
++    {
++      s_file << "-- capped at " << MAX_LOG_BYTES << " bytes; further lines dropped --\n";
++      s_file.flush();
++      s_capped.store(true, std::memory_order_relaxed);
++    }
++    return;
++  }
++  s_file << line << '\n';
++  s_bytes += line.size() + 1;
++  if (flush)
++    s_file.flush();
++}
++}  // namespace
++
++const std::string& FilePath()
++{
++  // D_GBAUSER_IDX already ends in a path separator (".../GBA/").
++  static const std::string path = File::GetUserPath(D_GBAUSER_IDX) + "gba_detect.log";
++  return path;
++}
++
++void OnDeviceCreated()
++{
++  std::lock_guard lock(s_mutex);
++  if (s_live_devices++ != 0)
++    return;  // session already open; just count this device
++
++  s_path = FilePath();
++  s_file.close();
++  s_file.clear();
++  s_file.open(s_path, std::ios::out | std::ios::trunc);
++  s_bytes = 0;
++  s_capped.store(false, std::memory_order_relaxed);
++
++  WriteLine(fmt::format("gba_detect.log  path={}", s_path), true);
++  WriteLine(fmt::format("session start  {}", Timestamp()), true);
++  WriteLine("cols: t=<gc_tick|boot> sock=<SI channel; link GBAs=2,3> <event> <key=val...>", true);
++  WriteLine("note: '> ... sent=0' == command withheld by quiet window (NOT GBA silence); "
++            "a per-socket 'role' line prints once under netplay",
++            true);
++
++  OSD::AddMessage(fmt::format("GBA detect log: {}", s_path), 12000, OSD::Color::CYAN);
++}
++
++void OnDeviceDestroyed()
++{
++  std::lock_guard lock(s_mutex);
++  if (s_live_devices > 0 && --s_live_devices == 0)
++  {
++    WriteLine(fmt::format("session end  {}", Timestamp()), true);
++    s_file.flush();
++    s_file.close();
++  }
++}
++
++void LogBios(int channel, bool official, const std::string& path, u64 size, bool netplay,
++             bool load_ok)
++{
++  if (s_capped.load(std::memory_order_relaxed))
++    return;
++  std::lock_guard lock(s_mutex);
++  WriteLine(fmt::format("t=boot sock={} BIOS {} size={} netplay={} load={} path={}", channel,
++                        official ? "official" : "bundled", size, netplay ? 1 : 0,
++                        load_ok ? "ok" : "FAIL", path.empty() ? "<none>" : path),
++            true);
++}
++
++void LogEvent(int channel, u64 tick, const char* event, const std::string& detail)
++{
++  if (s_capped.load(std::memory_order_relaxed))
++    return;
++  std::lock_guard lock(s_mutex);
++  WriteLine(fmt::format("t={} sock={} {} {}", tick, channel, event, detail), true);
++}
++
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent)
++{
++  if (s_capped.load(std::memory_order_relaxed))
++    return;
++  std::lock_guard lock(s_mutex);
++  if (dir == '>')
++    WriteLine(fmt::format("t={} sock={} joy > {:02x}{:02x}{:02x}{:02x}{:02x} len={} sent={}", tick,
++                          channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len,
++                          sent ? 1 : 0),
++              false);  // bounded burst; flushed by the next event/summary line
++  else
++    WriteLine(fmt::format("t={} sock={} joy < {:02x}{:02x}{:02x}{:02x}{:02x} len={}", tick, channel,
++                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len),
++              false);
++}
++
++void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
++                u32 prb, bool est, bool lck, u8 cmd)
++{
++  if (s_capped.load(std::memory_order_relaxed))
++    return;
++  std::lock_guard lock(s_mutex);
++  WriteLine(fmt::format("t={} sock={} sum rom={} gba={} loc={} lk={} win={} rst={} prb={} est={} "
++                        "lck={} cmd={:02x}",
++                        tick, channel, rom ? 1 : 0, gba ? 1 : 0, loc ? 1 : 0, lk ? 1 : 0, win, rst,
++                        prb, est ? 1 : 0, lck ? 1 : 0, cmd),
++            true);
++}
++}  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+new file mode 100644
+index 0000000..ce16fee
+--- /dev/null
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -0,0 +1,48 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <string>
++
++#include "Common/CommonTypes.h"
++
++// Human-readable, self-contained, BOUNDED diagnostic log for the XD GBA-vs-GBA
++// detection path. One fresh file per emulation session, written from the CPU/
++// emulation thread only, through a single mutex-guarded sink.
++//
++// Purely observational: nothing here feeds back into emulation or netplay, no
++// value returned is consumed by any control path, and no call performs file I/O
++// on the joybus hot path (transition-triggered + <=1/sec summary + a bounded
++// boot-time command dump only).
++//
++// File: <User>/GBA/gba_detect.log  (File::GetUserPath(D_GBAUSER_IDX)).
++namespace GBADetectLog
++{
++// Resolved absolute path of the log file (stable for the process lifetime).
++const std::string& FilePath();
++
++// CSIDevice_GBAEmu ctor/dtor (CPU/host thread). Reference-counted: the first
++// live GBA device of a session truncates the file, writes the banner as line 1
++// and shows the path on the OSD; when the last device is torn down the session
++// is closed. Guarantees a fresh, small file every boot.
++void OnDeviceCreated();
++void OnDeviceDestroyed();
++
++// H1 -- one line per GBA at boot (CPU/host thread, inside Core::Start).
++void LogBios(int channel, bool official, const std::string& path, u64 size, bool netplay,
++             bool load_ok);
++
++// Discrete detection transitions / role line. Flushed (transitions are rare).
++void LogEvent(int channel, u64 tick, const char* event, const std::string& detail);
++
++// One joybus command ('>') or response ('<') line. NOT flushed per call
++// (bounded boot burst; a later event/summary flushes it). bytes[0..4] must be
++// valid. `sent` is meaningful for '>' lines: 0 == withheld by the quiet window.
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent);
++
++// Once-per-second telemetry mirror (caller throttles to <=1/sec). Fields mirror
++// the on-screen readout: rom/gba/loc/lk/win/rst/prb/est/lck/cmd.
++void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
++                u32 prb, bool est, bool lck, u8 cmd);
++}  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 4b5b5d2..a0b3103 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -9,6 +9,8 @@
+ #include <atomic>
+ #include <vector>
+ 
++#include <fmt/format.h>
++
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Logging/Log.h"
+@@ -17,6 +19,7 @@
+ #include "Core/Core.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/GBACore.h"
++#include "Core/HW/GBADetectLog.h"
+ #include "Core/HW/GBAPad.h"
+ #include "Core/HW/SI/SI.h"
+ #include "Core/HW/SI/SI_DeviceGCController.h"
+@@ -49,6 +52,7 @@ static s64 GetSyncInterval(const SystemTimers::SystemTimersManager& timers)
+ CSIDevice_GBAEmu::CSIDevice_GBAEmu(Core::System& system, SIDevices device, int device_number)
+     : ISIDevice(system, device, device_number)
+ {
++  GBADetectLog::OnDeviceCreated();  // opens/truncates the file BEFORE Core::Start fires H1
+   m_core = std::make_shared<HW::GBA::Core>(system, m_device_number);
+   m_core->Start(system.GetCoreTiming().GetTicks());
+   m_gbahost = Host_CreateGBAHost(m_core);
+@@ -63,6 +67,7 @@ CSIDevice_GBAEmu::~CSIDevice_GBAEmu()
+   m_core->Stop();
+   m_gbahost.reset();
+   m_core.reset();
++  GBADetectLog::OnDeviceDestroyed();
+ }
+ 
+ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+@@ -191,6 +196,10 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+                             m_probe_link_down_streak >= 64;
+     if (backed_out)
+     {
++      GBADetectLog::LogEvent(
++          m_device_number, m_timestamp_sent, "rematch-release",
++          fmt::format("was_locked={} was_est={} link_down_ago={} down_streak={}", m_battle_locked,
++                      m_link_established, elapsed_since(m_last_link_seen), m_probe_link_down_streak));
+       m_link_established = false;
+       m_battle_locked = false;
+       m_data_cmd_count = 0;
+@@ -206,6 +215,11 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     {
+       m_netplay_pad_is_local = NetPlay::GetPadDetails(m_device_number).is_local;
+       m_netplay_locality_cached = true;
++      // One-shot per socket: makes two clients' logs alignable at a glance
++      // (which machine owns which socket). Uses the same cached value the audio
++      // mute path already trusts, so it inherits its safety.
++      GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "role",
++                             fmt::format("netplay=1 local={}", m_netplay_pad_is_local ? 1 : 0));
+     }
+     m_core->SetLinkAudioMuted((!m_link_established && !m_battle_locked) ||
+                               (m_netplay_locality_cached && !m_netplay_pad_is_local));
+@@ -259,6 +273,12 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         // this core has actually reopened its window, so the reboot lands in
+         // silence the way it does for a socket the game is not yet hammering.
+         m_quiet_until = m_timestamp_sent + tps * 6;
++        GBADetectLog::LogEvent(
++            m_device_number, m_timestamp_sent, "auto-reset",
++            fmt::format("{} link_idle={} cooldown_elapsed={} last_seen_ago={} quiet_until={}",
++                        NetPlay::IsNetPlayRunning() ? "net" : "solo", link_idle, cooldown_elapsed,
++                        elapsed_since(m_last_link_seen), m_quiet_until));
++        m_diag_cmd_burst = 24;  // capture the commands right after the reboot
+       }
+     }
+     // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
+@@ -267,13 +287,47 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     if (GBALinkDiag* diag = DiagSlot(m_device_number))
+     {
+       if (link_now && !m_diag_prev_link)
++      {
+         diag->window_count.fetch_add(1, std::memory_order_relaxed);
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "window-open", {});  // H2
++      }
+       if (probing)
+         diag->probe_count.fetch_add(1, std::memory_order_relaxed);
+       diag->link.store(link_now, std::memory_order_relaxed);
+       diag->established.store(m_link_established, std::memory_order_relaxed);
+       diag->locked.store(m_battle_locked, std::memory_order_relaxed);
+       diag->last_cmd.store(static_cast<u8>(m_last_cmd), std::memory_order_relaxed);
++
++      // H5/H6: latch rising edges. Arm a short command burst on the H5 edge so
++      // the log captures the exact commands crossing the link when XD is
++      // recognized. window-open deliberately does NOT arm a burst (Review #1 I4).
++      if (m_link_established && !m_diag_prev_established)
++      {
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "link-established",
++                               fmt::format("data_cmd_count={}", m_data_cmd_count));
++        if (m_diag_cmd_burst < 16)
++          m_diag_cmd_burst = 16;
++      }
++      if (m_battle_locked && !m_diag_prev_locked)
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "battle-locked",
++                               fmt::format("data_cmd_count={}", m_data_cmd_count));
++      m_diag_prev_established = m_link_established;
++      m_diag_prev_locked = m_battle_locked;
++
++      // <=1/sec summary mirroring the on-screen telemetry. Throttled on emulated
++      // ticks, so no transition rate can push it past one line/sec/channel.
++      if (m_diag_last_summary_tick == 0 ||
++          (m_timestamp_sent > m_diag_last_summary_tick &&
++           m_timestamp_sent - m_diag_last_summary_tick > tps))
++      {
++        GBADetectLog::LogSummary(
++            m_device_number, m_timestamp_sent, m_core->IsStarted(), /*gba=*/true,
++            m_netplay_pad_is_local, link_now, diag->window_count.load(std::memory_order_relaxed),
++            diag->reset_count.load(std::memory_order_relaxed),
++            diag->probe_count.load(std::memory_order_relaxed), m_link_established, m_battle_locked,
++            static_cast<u8>(m_last_cmd));
++        m_diag_last_summary_tick = m_timestamp_sent;
++      }
+     }
+     m_diag_prev_link = link_now;
+ 
+@@ -283,15 +337,47 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     // run its Init and is listening) or when it times out, so a core that never
+     // reopens can't wedge itself out of contact.
+     if (m_quiet_until != 0 && (link_now || m_timestamp_sent >= m_quiet_until))
++    {
++      GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "quiet-exit",
++                             link_now ? "reason=link-up" : "reason=timeout");
+       m_quiet_until = 0;
++    }
+ 
+     // Withhold only the command itself. Everything below still runs, so the
+     // core keeps being time-synced and SI keeps its cadence; the poll simply
+     // finds no response and reports "no GBA answered", exactly as it already
+     // does while a core is booting.
+-    if (m_quiet_until == 0)
++    m_diag_cmd_sent = (m_quiet_until == 0);  // H8/H9: was this poll's command actually sent?
++    if (m_diag_cmd_sent)
+       m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
+ 
++    // H8 (gba_detect.log): bounded joybus command dump. buffer[0..4] still hold
++    // the request here (ReceiveResponse's GetJoybusResponse only overwrites it
++    // on the next poll). Bounded so the hot handshake path never pays per-poll
++    // cost: the first 64 commands of the session, a short count-bounded burst
++    // armed by a rare transition (auto-reset / link-established), OR a
++    // command-class change -- and the class-change path is rate-limited to a
++    // minimum tick gap (Review #1 I4). In the socket-3 failure the class stays
++    // at 1 (STATUS), so class_changed is false and H8 falls silent after the
++    // boot budget; the healthy upload oscillates class and is capped at ~200/s.
++    const u8 cmd_class = probing ? 1u : (data_cmd_now ? 2u : 0u);
++    const bool class_changed = cmd_class != m_diag_prev_cmd_class;
++    m_diag_prev_cmd_class = cmd_class;
++    const bool joy_gap_ok =
++        m_diag_last_joy_tick == 0 || elapsed_since(m_diag_last_joy_tick) > tps / 200;
++    m_diag_log_this_response = false;
++    if (m_diag_cmd_log_count < 64 || m_diag_cmd_burst > 0 || (class_changed && joy_gap_ok))
++    {
++      GBADetectLog::LogJoybus(m_device_number, m_timestamp_sent, '>', buffer, request_length,
++                              m_diag_cmd_sent);
++      m_diag_last_joy_tick = m_timestamp_sent;
++      if (m_diag_cmd_log_count < 64)
++        ++m_diag_cmd_log_count;
++      if (m_diag_cmd_burst > 0)
++        --m_diag_cmd_burst;
++      m_diag_log_this_response = true;  // pair the response in ReceiveResponse
++    }
++
+     auto& si = m_system.GetSerialInterface();
+     si.RemoveEvent(m_device_number);
+     si.ScheduleEvent(m_device_number,
+@@ -323,6 +409,38 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+   {
+     m_next_action = NextAction::SendCommand;
+     const auto response_length = m_core->GetJoybusResponse(buffer);
++
++    // H9 (gba_detect.log). A withheld command (m_diag_cmd_sent == false) makes
++    // the core return 0 with nothing having been asked, so it must NEVER be
++    // scored as GBA silence -- only genuinely-sent probes are classified
++    // (Review #3 Q1). buffer now holds the response bytes.
++    {
++      const bool probe_cmd = m_last_cmd == EBufferCommands::CMD_STATUS ||
++                             m_last_cmd == EBufferCommands::CMD_RESET;
++      const bool resp_nonzero = response_length != 0;
++      if (m_diag_cmd_sent && probe_cmd && resp_nonzero != m_diag_prev_resp_nonzero)
++      {
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent,
++                               resp_nonzero ? "gba-answering" : "gba-silent",
++                               fmt::format("cmd={:02x}", static_cast<u8>(m_last_cmd)));
++        m_diag_prev_resp_nonzero = resp_nonzero;
++      }
++      if (m_diag_log_this_response)
++      {
++        m_diag_log_this_response = false;
++        if (m_diag_cmd_sent)
++        {
++          if (resp_nonzero)
++            GBADetectLog::LogJoybus(m_device_number, m_timestamp_sent, '<', buffer,
++                                    static_cast<int>(response_length), true);
++          else
++            GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "no-response",
++                                   fmt::format("cmd={:02x}", static_cast<u8>(m_last_cmd)));
++        }
++        // sent==0: the '>' line already recorded sent=0 (withheld); nothing to pair.
++      }
++    }
++
+     if (response_length == 0)
+       return -1;
+ 
+@@ -411,12 +529,16 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+   // Android exactly like the auto-reset above. RequestReset is tick-anchored
+   // (the core runs to the given GC timestamp before resetting), so every
+   // netplay client still resets this core at the same emulated time.
+-  if (pad_status.button & PadButton::PAD_BUTTON_X)
++  const bool x_now = (pad_status.button & PadButton::PAD_BUTTON_X) != 0;
++  if (x_now)
+   {
+     m_core->RequestReset(m_timestamp_sent);
+     if (GBALinkDiag* diag = DiagSlot(m_device_number))
+       diag->reset_count.fetch_add(1, std::memory_order_relaxed);
++    if (!m_diag_prev_xreset)
++      GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "x-reset", {});
+   }
++  m_diag_prev_xreset = x_now;
+ 
+   return DataResponse::NoData;
+ }
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index dc83b99..486fc1d 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -100,6 +100,21 @@ private:
+   // which the auto-reset guard above depends on.
+   bool m_diag_prev_link = false;
+ 
++  // gba_detect.log bookkeeping. CPU/emulation thread only; NOT serialized in
++  // DoState, and never read by any control path -- pure observation. See
++  // Core/HW/GBADetectLog.h.
++  bool m_diag_prev_established = false;
++  bool m_diag_prev_locked = false;
++  bool m_diag_prev_xreset = false;
++  bool m_diag_prev_resp_nonzero = false;
++  bool m_diag_log_this_response = false;
++  bool m_diag_cmd_sent = false;   // Review #3 Q1: was this poll's command actually sent?
++  u8 m_diag_prev_cmd_class = 0;   // 0=idle 1=probe(RESET/STATUS) 2=data(READ/WRITE)
++  u32 m_diag_cmd_log_count = 0;   // first-N command-dump budget (<=64)
++  u32 m_diag_cmd_burst = 0;       // extra command lines emitted after a transition
++  u64 m_diag_last_summary_tick = 0;
++  u64 m_diag_last_joy_tick = 0;   // Review #1 I4: min-gap rate limit for the H8 class path
++
+   std::shared_ptr<HW::GBA::Core> m_core;
+   std::shared_ptr<GBAHostInterface> m_gbahost;
+ };
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index a04d67b..afbddec 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -158,7 +158,7 @@ void XDLauncherDialog::CreateMainLayout()
+   };
+   add_row(&m_game_row, tr("Pokémon XD (USA) — choose your XD ISO file"), tr("Choose ISO..."));
+   add_row(&m_rom_row, tr("Emerald ROM configured"), tr("Choose ROM..."));
+-  add_row(&m_bios_row, tr("GBA BIOS (optional)"), tr("Choose BIOS..."));
++  add_row(&m_bios_row, tr("Official GBA BIOS"), tr("Choose BIOS..."));
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+   add_row(&m_gba_input_row, tr("GBA controls"), tr("Use defaults"));
+@@ -269,11 +269,17 @@ void XDLauncherDialog::RefreshChecklist()
+   // auto-reset no longer races Emerald's connection handshake (the reset was
+   // the real problem, never the BIOS). An official dump is still used if the
+   // user has one; otherwise the bundled BIOS boots the GBA.
++  // Required, and settled the hard way: the official dump is the only BIOS the
++  // game will accept. Its boot code contains Nintendo's own JoyBus listener,
++  // which is what answers the GameCube's handshake -- no open-source BIOS
++  // reimplements it, and mGBA's HLE BIOS does not either. Tested on device:
++  // the bundled build, a current Cult-of-GBA build and HLE all leave the link
++  // window opening while the handshake never starts.
+   const bool official_bios = XDNetplay::CheckOfficialBios(nullptr);
+-  SetRowState(m_bios_row.status, true);
++  SetRowState(m_bios_row.status, official_bios);
+   m_bios_row.description->setText(
+-      official_bios ? tr("GBA BIOS: using your official dump") :
+-                      tr("GBA BIOS: none needed — the bundled one works (optional)"));
++      official_bios ? tr("Official GBA BIOS configured") :
++                      tr("Official GBA BIOS required — the game cannot detect the GBA without it"));
+   SetRowState(m_team_saves_row.status, TeamSavesInstalled());
+   SetRowState(m_vs_save_row.status, VsSaveInstalled());
+   const bool input_mapped = XDNetplay::GbaInputMapped();
+@@ -471,6 +477,15 @@ void XDLauncherDialog::OnBootSolo()
+     return;
+   }
+ 
++  if (!XDNetplay::CheckOfficialBios(nullptr))
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("The official GBA BIOS is required — XD cannot detect the GBA without it. "
++           "Add it with \"Choose BIOS...\" first."));
++    return;
++  }
++
+   XDNetplay::EnsureGbaConfig();
+   emit BootXD(QString::fromStdString(game->GetFilePath()));
+ }
+@@ -486,6 +501,15 @@ void XDLauncherDialog::OnHost()
+     return;
+   }
+ 
++  if (!XDNetplay::CheckOfficialBios(nullptr))
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("The official GBA BIOS is required — XD cannot detect the GBA without it. "
++           "Add it with \"Choose BIOS...\" first."));
++    return;
++  }
++
+   PrepareNetplayConfig();
+   Config::Save();
+   emit HostXD(*game);
+@@ -501,6 +525,15 @@ void XDLauncherDialog::OnJoin()
+     return;
+   }
+ 
++  if (!XDNetplay::CheckOfficialBios(nullptr))
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("The official GBA BIOS is required — XD cannot detect the GBA without it. "
++           "Add it with \"Choose BIOS...\" first."));
++    return;
++  }
++
+   PrepareNetplayConfig();
+   Config::SetBaseOrCurrent(Config::NETPLAY_HOST_CODE, code);
+   Config::Save();
+-- 
+2.39.5 (Apple Git-154)
+
