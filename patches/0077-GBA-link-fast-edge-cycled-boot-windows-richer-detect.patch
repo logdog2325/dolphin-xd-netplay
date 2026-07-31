@@ -1,0 +1,722 @@
+From e5dd63b3adb13c03efd6691512a0f09449a96490 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Thu, 30 Jul 2026 18:45:21 -0700
+Subject: [PATCH] GBA link: fast edge-cycled boot windows, richer detection
+ log, per-session log files
+
+Three-session log forensics plus a read of XD's own binary settled how
+detection actually works: XD arms its GBA bring-up from the connection
+menus and then fires on the next absent->present transition of the
+socket, so what it needs from the emulator is frequent fresh boot
+windows. Restore the debounced falling-edge auto-reset (window seen this
+boot, link continuously down >= 250 ms, >= 1 s between resets; the
+250 ms debounce is immune to the RCNT blink race that killed the old
+edge trigger, and the 6 s timer stays as a backstop). Config-gated
+(GBA/EdgeReset, default on), read once per session so netplay clients
+can't diverge mid-run.
+
+Delete the quiet window: it was built to shelter the abandoned bundled
+BIOS's cartridge listener and is provably inert in solo (commands at a
+down link never reach the core), while adding a rare netplay divergence
+surface. Every command is sent again.
+
+Diagnostic log upgrades, all bounded: one file per session named
+gba_detect_YYYYMMDD_HHMMSS.log with the two previous sessions retained
+(and shared together by the Android Share button, so a failed
+attempt/retry pair arrives intact); 4 MiB budget (the old 1 MiB died
+after ~3.5 min of XD's connected-idle RESET polling); JOY-register tap
+on the GBA event thread logging SEND-bit transitions with the pending
+JOY_TRANS word and attributing each clear to the command that caused it;
+JOYSTAT after each command on response lines; response bursts at every
+window-open (records which listener answered with what status); a burst
+whenever data resumes after >= 1 s of silence (captures the client's
+post-hello report with content); ungated rd=/wr= counters in the summary
+lines; reason=edge|timer on every auto-reset. On-screen prb counter now
+says 65535+ when its 16-bit packing saturates instead of freezing at a
+plausible-looking number.
+---
+ .../features/dualscreen/GbaScreenView.kt      |   8 +-
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  27 ++--
+ Source/Core/Core/Config/MainSettings.cpp      |   3 +
+ Source/Core/Core/Config/MainSettings.h        |   1 +
+ Source/Core/Core/HW/GBACore.cpp               |  55 ++++++++
+ Source/Core/Core/HW/GBACore.h                 |  13 ++
+ Source/Core/Core/HW/GBADetectLog.cpp          |  77 ++++++++----
+ Source/Core/Core/HW/GBADetectLog.h            |  24 ++--
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 119 +++++++++++-------
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  10 +-
+ 10 files changed, 250 insertions(+), 87 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index cd165fc..e349586 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -530,7 +530,13 @@ class GbaScreenView @JvmOverloads constructor(
+             diagBuilder.append(" lk=").append(bit(GbaHostBridge.linkDiagLinkOpen(diag)))
+                 .append(" win=").append(GbaHostBridge.linkDiagWindowCount(diag))
+                 .append(" rst=").append(GbaHostBridge.linkDiagResetCount(diag))
+-                .append(" prb=").append(GbaHostBridge.linkDiagProbeCount(diag))
++                // The packed counter saturates at 16 bits; say so instead of
++                // showing a frozen 65535 that reads like a real value.
++                .append(" prb=").append(
++                    GbaHostBridge.linkDiagProbeCount(diag).let {
++                        if (it >= 0xFFFF) "65535+" else it.toString()
++                    }
++                )
+                 .append(" est=").append(bit(GbaHostBridge.linkDiagEstablished(diag)))
+                 .append(" lck=").append(bit(GbaHostBridge.linkDiagLocked(diag)))
+                 .append(" cmd=").append(
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index e9d8289..905ce4c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -193,25 +193,32 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ 
+-    /** Share the GBA-detection diagnostic log (written to GBA/gba_detect.log in
+-     * the app's external files dir, which the stock Files app hides on Android
+-     * 11+) via the FileProvider so the user can hand it to us. */
++    /** Share the GBA-detection diagnostic logs (GBA/gba_detect_*.log in the
++     * app's external files dir, which the stock Files app hides on Android
++     * 11+) via the FileProvider. One file per session, newest three retained —
++     * all are shared together so a failed-attempt/retry pair arrives intact,
++     * and the timestamped names say which session is which. */
+     private fun shareDetectLog() {
+-        val log = java.io.File(getExternalFilesDir(null), "GBA/gba_detect.log")
+-        if (!log.exists()) {
++        val dir = java.io.File(getExternalFilesDir(null), "GBA")
++        val logs = (dir.listFiles { f ->
++            f.isFile && f.name.startsWith("gba_detect") && f.name.endsWith(".log")
++        } ?: emptyArray()).sortedByDescending { it.name }.take(3)
++        if (logs.isEmpty()) {
+             android.widget.Toast.makeText(
+                 this, "No detect log yet — boot XD once, then share.",
+                 android.widget.Toast.LENGTH_LONG).show()
+             return
+         }
+-        val uri = androidx.core.content.FileProvider.getUriForFile(
+-            this, "$packageName.xdshare", log)
+-        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
++        val uris = ArrayList<android.os.Parcelable>(logs.map {
++            androidx.core.content.FileProvider.getUriForFile(this, "$packageName.xdshare", it)
++        })
++        val send = android.content.Intent(
++            android.content.Intent.ACTION_SEND_MULTIPLE).apply {
+             type = "text/plain"
+-            putExtra(android.content.Intent.EXTRA_STREAM, uri)
++            putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, uris)
+             addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+         }
+-        startActivity(android.content.Intent.createChooser(send, "Share detect log"))
++        startActivity(android.content.Intent.createChooser(send, "Share detect logs"))
+     }
+ 
+     /** Boot Pokemon XD directly by game ID, bypassing the game picker (which
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index f53386b..1f7f38e 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -409,6 +409,9 @@ const Info<std::string> MAIN_GBA_SAVES_PATH{{System::Main, "GBA", "SavesPath"},
+ const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH{{System::Main, "GBA", "SavesInRomPath"}, false};
+ const Info<bool> MAIN_GBA_LINK_MUTED{{System::Main, "GBA", "MuteLinkAudio"}, false};
+ const Info<bool> MAIN_GBA_PRACTICE_DUMMY{{System::Main, "GBA", "PracticeDummy"}, false};
++// Debounced falling-edge GBA auto-reset (fast fresh-boot-window cadence for
++// XD's edge-triggered detection). Default on; timer backstop remains either way.
++const Info<bool> MAIN_GBA_EDGE_RESET{{System::Main, "GBA", "EdgeReset"}, true};
+ #endif
+ 
+ // Main.Network
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index e4ed9fe..86c08ad 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -229,6 +229,7 @@ extern const Info<std::string> MAIN_GBA_SAVES_PATH;
+ extern const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH;
+ extern const Info<bool> MAIN_GBA_LINK_MUTED;
+ extern const Info<bool> MAIN_GBA_PRACTICE_DUMMY;
++extern const Info<bool> MAIN_GBA_EDGE_RESET;
+ 
+ static constexpr std::size_t GBPLAYER_GBA_INDEX = 4;
+ #endif
+diff --git a/Source/Core/Core/HW/GBACore.cpp b/Source/Core/Core/HW/GBACore.cpp
+index bd5440d..fdb2311 100644
+--- a/Source/Core/Core/HW/GBACore.cpp
++++ b/Source/Core/Core/HW/GBACore.cpp
+@@ -16,6 +16,8 @@
+ #include <mz_zip.h>
+ #include <mz_zip_rw.h>
+ 
++#include <fmt/format.h>
++
+ #include "AudioCommon/AudioCommon.h"
+ 
+ #include "Common/ChunkFile.h"
+@@ -637,6 +639,53 @@ void Core::RequestReset(u64 gc_ticks)
+   });
+ }
+ 
++void Core::DiagJoyTap(bool after_command)
++{
++  if (!IsStarted() || m_core->platform(m_core) != mPLATFORM_GBA)
++    return;
++  const auto* gba = static_cast<::GBA*>(m_core->board);
++  // io[] is halfword-indexed by (address - 0x04000000) >> 1.
++  // 0x154/0x156 = JOY_TRANS_LO/HI, 0x158 = JOYSTAT (bit 0x08 = SEND: the GBA
++  // wrote JOY_TRANS and has data ready for the GameCube).
++  const u8 stat = static_cast<u8>(gba->memory.io[0x158 >> 1]);
++  const u32 trans = gba->memory.io[0x154 >> 1] |
++                    (static_cast<u32>(gba->memory.io[0x156 >> 1]) << 16);
++  if (after_command)
++    m_joystat_after_cmd.store(stat, std::memory_order_relaxed);
++
++  const bool send_now = (stat & 0x08) != 0;
++  const bool send_prev = (m_diag_prev_joystat & 0x08) != 0;
++  m_diag_prev_joystat = stat;
++  if (send_now == send_prev)
++    return;
++  // Token bucket: never more than ~20 edge lines per second per core, so a
++  // pathological flap can't make the event thread spend its time formatting.
++  const u64 tps = m_system.GetSystemTimers().GetTicksPerSecond();
++  if (m_diag_last_joy_line_ticks != 0 && m_last_gc_ticks > m_diag_last_joy_line_ticks &&
++      m_last_gc_ticks - m_diag_last_joy_line_ticks < tps / 20)
++  {
++    return;
++  }
++  m_diag_last_joy_line_ticks = m_last_gc_ticks;
++  if (send_now)
++  {
++    // The client raised SEND: JOY_TRANS holds what it wants the GC to read.
++    GBADetectLog::LogEvent(m_device_number, m_last_gc_ticks, "jpost",
++                           fmt::format("trans={:08x} stat={:02x}", trans, stat), false);
++  }
++  else
++  {
++    // SEND fell. cause=<cmd byte> when the joybus command that just executed
++    // cleared it (a GC read); cause=none when the program or a reset did.
++    GBADetectLog::LogEvent(
++        m_device_number, m_last_gc_ticks, "jclear",
++        after_command ?
++            fmt::format("cause={:02x} stat={:02x}", static_cast<u8>(m_joybus_command), stat) :
++            fmt::format("cause=none stat={:02x}", stat),
++        false);
++  }
++}
++
+ void Core::HandleEvent(SyncEvent event)
+ {
+   m_keys = event.keys;
+@@ -647,11 +696,15 @@ void Core::HandleEvent(SyncEvent event)
+   {
+     if (IsStarted())
+       m_core->reset(m_core);
++    DiagJoyTap(false);
+     return;
+   }
+ 
+   if (event.event_type != SyncEventType::RunCommand)
++  {
++    DiagJoyTap(false);
+     return;
++  }
+ 
+   if (m_link_enabled && !m_force_disconnect)
+   {
+@@ -663,6 +716,8 @@ void Core::HandleEvent(SyncEvent event)
+     m_response_size = 0;
+   }
+ 
++  DiagJoyTap(true);
++
+   m_command_pending.store(false, std::memory_order_release);
+   m_command_pending.notify_one();
+ 
+diff --git a/Source/Core/Core/HW/GBACore.h b/Source/Core/Core/HW/GBACore.h
+index e63c6a4..0222ade 100644
+--- a/Source/Core/Core/HW/GBACore.h
++++ b/Source/Core/Core/HW/GBACore.h
+@@ -81,6 +81,9 @@ public:
+   void RequestReset(u64 gc_ticks);
+   bool IsStarted() const;
+   bool IsLinkEnabled() const { return m_link_enabled.load(std::memory_order_relaxed); }
++  // JOYSTAT as sampled on the event thread right after the last joybus command
++  // (gba_detect.log's jsa= field). Diagnostic only.
++  u8 GetJoyStatAfterCommand() const { return m_joystat_after_cmd.load(std::memory_order_relaxed); }
+   CoreInfo GetCoreInfo() const;
+ 
+   // Host-side audio gate: while true this core's samples are dropped before
+@@ -136,6 +139,10 @@ private:
+   };
+   void PushEvent(SyncEvent event);
+   void HandleEvent(SyncEvent event);
++  // I1: sample the GBA's JOY registers on the event thread and log SEND-bit
++  // transitions (gba_detect.log). after_command attributes a falling edge to
++  // the joybus command that just ran. Never blocks: log lines are unflushed.
++  void DiagJoyTap(bool after_command);
+ 
+   bool LoadBIOS(const char* bios_path);
+   bool LoadSave(const char* save_path);
+@@ -170,6 +177,12 @@ private:
+   // thread in the SI device. Emerald toggles JOYBUS off/on two instructions
+   // apart, so this flips constantly during a handshake.
+   std::atomic_bool m_link_enabled{false};
++  // gba_detect.log JOY-register tap (I1). m_joystat_after_cmd is written on the
++  // event thread after each joybus command and read by the SI thread when it
++  // logs the response line; the rest are event-thread-only. Pure observation.
++  std::atomic<u8> m_joystat_after_cmd{0};
++  u8 m_diag_prev_joystat = 0;
++  u64 m_diag_last_joy_line_ticks = 0;
+   bool m_force_disconnect = false;
+ 
+   std::weak_ptr<GBAHostInterface> m_host;
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index 54f900e..f16e37f 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -3,10 +3,13 @@
+ 
+ #include "Core/HW/GBADetectLog.h"
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <ctime>
+ #include <fstream>
++#include <functional>
+ #include <mutex>
++#include <vector>
+ 
+ #include <fmt/format.h>
+ 
+@@ -20,8 +23,11 @@ namespace GBADetectLog
+ namespace
+ {
+ // Hard ceiling on one session's file, so a wedged session that emits summaries
+-// for hours can never fill the disk. 1 MiB is tens of thousands of lines.
+-constexpr u64 MAX_LOG_BYTES = 1u << 20;
++// for hours can never fill the disk. 4 MiB: a 35-minute session on the old
++// 1 MiB budget hit the cap after ~3.5 minutes of XD's connected-idle RESET
++// polling and went dark for the interesting part; the new budget plus the
++// smaller post-reset bursts holds roughly half an hour of worst-case traffic.
++constexpr u64 MAX_LOG_BYTES = 4u << 20;
+ 
+ std::mutex s_mutex;
+ std::ofstream s_file;    // held open for the session; never fopen'd per line
+@@ -32,7 +38,7 @@ int s_live_devices = 0;  // ref-count -> session begin/end
+ // (Review #1 I5: the byte cap must bound CPU/lock cost, not just disk).
+ std::atomic<bool> s_capped{false};
+ 
+-std::string Timestamp()
++std::string Timestamp(const char* format)
+ {
+   const std::time_t now = std::time(nullptr);
+   std::tm tm{};
+@@ -42,10 +48,35 @@ std::string Timestamp()
+   localtime_r(&now, &tm);
+ #endif
+   char buf[32] = {};
+-  std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm);
++  std::strftime(buf, sizeof(buf), format, &tm);
+   return buf;
+ }
+ 
++// Keep only the newest KEEP_PREVIOUS previous session logs (the timestamped
++// names sort lexicographically = chronologically), and drop the un-timestamped
++// legacy file from older builds. Called before each session's file is created,
++// so at most KEEP_PREVIOUS + 1 logs ever exist.
++constexpr size_t KEEP_PREVIOUS = 2;
++
++void PruneOldLogs(const std::string& dir)
++{
++  File::Delete(dir + "gba_detect.log");  // legacy single-file name
++  std::vector<std::string> old_logs;
++  const File::FSTEntry tree = File::ScanDirectoryTree(dir, false);
++  for (const File::FSTEntry& child : tree.children)
++  {
++    const std::string& name = child.virtualName;
++    if (!child.isDirectory && name.rfind("gba_detect_", 0) == 0 &&
++        name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0)
++    {
++      old_logs.push_back(name);
++    }
++  }
++  std::sort(old_logs.begin(), old_logs.end(), std::greater<std::string>());
++  for (size_t i = KEEP_PREVIOUS; i < old_logs.size(); ++i)
++    File::Delete(dir + old_logs[i]);
++}
++
+ // Must hold s_mutex. Appends one line (adds '\n'), enforces the byte cap, never
+ // throws. `flush` forces the stream to disk for rare, important lines.
+ void WriteLine(const std::string& line, bool flush)
+@@ -69,11 +100,10 @@ void WriteLine(const std::string& line, bool flush)
+ }
+ }  // namespace
+ 
+-const std::string& FilePath()
++std::string FilePath()
+ {
+-  // D_GBAUSER_IDX already ends in a path separator (".../GBA/").
+-  static const std::string path = File::GetUserPath(D_GBAUSER_IDX) + "gba_detect.log";
+-  return path;
++  std::lock_guard lock(s_mutex);
++  return s_path;
+ }
+ 
+ void OnDeviceCreated()
+@@ -82,18 +112,21 @@ void OnDeviceCreated()
+   if (s_live_devices++ != 0)
+     return;  // session already open; just count this device
+ 
+-  s_path = FilePath();
++  // D_GBAUSER_IDX already ends in a path separator (".../GBA/").
++  const std::string dir = File::GetUserPath(D_GBAUSER_IDX);
++  PruneOldLogs(dir);
++  s_path = dir + "gba_detect_" + Timestamp("%Y%m%d_%H%M%S") + ".log";
+   s_file.close();
+   s_file.clear();
+   s_file.open(s_path, std::ios::out | std::ios::trunc);
+   s_bytes = 0;
+   s_capped.store(false, std::memory_order_relaxed);
+ 
+-  WriteLine(fmt::format("gba_detect.log  path={}", s_path), true);
+-  WriteLine(fmt::format("session start  {}", Timestamp()), true);
++  WriteLine(fmt::format("gba_detect log  path={}", s_path), true);
++  WriteLine(fmt::format("session start  {}", Timestamp("%Y-%m-%d %H:%M:%S")), true);
+   WriteLine("cols: t=<gc_tick|boot> sock=<SI channel; link GBAs=2,3> <event> <key=val...>", true);
+-  WriteLine("note: '> ... sent=0' == command withheld by quiet window (NOT GBA silence); "
+-            "a per-socket 'role' line prints once under netplay",
++  WriteLine("note: a per-socket 'role' line prints once under netplay; rd=/wr= in sum lines are "
++            "ungated data-command counts",
+             true);
+ 
+   OSD::AddMessage(fmt::format("GBA detect log: {}", s_path), 12000, OSD::Color::CYAN);
+@@ -104,7 +137,7 @@ void OnDeviceDestroyed()
+   std::lock_guard lock(s_mutex);
+   if (s_live_devices > 0 && --s_live_devices == 0)
+   {
+-    WriteLine(fmt::format("session end  {}", Timestamp()), true);
++    WriteLine(fmt::format("session end  {}", Timestamp("%Y-%m-%d %H:%M:%S")), true);
+     s_file.flush();
+     s_file.close();
+   }
+@@ -122,15 +155,15 @@ void LogBios(int channel, bool official, const std::string& path, u64 size, bool
+             true);
+ }
+ 
+-void LogEvent(int channel, u64 tick, const char* event, const std::string& detail)
++void LogEvent(int channel, u64 tick, const char* event, const std::string& detail, bool flush)
+ {
+   if (s_capped.load(std::memory_order_relaxed))
+     return;
+   std::lock_guard lock(s_mutex);
+-  WriteLine(fmt::format("t={} sock={} {} {}", tick, channel, event, detail), true);
++  WriteLine(fmt::format("t={} sock={} {} {}", tick, channel, event, detail), flush);
+ }
+ 
+-void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent)
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa)
+ {
+   if (s_capped.load(std::memory_order_relaxed))
+     return;
+@@ -141,21 +174,21 @@ void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool s
+                           sent ? 1 : 0),
+               false);  // bounded burst; flushed by the next event/summary line
+   else
+-    WriteLine(fmt::format("t={} sock={} joy < {:02x}{:02x}{:02x}{:02x}{:02x} len={}", tick, channel,
+-                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len),
++    WriteLine(fmt::format("t={} sock={} joy < {:02x}{:02x}{:02x}{:02x}{:02x} len={} jsa={:02x}",
++                          tick, channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len, jsa),
+               false);
+ }
+ 
+ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
+-                u32 prb, bool est, bool lck, u8 cmd)
++                u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr)
+ {
+   if (s_capped.load(std::memory_order_relaxed))
+     return;
+   std::lock_guard lock(s_mutex);
+   WriteLine(fmt::format("t={} sock={} sum rom={} gba={} loc={} lk={} win={} rst={} prb={} est={} "
+-                        "lck={} cmd={:02x}",
++                        "lck={} cmd={:02x} rd={} wr={}",
+                         tick, channel, rom ? 1 : 0, gba ? 1 : 0, loc ? 1 : 0, lk ? 1 : 0, win, rst,
+-                        prb, est ? 1 : 0, lck ? 1 : 0, cmd),
++                        prb, est ? 1 : 0, lck ? 1 : 0, cmd, rd, wr),
+             true);
+ }
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index ce16fee..8568131 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -16,11 +16,12 @@
+ // on the joybus hot path (transition-triggered + <=1/sec summary + a bounded
+ // boot-time command dump only).
+ //
+-// File: <User>/GBA/gba_detect.log  (File::GetUserPath(D_GBAUSER_IDX)).
++// File: <User>/GBA/gba_detect_YYYYMMDD_HHMMSS.log (File::GetUserPath(D_GBAUSER_IDX));
++// one file per session, the two most recent previous sessions are retained.
+ namespace GBADetectLog
+ {
+-// Resolved absolute path of the log file (stable for the process lifetime).
+-const std::string& FilePath();
++// Absolute path of the CURRENT session's log file (empty before any session).
++std::string FilePath();
+ 
+ // CSIDevice_GBAEmu ctor/dtor (CPU/host thread). Reference-counted: the first
+ // live GBA device of a session truncates the file, writes the banner as line 1
+@@ -33,16 +34,21 @@ void OnDeviceDestroyed();
+ void LogBios(int channel, bool official, const std::string& path, u64 size, bool netplay,
+              bool load_ok);
+ 
+-// Discrete detection transitions / role line. Flushed (transitions are rare).
+-void LogEvent(int channel, u64 tick, const char* event, const std::string& detail);
++// Discrete detection transitions / role line. Flushed by default (transitions
++// are rare); pass flush=false from the GBA event thread (I1 jpost/jclear) so
++// that thread never waits on a write syscall.
++void LogEvent(int channel, u64 tick, const char* event, const std::string& detail,
++              bool flush = true);
+ 
+ // One joybus command ('>') or response ('<') line. NOT flushed per call
+ // (bounded boot burst; a later event/summary flushes it). bytes[0..4] must be
+-// valid. `sent` is meaningful for '>' lines: 0 == withheld by the quiet window.
+-void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent);
++// valid. `sent` is meaningful for '>' lines. `jsa` (responses only) is JOYSTAT
++// as sampled on the event thread right after the command executed.
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa = 0);
+ 
+ // Once-per-second telemetry mirror (caller throttles to <=1/sec). Fields mirror
+-// the on-screen readout: rom/gba/loc/lk/win/rst/prb/est/lck/cmd.
++// the on-screen readout (rom/gba/loc/lk/win/rst/prb/est/lck/cmd) plus the
++// ungated data-command counters rd/wr (I4 ground truth).
+ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
+-                u32 prb, bool est, bool lck, u8 cmd);
++                u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr);
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index a0b3103..d98be84 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -52,7 +52,11 @@ static s64 GetSyncInterval(const SystemTimers::SystemTimersManager& timers)
+ CSIDevice_GBAEmu::CSIDevice_GBAEmu(Core::System& system, SIDevices device, int device_number)
+     : ISIDevice(system, device, device_number)
+ {
+-  GBADetectLog::OnDeviceCreated();  // opens/truncates the file BEFORE Core::Start fires H1
++  GBADetectLog::OnDeviceCreated();  // opens the session log BEFORE Core::Start fires H1
++  // Read once; in netplay every client constructs its devices from the same
++  // synced config, and never re-reading means a mid-session toggle can't split
++  // the clients' reset behavior.
++  m_edge_reset_enabled = Config::Get(Config::MAIN_GBA_EDGE_RESET);
+   m_core = std::make_shared<HW::GBA::Core>(system, m_device_number);
+   m_core->Start(system.GetCoreTiming().GetTicks());
+   m_gbahost = Host_CreateGBAHost(m_core);
+@@ -105,6 +109,17 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     if (m_last_cmd == EBufferCommands::CMD_READ_GBA ||
+         m_last_cmd == EBufferCommands::CMD_WRITE_GBA)
+     {
++      // I3 (gba_detect.log): a data command after >=1s of data silence starts a
++      // conversation we want captured with content -- the client hello, its
++      // post-hello report and any first GC WRITE all follow such silences (the
++      // rate-limited class logging provably missed the report in one session).
++      const u64 tps_now = static_cast<u64>(m_system.GetSystemTimers().GetTicksPerSecond());
++      if ((m_last_data_cmd == 0 ||
++           (m_timestamp_sent > m_last_data_cmd && m_timestamp_sent - m_last_data_cmd > tps_now)) &&
++          m_diag_cmd_burst < 32)
++      {
++        m_diag_cmd_burst = 32;
++      }
+       m_last_data_cmd = m_timestamp_sent;
+     }
+ 
+@@ -128,7 +143,14 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     // treating it as genuinely closed; that swallows the per-frame toggling
+     // while still noticing the real close at the end of the connection screen.
+     if (link_now)
++    {
+       m_last_link_seen = m_timestamp_sent;
++      // Rising edge = a boot link window opened since the last poll that saw the
++      // link down. Tracked independently of the diagnostics so the edge-reset
++      // trigger below never depends on the diag slot.
++      if (!m_link_was_enabled)
++        m_window_since_reset = true;
++    }
+     const bool handshake_active = m_last_data_cmd != 0 && elapsed_since(m_last_data_cmd) < tps * 8;
+ 
+     // Count consecutive polls where XD is probing a DEAD link. A back-out to the
+@@ -226,18 +248,30 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ 
+     if (probing && !link_now && !handshake_active && !m_link_established && !m_battle_locked)
+     {
+-      // Must exceed the slowest reset->link-window-open time, or the cooldown
+-      // resets the core before Emerald's window ever opens (livelock). Measured:
+-      // bundled open-source BIOS 2.35 s, official BIOS 4.78 s. The steady-state
+-      // cadence is now purely this interval, so keep it comfortably above the
+-      // slowest boot while still retrying often enough to catch XD's probes.
+-      const u64 min_interval = tps * 6;
+-      // Timer only -- no falling-edge shortcut. The edge trigger is what raced
+-      // Emerald's own RCNT toggling; a plain interval cannot.
++      // Two ways to decide the GBA should reboot and reopen its boot link
++      // window:
++      //
++      // EDGE (default, config-gated): a window opened this boot cycle and the
++      // link has now been continuously down >= 250 ms. The 250 ms debounce is
++      // what makes this race-free: Emerald's GameCubeMultiBoot_Init blinks RCNT
++      // within a frame while handshaking, so a live handshake refreshes
++      // m_last_link_seen every up-sample and can never accumulate 250 ms of
++      // down-time; only a genuinely closed window can. This restores the fast
++      // presence cadence (fresh boot window every ~1.2 s) that XD's
++      // edge-triggered detection gate wants -- XD arms on an absent->present
++      // transition, so frequent fresh windows are exactly what it samples.
++      //
++      // TIMER (backstop, always on): link down >= 1 s and 6 s since the last
++      // reset -- the previous behavior, kept as a floor for the edge path and
++      // as the sole path when the edge trigger is toggled off.
+       const bool link_idle = m_last_link_seen == 0 || elapsed_since(m_last_link_seen) > tps;
+-      const bool cooldown_elapsed =
+-          m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > min_interval;
+-      if (link_idle && cooldown_elapsed)
++      const bool timer_fire =
++          link_idle && (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > tps * 6);
++      const bool edge_fire =
++          m_edge_reset_enabled && m_window_since_reset && m_last_link_seen != 0 &&
++          elapsed_since(m_last_link_seen) > tps / 4 &&
++          (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > tps);
++      if (edge_fire || timer_fire)
+       {
+         if (!NetPlay::IsNetPlayRunning())
+         {
+@@ -264,21 +298,13 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         }
+         m_last_auto_reset = m_timestamp_sent;
+         m_data_cmd_count = 0;
+-        // Emerald's GameCubeMultiBoot_Main only re-runs its Init after roughly
+-        // eleven frames with no serial interrupt: every joybus command the
+-        // GameCube sends resets that counter. XD probes a socket it is waiting
+-        // on continuously (thousands of times per attempt), which starves the
+-        // cartridge of the quiet it needs and leaves it never ready -- windows
+-        // open, but the handshake never begins. Hold the commands back until
+-        // this core has actually reopened its window, so the reboot lands in
+-        // silence the way it does for a socket the game is not yet hammering.
+-        m_quiet_until = m_timestamp_sent + tps * 6;
++        m_window_since_reset = false;  // a fresh boot must open its own window
+         GBADetectLog::LogEvent(
+             m_device_number, m_timestamp_sent, "auto-reset",
+-            fmt::format("{} link_idle={} cooldown_elapsed={} last_seen_ago={} quiet_until={}",
+-                        NetPlay::IsNetPlayRunning() ? "net" : "solo", link_idle, cooldown_elapsed,
+-                        elapsed_since(m_last_link_seen), m_quiet_until));
+-        m_diag_cmd_burst = 24;  // capture the commands right after the reboot
++            fmt::format("{} reason={} last_seen_ago={}", NetPlay::IsNetPlayRunning() ? "net" : "solo",
++                        edge_fire ? "edge" : "timer", elapsed_since(m_last_link_seen)));
++        if (m_diag_cmd_burst < 8)
++          m_diag_cmd_burst = 8;  // capture the commands right after the reboot
+       }
+     }
+     // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
+@@ -290,6 +316,11 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       {
+         diag->window_count.fetch_add(1, std::memory_order_relaxed);
+         GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "window-open", {});  // H2
++        // I2: capture the first probes INTO the fresh window with responses, so
++        // the status byte each listener presents (BIOS boot listener vs
++        // Emerald's cartridge listener) is on the record per window.
++        if (m_diag_cmd_burst < 4)
++          m_diag_cmd_burst = 4;
+       }
+       if (probing)
+         diag->probe_count.fetch_add(1, std::memory_order_relaxed);
+@@ -314,6 +345,16 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       m_diag_prev_established = m_link_established;
+       m_diag_prev_locked = m_battle_locked;
+ 
++      // I4: ungated data-command counters -- ground truth for "did XD ever
++      // READ/WRITE this socket", independent of every line-suppression rule.
++      if (data_cmd_now)
++      {
++        if (m_last_cmd == EBufferCommands::CMD_READ_GBA)
++          ++m_diag_rd_count;
++        else
++          ++m_diag_wr_count;
++      }
++
+       // <=1/sec summary mirroring the on-screen telemetry. Throttled on emulated
+       // ticks, so no transition rate can push it past one line/sec/channel.
+       if (m_diag_last_summary_tick == 0 ||
+@@ -325,7 +366,7 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+             m_netplay_pad_is_local, link_now, diag->window_count.load(std::memory_order_relaxed),
+             diag->reset_count.load(std::memory_order_relaxed),
+             diag->probe_count.load(std::memory_order_relaxed), m_link_established, m_battle_locked,
+-            static_cast<u8>(m_last_cmd));
++            static_cast<u8>(m_last_cmd), m_diag_rd_count, m_diag_wr_count);
+         m_diag_last_summary_tick = m_timestamp_sent;
+       }
+     }
+@@ -333,23 +374,12 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ 
+     m_link_was_enabled = link_now;
+ 
+-    // The quiet window ends as soon as the link is back up (the cartridge has
+-    // run its Init and is listening) or when it times out, so a core that never
+-    // reopens can't wedge itself out of contact.
+-    if (m_quiet_until != 0 && (link_now || m_timestamp_sent >= m_quiet_until))
+-    {
+-      GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "quiet-exit",
+-                             link_now ? "reason=link-up" : "reason=timeout");
+-      m_quiet_until = 0;
+-    }
+-
+-    // Withhold only the command itself. Everything below still runs, so the
+-    // core keeps being time-synced and SI keeps its cadence; the poll simply
+-    // finds no response and reports "no GBA answered", exactly as it already
+-    // does while a core is booting.
+-    m_diag_cmd_sent = (m_quiet_until == 0);  // H8/H9: was this poll's command actually sent?
+-    if (m_diag_cmd_sent)
+-      m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
++    // No quiet window anymore: it was built to shelter the (abandoned) bundled
++    // BIOS's cartridge listener, and in solo it was provably inert -- commands
++    // at a down link never reach the core in the first place. Every command is
++    // sent; m_diag_cmd_sent stays for logger stability (always true now).
++    m_diag_cmd_sent = true;
++    m_core->SendJoybusCommand(m_timestamp_sent, TransferInterval(), buffer, m_keys);
+ 
+     // H8 (gba_detect.log): bounded joybus command dump. buffer[0..4] still hold
+     // the request here (ReceiveResponse's GetJoybusResponse only overwrites it
+@@ -432,7 +462,8 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         {
+           if (resp_nonzero)
+             GBADetectLog::LogJoybus(m_device_number, m_timestamp_sent, '<', buffer,
+-                                    static_cast<int>(response_length), true);
++                                    static_cast<int>(response_length), true,
++                                    m_core->GetJoyStatAfterCommand());
+           else
+             GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "no-response",
+                                    fmt::format("cmd={:02x}", static_cast<u8>(m_last_cmd)));
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 486fc1d..40eab92 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -84,7 +84,13 @@ private:
+   u64 m_last_data_cmd = 0;
+   bool m_link_was_enabled = false;
+   u64 m_last_link_seen = 0;
+-  u64 m_quiet_until = 0;
++  // A boot link window opened since the last auto-reset (rising-edge tracked);
++  // required before the edge-reset can fire so a core that never opens a window
++  // is only ever cycled by the slow timer backstop.
++  bool m_window_since_reset = false;
++  // Read once at construction from MAIN_GBA_EDGE_RESET; never re-read so a
++  // mid-session config change can't desync netplay clients.
++  bool m_edge_reset_enabled = true;
+   u32 m_probe_link_down_streak = 0;
+   bool m_link_established = false;
+   // Sustained joybus traffic means a real party exchange, not a stray probe.
+@@ -112,6 +118,8 @@ private:
+   u8 m_diag_prev_cmd_class = 0;   // 0=idle 1=probe(RESET/STATUS) 2=data(READ/WRITE)
+   u32 m_diag_cmd_log_count = 0;   // first-N command-dump budget (<=64)
+   u32 m_diag_cmd_burst = 0;       // extra command lines emitted after a transition
++  u32 m_diag_rd_count = 0;        // I4: ungated READ count (ground truth in sum)
++  u32 m_diag_wr_count = 0;        // I4: ungated WRITE count (ground truth in sum)
+   u64 m_diag_last_summary_tick = 0;
+   u64 m_diag_last_joy_tick = 0;   // Review #1 I4: min-gap rate limit for the H8 class path
+ 
+-- 
+2.39.5 (Apple Git-154)
+
