@@ -1,0 +1,197 @@
+From 02d4ece2fc5b0a675b8629bad4333bdb171901b0 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 31 Jul 2026 10:50:01 -0700
+Subject: [PATCH] GBA link: remove all in-game back-out advice
+
+The stuck-entry hint misfired twice on device: during the live socket-3
+handoff (press-silent by design -- it advised aborting 2.5 s before
+success) and on the boot menu (any long menu idle trips a press-silence
+timer). Root problem: the wire looks identical whether the player is
+parked at the connect screen or idling on any other menu -- XD polls the
+sockets constantly either way -- so no heuristic here can place the
+advice correctly. Remove the OSD hint and the bottom-screen footer
+variant entirely; the recovery rule (a link arms within seconds of a
+good entry; ~20 s of nothing means back out with B and re-enter) lives
+in the launcher tip and the release notes, where it cannot interrupt a
+working session. The roll-state log lines still record every park.
+---
+ .../features/dualscreen/GbaScreenView.kt      | 27 ++++---------
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  6 ++-
+ Source/Core/Core/HW/GBADetectLog.cpp          |  6 ---
+ Source/Core/Core/HW/GBADetectLog.h            |  7 +---
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 38 +++++++------------
+ 5 files changed, 27 insertions(+), 57 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index f8d7430..a4c9e77 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -57,8 +57,6 @@ class GbaScreenView @JvmOverloads constructor(
+     }
+     private val diagBuilder = StringBuilder(96)
+     private val diagLines = arrayOfNulls<String>(DIAG_LINE_COUNT)
+-    // First diagnostic-draw timestamp; drives the 60 s "not linking?" hint.
+-    private var diagFirstMs = 0L
+ 
+     private var bitmap: Bitmap? = null
+     private var visibleDevice = GbaHostBridge.NO_DEVICE
+@@ -550,26 +548,17 @@ class GbaScreenView @JvmOverloads constructor(
+             diagLines[d] = diagBuilder.toString()
+         }
+ 
+-        // Fallback hint: XD's GBA detection is armed by the player's own menu
+-        // navigation, so a session can park un-linked if its detection roll
+-        // missed. After 60 s with no established port, replace the footer with
+-        // the recovery rule; it self-hides the moment any port establishes.
+-        if (diagFirstMs == 0L) diagFirstMs = android.os.SystemClock.elapsedRealtime()
+-        val anyEstablished = (0..3).any { GbaHostBridge.linkDiagEstablished(GbaHostBridge.getLinkDiag(it)) }
+-        val stuckLong =
+-            !anyEstablished && android.os.SystemClock.elapsedRealtime() - diagFirstMs > 60_000L
++        // No advisory text here: a press/time heuristic cannot tell a parked
++        // connect-screen entry from innocent menu idling, and misplaced advice
++        // is worse than none. The recovery rule lives in the release notes.
+         diagBuilder.setLength(0)
+-        if (stuckLong) {
+-            diagBuilder.append("Not linking? In XD press B, back out, re-enter VS mode - fresh roll each entry")
++        diagBuilder.append("visible=")
++        if (visibleDevice in 0..3) {
++            diagBuilder.append(visibleDevice + 1)
+         } else {
+-            diagBuilder.append("visible=")
+-            if (visibleDevice in 0..3) {
+-                diagBuilder.append(visibleDevice + 1)
+-            } else {
+-                diagBuilder.append('-')
+-            }
+-            diagBuilder.append("  (long-press to switch GBA)")
++            diagBuilder.append('-')
+         }
++        diagBuilder.append("  (long-press to switch GBA)")
+         diagLines[DIAG_LINE_COUNT - 1] = diagBuilder.toString()
+ 
+         // These lines are long and the view can be narrow, so shrink to fit
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index fb563ce..54e8944 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -228,9 +228,11 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (xd != null) {
+             // XD arms its GBA detection from the player's own menu navigation;
+             // a parked connect screen means the roll missed, and re-entering is
+-            // the retry. Shown here so the rule survives on the launcher.
++            // the retry. Shown only here on the launcher -- in-game text can't
++            // tell a parked entry from innocent menu idling, so it was removed.
+             statusMessage =
+-                "Tip: if a GBA hasn't linked ~60s after entering VS mode, press B and re-enter."
++                "Tip: a GBA links within seconds of entering the connect screen. " +
++                "If ~20s pass with nothing, press B and re-enter - each entry is a fresh try."
+             EmulationActivity.launch(this, xd.getPath(), false)
+         } else {
+             statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index 5f027c3..f9f7ff0 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -194,7 +194,6 @@ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u3
+ namespace
+ {
+ std::atomic<u64> s_last_pad_press{0};
+-std::atomic<u64> s_hint_claimed{0};
+ }  // namespace
+ 
+ void NotePadPress(u64 tick)
+@@ -206,9 +205,4 @@ u64 LastPadPress()
+ {
+   return s_last_pad_press.load(std::memory_order_relaxed);
+ }
+-
+-bool TryClaimHint(u64 press_tick)
+-{
+-  return s_hint_claimed.exchange(press_tick, std::memory_order_relaxed) != press_tick;
+-}
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index 17b1ce2..52ec86b 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -53,11 +53,8 @@ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u3
+                 u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr);
+ 
+ // Shared last-GC-pad-press tick (A/B/Start rising edges), written by the GC
+-// controller tap and read by the GBA devices for the per-roll state lines and
+-// the stuck-entry hint. Diagnostic only; never feeds emulation.
++// controller tap and read by the GBA devices for the per-roll state lines.
++// Diagnostic only; never feeds emulation.
+ void NotePadPress(u64 tick);
+ u64 LastPadPress();
+-// One-shot claim so exactly one GBA socket fires the on-screen hint per
+-// press-silence span. Returns true iff this call claimed the given press tick.
+-bool TryClaimHint(u64 press_tick);
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 63b404f..6c5b97f 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -27,7 +27,6 @@
+ #include "Core/Host.h"
+ #include "Core/NetPlayProto.h"
+ #include "Core/System.h"
+-#include "VideoCommon/OnScreenDisplay.h"
+ 
+ namespace SerialInterface
+ {
+@@ -269,13 +268,20 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ 
+     if (probing && !link_now && !handshake_active && !m_link_established && !m_battle_locked)
+     {
+-      // Is any OTHER GBA socket already engaged? Needed by the stuck-entry
+-      // hint (a live handoff is press-silent by design -- never advise backing
+-      // out of one) and, under the legacy flag, by the presence-regime split.
+-      // g_gba_link_diag is written by each device during its own poll on this
+-      // same thread, and est/lck derive purely from synced emulation state, so
+-      // the read is deterministic across netplay clients.
++      // NO on-screen advice fires from here. A press-silence heuristic cannot
++      // tell "parked at the connect screen" from "idling on any menu" -- the
++      // wire looks identical (XD polls the sockets constantly either way), and
++      // on device the hint misfired both during a live handoff and on the boot
++      // menu. The recovery rule (back out with B, re-enter) lives in the
++      // release notes; the roll-state log lines still record every park.
++      //
++      // Is any OTHER GBA socket already engaged? Used by the legacy full-boot
++      // presence-regime split. g_gba_link_diag is written by each device
++      // during its own poll on this same thread, and est/lck derive purely
++      // from synced emulation state, so the read is deterministic across
++      // netplay clients.
+       bool other_socket_engaged = false;
++      if (m_fullboot_presence)
+       {
+         auto& si_for_diag = m_system.GetSerialInterface();
+         for (int ch = 0; ch < MAX_SI_CHANNELS; ++ch)
+@@ -291,24 +297,6 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           }
+         }
+       }
+-
+-      // Stuck-entry hint: every recorded arm latched within ~1 s of the
+-      // player's final press, so 20 s of press-silence with NOTHING connected
+-      // means the entry roll parked and only backing out re-rolls it. The
+-      // no-socket-engaged gate is load-bearing: the socket-3 handoff runs
+-      // automatically for 20+ press-silent seconds after socket 2 links, and
+-      // an ungated version of this hint told the player to back out 2.5 s
+-      // before the handoff completed. 20 s clears the longest observed
+-      // innocent silence (title-screen idle, 15.9 s) with margin. One-shot per
+-      // press-silence span, claimed by whichever socket checks first.
+-      if (const u64 press = GBADetectLog::LastPadPress();
+-          !other_socket_engaged && press != 0 && m_timestamp_sent > press &&
+-          m_timestamp_sent - press > tps * 20 && GBADetectLog::TryClaimHint(press))
+-      {
+-        OSD::AddMessage("GBA link idle - press B to back out and re-enter the link menu", 8000,
+-                        OSD::Color::CYAN);
+-        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "hint", "stuck-entry");
+-      }
+       // Two ways to decide the GBA should reboot and reopen its boot link
+       // window:
+       //
+-- 
+2.39.5 (Apple Git-154)
+
