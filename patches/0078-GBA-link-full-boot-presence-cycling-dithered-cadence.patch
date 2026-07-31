@@ -1,0 +1,368 @@
+From ffbbcf047af59238b9518915fb9a112481e3b98b Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 31 Jul 2026 00:27:50 -0700
+Subject: [PATCH] GBA link: full-boot presence cycling + dithered cadence,
+ armed-rescue, roll instrumentation
+
+Session forensics against the first fully-instrumented successful battle
+settled the last failure mode: whenever XD actually asked, the GBA
+answered and the whole flow ran (arm -> ladder -> upload -> client ->
+both sockets -> battle); in the failed sessions XD never sent a byte.
+The game's detection is armed by the player's own menu navigation and
+then samples GBA presence -- and the previous reset cadence kept the GBA
+visible only ~12% of the time in short BIOS beacons, with a cycle length
+of exactly 65.0000 video frames, so a frame-grid sampler could stay
+phase-locked out of every window for an entire session.
+
+Fix, in three parts. (1) Full-boot presence cycling (GBA/FullBootPresence,
+default on): raise the minimum reset spacing to 5 s so every boot runs
+past the BIOS beacons into Emerald's long cartridge window -- the one the
+JoyBoot ladder needs -- before the falling-edge trigger fires at its
+close. Observed cycle ~7.8-8.2 s with ~41% presence duty, every cycle
+armable. Spacings between 3.45 and 4.79 s would reset in the dead gap
+before that window and silently recreate the starved regime; documented
+so nobody picks one. (2) A deterministic 0-450 ms dither on the edge
+debounce, derived from the reset ordinal, so consecutive cycles never
+repeat a length and no sampler can stay phase-locked; pure function of
+synced state, ordinal-global so both sockets stay in phase. (3) An
+armed-rescue clause: if XD arms on the cartridge window's last moments
+and loses it mid-ladder, the established latch used to wedge the socket
+against further resets; release it after the link has been down 0.5 s
+with 8 s since our reset and reboot through the same synced path.
+
+Instrumentation for whatever remains: A/B/Start rising edges from the GC
+pad logged on the detect-log clock (every detection roll timestamped
+against window state), a policy line at session start, ord=/dither= on
+every reset. On-screen fallback rule after 60 s unlinked and a launcher
+tip: back out with B and re-enter VS mode -- each entry is a fresh roll.
+
+Also register GBADetectLog in DolphinLib.props: the Windows build links
+the SI/GBA objects that now call it, and would have failed at link.
+---
+ .../features/dualscreen/GbaScreenView.kt      | 24 ++++-
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  5 +
+ Source/Core/Core/Config/MainSettings.cpp      |  4 +
+ Source/Core/Core/Config/MainSettings.h        |  1 +
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 93 ++++++++++++++++---
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  8 ++
+ .../Core/Core/HW/SI/SI_DeviceGCController.cpp | 23 +++++
+ .../Core/Core/HW/SI/SI_DeviceGCController.h   |  3 +
+ Source/Core/DolphinLib.props                  |  2 +
+ 9 files changed, 144 insertions(+), 19 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+index e349586..f8d7430 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
+@@ -57,6 +57,8 @@ class GbaScreenView @JvmOverloads constructor(
+     }
+     private val diagBuilder = StringBuilder(96)
+     private val diagLines = arrayOfNulls<String>(DIAG_LINE_COUNT)
++    // First diagnostic-draw timestamp; drives the 60 s "not linking?" hint.
++    private var diagFirstMs = 0L
+ 
+     private var bitmap: Bitmap? = null
+     private var visibleDevice = GbaHostBridge.NO_DEVICE
+@@ -548,14 +550,26 @@ class GbaScreenView @JvmOverloads constructor(
+             diagLines[d] = diagBuilder.toString()
+         }
+ 
++        // Fallback hint: XD's GBA detection is armed by the player's own menu
++        // navigation, so a session can park un-linked if its detection roll
++        // missed. After 60 s with no established port, replace the footer with
++        // the recovery rule; it self-hides the moment any port establishes.
++        if (diagFirstMs == 0L) diagFirstMs = android.os.SystemClock.elapsedRealtime()
++        val anyEstablished = (0..3).any { GbaHostBridge.linkDiagEstablished(GbaHostBridge.getLinkDiag(it)) }
++        val stuckLong =
++            !anyEstablished && android.os.SystemClock.elapsedRealtime() - diagFirstMs > 60_000L
+         diagBuilder.setLength(0)
+-        diagBuilder.append("visible=")
+-        if (visibleDevice in 0..3) {
+-            diagBuilder.append(visibleDevice + 1)
++        if (stuckLong) {
++            diagBuilder.append("Not linking? In XD press B, back out, re-enter VS mode - fresh roll each entry")
+         } else {
+-            diagBuilder.append('-')
++            diagBuilder.append("visible=")
++            if (visibleDevice in 0..3) {
++                diagBuilder.append(visibleDevice + 1)
++            } else {
++                diagBuilder.append('-')
++            }
++            diagBuilder.append("  (long-press to switch GBA)")
+         }
+-        diagBuilder.append("  (long-press to switch GBA)")
+         diagLines[DIAG_LINE_COUNT - 1] = diagBuilder.toString()
+ 
+         // These lines are long and the view can be narrow, so shrink to fit
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 905ce4c..fb563ce 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -226,6 +226,11 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private fun bootXd() {
+         val xd = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID)
+         if (xd != null) {
++            // XD arms its GBA detection from the player's own menu navigation;
++            // a parked connect screen means the roll missed, and re-entering is
++            // the retry. Shown here so the rule survives on the launcher.
++            statusMessage =
++                "Tip: if a GBA hasn't linked ~60s after entering VS mode, press B and re-enter."
+             EmulationActivity.launch(this, xd.getPath(), false)
+         } else {
+             statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 1f7f38e..0dc96d4 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -412,6 +412,10 @@ const Info<bool> MAIN_GBA_PRACTICE_DUMMY{{System::Main, "GBA", "PracticeDummy"},
+ // Debounced falling-edge GBA auto-reset (fast fresh-boot-window cadence for
+ // XD's edge-triggered detection). Default on; timer backstop remains either way.
+ const Info<bool> MAIN_GBA_EDGE_RESET{{System::Main, "GBA", "EdgeReset"}, true};
++// Full-boot presence cycling: 5 s minimum reset spacing so every boot exposes
++// the cartridge link window, not just the BIOS beacons. False = v0.4.33's
++// fast short-beacon cycling (escape hatch).
++const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE{{System::Main, "GBA", "FullBootPresence"}, true};
+ #endif
+ 
+ // Main.Network
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index 86c08ad..f16298a 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -230,6 +230,7 @@ extern const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH;
+ extern const Info<bool> MAIN_GBA_LINK_MUTED;
+ extern const Info<bool> MAIN_GBA_PRACTICE_DUMMY;
+ extern const Info<bool> MAIN_GBA_EDGE_RESET;
++extern const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE;
+ 
+ static constexpr std::size_t GBPLAYER_GBA_INDEX = 4;
+ #endif
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index d98be84..6a1596d 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -57,6 +57,11 @@ CSIDevice_GBAEmu::CSIDevice_GBAEmu(Core::System& system, SIDevices device, int d
+   // synced config, and never re-reading means a mid-session toggle can't split
+   // the clients' reset behavior.
+   m_edge_reset_enabled = Config::Get(Config::MAIN_GBA_EDGE_RESET);
++  m_fullboot_presence = Config::Get(Config::MAIN_GBA_FULLBOOT_PRESENCE);
++  // Every log self-identifies the reset policy it ran under.
++  GBADetectLog::LogEvent(m_device_number, 0, "policy",
++                         fmt::format("edge={} fullboot={}", m_edge_reset_enabled ? 1 : 0,
++                                     m_fullboot_presence ? 1 : 0));
+   m_core = std::make_shared<HW::GBA::Core>(system, m_device_number);
+   m_core->Start(system.GetCoreTiming().GetTicks());
+   m_gbahost = Host_CreateGBAHost(m_core);
+@@ -252,25 +257,43 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       // window:
+       //
+       // EDGE (default, config-gated): a window opened this boot cycle and the
+-      // link has now been continuously down >= 250 ms. The 250 ms debounce is
+-      // what makes this race-free: Emerald's GameCubeMultiBoot_Init blinks RCNT
+-      // within a frame while handshaking, so a live handshake refreshes
+-      // m_last_link_seen every up-sample and can never accumulate 250 ms of
+-      // down-time; only a genuinely closed window can. This restores the fast
+-      // presence cadence (fresh boot window every ~1.2 s) that XD's
+-      // edge-triggered detection gate wants -- XD arms on an absent->present
+-      // transition, so frequent fresh windows are exactly what it samples.
++      // link has now been continuously down >= 250 ms (+ dither, below). The
++      // debounce is what makes this race-free: Emerald's GameCubeMultiBoot_Init
++      // blinks RCNT within a frame while handshaking, so a live handshake
++      // refreshes m_last_link_seen every up-sample and can never accumulate the
++      // down-time; only a genuinely closed window can.
++      //
++      // FULL-BOOT PRESENCE (default): the minimum spacing between resets is
++      // 5 s, which lets every boot run past the official BIOS's four short
++      // JoyBus beacons (+0.78..+3.05 s) into Emerald's long cartridge window
++      // (+4.79..+7.53 s). 5 s lands INSIDE that window, so the link-down guard
++      // defers the fire to its closing edge: the observed cycle is ~7.8-8.2 s
++      // with ~41% presence duty, and every cycle exposes the window XD's ladder
++      // actually needs. DO NOT pick a spacing in 3.45-4.79 s: that resets in
++      // the dead gap before the cartridge window and silently recreates the
++      // short-beacon-only regime (12% duty) that let XD's detection roll miss.
++      //
++      // DITHER: a deterministic 0-450 ms term derived from the reset ordinal,
++      // so consecutive cycles never repeat the same length. The no-arm failure
++      // mode included a cycle length of exactly 65.0000 video frames -- a
++      // sampler on the frame grid could stay phase-locked out of every window
++      // for an entire session. The dither is a pure function of synced state
++      // (same on every netplay client) and ordinal-global (both sockets stay
++      // in phase with each other on purpose).
+       //
+       // TIMER (backstop, always on): link down >= 1 s and 6 s since the last
+-      // reset -- the previous behavior, kept as a floor for the edge path and
+-      // as the sole path when the edge trigger is toggled off.
++      // reset -- fires only when a boot never opened a window at all, and is
++      // the sole path when the edge trigger is toggled off.
++      const u64 dither =
++          (static_cast<u64>(m_auto_reset_ordinal) * 2654435761u % 450u) * (tps / 1000);
++      const u64 min_spacing = m_fullboot_presence ? tps * 5 : tps;
+       const bool link_idle = m_last_link_seen == 0 || elapsed_since(m_last_link_seen) > tps;
+       const bool timer_fire =
+           link_idle && (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > tps * 6);
+       const bool edge_fire =
+           m_edge_reset_enabled && m_window_since_reset && m_last_link_seen != 0 &&
+-          elapsed_since(m_last_link_seen) > tps / 4 &&
+-          (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > tps);
++          elapsed_since(m_last_link_seen) > tps / 4 + dither &&
++          (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > min_spacing);
+       if (edge_fire || timer_fire)
+       {
+         if (!NetPlay::IsNetPlayRunning())
+@@ -299,14 +322,56 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         m_last_auto_reset = m_timestamp_sent;
+         m_data_cmd_count = 0;
+         m_window_since_reset = false;  // a fresh boot must open its own window
++        ++m_auto_reset_ordinal;
+         GBADetectLog::LogEvent(
+             m_device_number, m_timestamp_sent, "auto-reset",
+-            fmt::format("{} reason={} last_seen_ago={}", NetPlay::IsNetPlayRunning() ? "net" : "solo",
+-                        edge_fire ? "edge" : "timer", elapsed_since(m_last_link_seen)));
++            fmt::format("{} reason={} last_seen_ago={} ord={} dither={}",
++                        NetPlay::IsNetPlayRunning() ? "net" : "solo",
++                        edge_fire ? "edge" : "timer", elapsed_since(m_last_link_seen),
++                        m_auto_reset_ordinal, dither / (tps / 1000)));
+         if (m_diag_cmd_burst < 8)
+           m_diag_cmd_burst = 8;  // capture the commands right after the reboot
+       }
+     }
++    // Armed-rescue: XD can arm on the cartridge window's last ~150 ms, latch
++    // m_link_established off the ladder's first data, and then lose the window
++    // mid-ladder -- est=1 with the link genuinely down wedges the socket (the
++    // pre-arm trigger above requires !est) while XD retries against silence.
++    // Release: link continuously down >= 0.5 s AND >= 8 s since our reset (a
++    // healthy arm has completed AXVE by +7.0 s and holds the link up; the
++    // post-upload client-reboot gap is covered by m_battle_locked, latched
++    // during the upload). Clear the latch and reboot through the same
++    // solo/netplay-synced path. Provably unreachable in every phase of the
++    // recorded successful sessions.
++    else if (probing && !link_now && m_link_established && !m_battle_locked &&
++             m_last_link_seen != 0 && elapsed_since(m_last_link_seen) >= tps / 2 &&
++             m_last_auto_reset != 0 && elapsed_since(m_last_auto_reset) > tps * 8)
++    {
++      m_link_established = false;
++      if (!NetPlay::IsNetPlayRunning())
++      {
++        m_core->RequestReset(m_timestamp_sent);
++        if (GBALinkDiag* diag = DiagSlot(m_device_number))
++          diag->reset_count.fetch_add(1, std::memory_order_relaxed);
++      }
++      else if (const NetPlay::PadDetails details = NetPlay::GetPadDetails(m_device_number);
++               details.is_local && details.local_pad < 4)
++      {
++        Pad::SetGBAReset(details.local_pad, true);
++        if (GBALinkDiag* diag = DiagSlot(m_device_number))
++          diag->reset_count.fetch_add(1, std::memory_order_relaxed);
++      }
++      m_last_auto_reset = m_timestamp_sent;
++      m_data_cmd_count = 0;
++      m_window_since_reset = false;
++      ++m_auto_reset_ordinal;
++      GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "rescue-reset",
++                             fmt::format("{} last_seen_ago={}",
++                                         NetPlay::IsNetPlayRunning() ? "net" : "solo",
++                                         elapsed_since(m_last_link_seen)));
++      if (m_diag_cmd_burst < 8)
++        m_diag_cmd_burst = 8;
++    }
+     // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
+     // below this point reads any of it, and nothing above it was moved or
+     // changed. Placed here so it sees the final values of this poll.
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 40eab92..4e58281 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -91,6 +91,14 @@ private:
+   // Read once at construction from MAIN_GBA_EDGE_RESET; never re-read so a
+   // mid-session config change can't desync netplay clients.
+   bool m_edge_reset_enabled = true;
++  // Read once from MAIN_GBA_FULLBOOT_PRESENCE: raise the minimum reset spacing
++  // to 5 s so every boot cycle exposes Emerald's long cartridge window (the
++  // one XD's ladder needs), not just the BIOS's short beacons. False restores
++  // the fast short-beacon cycling (the v0.4.33 behavior) as an escape hatch.
++  bool m_fullboot_presence = true;
++  // Counts every auto/rescue reset this session; drives the deterministic
++  // dither term (pure function of synced state -> netplay-safe).
++  u32 m_auto_reset_ordinal = 0;
+   u32 m_probe_link_down_streak = 0;
+   bool m_link_established = false;
+   // Sustained joybus traffic means a real party exchange, not a stray probe.
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
+index 1f7a7b6..d9d4d5e 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
+@@ -9,6 +9,11 @@
+ #include "Common/MsgHandler.h"
+ #include "Core/Config/MainSettings.h"
+ #include "Core/CoreTiming.h"
++#ifdef HAS_LIBMGBA
++#include <fmt/format.h>
++
++#include "Core/HW/GBADetectLog.h"
++#endif
+ #include "Core/HW/GCPad.h"
+ #include "Core/HW/ProcessorInterface.h"
+ #include "Core/HW/SI/SI.h"
+@@ -175,6 +180,24 @@ DataResponse CSIDevice_GCController::GetData(u32& hi, u32& low)
+   if (HandleButtonCombos(pad_status) == COMBO_ORIGIN)
+     pad_status.button |= PAD_GET_ORIGIN;
+ 
++#ifdef HAS_LIBMGBA
++  // gba_detect.log gate-roll tap: XD's GBA-detection "rolls" are driven by the
++  // player's menu presses, so timestamp A/B/Start RISING edges on the same
++  // t= clock as the link events. Rising-edge only -- a held button logs once.
++  {
++    const u16 pressed = pad_status.button & ~m_diag_prev_buttons;
++    if (pressed & (PAD_BUTTON_A | PAD_BUTTON_B | PAD_BUTTON_START))
++    {
++      GBADetectLog::LogEvent(m_device_number,
++                             m_system.GetCoreTiming().GetTicks(), "pad",
++                             fmt::format("a={} b={} start={}", (pressed & PAD_BUTTON_A) ? 1 : 0,
++                                         (pressed & PAD_BUTTON_B) ? 1 : 0,
++                                         (pressed & PAD_BUTTON_START) ? 1 : 0));
++    }
++    m_diag_prev_buttons = pad_status.button;
++  }
++#endif
++
+   hi = MapPadStatus(pad_status);
+ 
+   // Low bits are packed differently per mode
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGCController.h b/Source/Core/Core/HW/SI/SI_DeviceGCController.h
+index 19b5bdb..fb8ee16 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGCController.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGCController.h
+@@ -55,6 +55,9 @@ protected:
+   u64 m_timer_button_combo_start = 0;
+   // Type of button combo from the last/current poll
+   EButtonCombo m_last_button_combo = COMBO_NONE;
++  // gba_detect.log gate-roll tap: previous poll's button bits, for
++  // rising-edge-only logging of A/B/Start. Diagnostic only; not serialized.
++  u16 m_diag_prev_buttons = 0;
+ 
+ public:
+   // Constructor
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index fb8f8ce..977ab43 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -300,6 +300,7 @@
+     <ClInclude Include="Core\HW\EXI\EXI_DeviceModem.h" />
+     <ClInclude Include="Core\HW\EXI\EXI.h" />
+     <ClInclude Include="Core\HW\GBACore.h" />
++    <ClInclude Include="Core\HW\GBADetectLog.h" />
+     <ClInclude Include="Core\HW\GBAPad.h" />
+     <ClInclude Include="Core\HW\GBAPadEmu.h" />
+     <ClInclude Include="Core\HW\GCKeyboard.h" />
+@@ -1019,6 +1020,7 @@
+     <ClCompile Include="Core\HW\EXI\EXI_DeviceModem.cpp" />
+     <ClCompile Include="Core\HW\EXI\EXI.cpp" />
+     <ClCompile Include="Core\HW\GBACore.cpp" />
++    <ClCompile Include="Core\HW\GBADetectLog.cpp" />
+     <ClCompile Include="Core\HW\GBAPad.cpp" />
+     <ClCompile Include="Core\HW\GBAPadEmu.cpp" />
+     <ClCompile Include="Core\HW\GCKeyboard.cpp" />
+-- 
+2.39.5 (Apple Git-154)
+
