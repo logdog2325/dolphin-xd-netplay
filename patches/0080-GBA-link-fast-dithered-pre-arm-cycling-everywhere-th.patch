@@ -1,0 +1,365 @@
+From ba8a228421f7b49003c565ef37bdf13ca7bd0bf9 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 31 Jul 2026 09:34:05 -0700
+Subject: [PATCH] GBA link: fast dithered pre-arm cycling everywhere -- the
+ entry-park law fix
+
+Roll forensics across every pad-instrumented session (9/9, three builds,
+zero counterexamples) settled the last connection flake: XD's menu-entry
+arming completes ~0.6-1.0 s after the player's final press, PARKS iff
+Emerald's long cartridge window overlaps that span (4/4 parks), and
+otherwise arms, latching within ~20 ms of the next window edge of any
+kind -- almost always a BIOS beacon. The long window pre-arm was pure
+park-bait; arming never needed it, and the AXVE ladder gets its long
+window from the est-latch-protected post-arm boot in every recorded
+success. So the pre-arm regime is now the same fast dithered
+short-beacon cycling that has a 100% record as the handoff regime, for
+every socket in every phase. MAIN_GBA_FULLBOOT_PRESENCE flips to
+default-false and now means the legacy v0.4.35 per-phase behavior,
+preserved as an escape hatch; the cross-socket regime read only runs
+under it.
+
+Dither hardening: cap 350 ms in fast mode so the worst inter-edge gap
+stays ~1.5 s, and spread the hash (>>16) so consecutive cycles are not a
+fixed arithmetic step apart.
+
+Stuck-entry recovery: every recorded arm came within a second of the
+final press, so 20 s of press-silence on an unarmed socket now raises an
+on-screen hint (back out with B, re-enter) -- 20 s clears the longest
+observed innocent idle with margin; one-shot per press-silence span.
+
+Roll self-classification in the log: a roll-state line per socket at
+every pad press (link/est/lck, window age, last window duration,
+ordinal, regime), gap_ms on every window-open, and a first-data line per
+window carrying the armed-watcher signature (XD's first non-STATUS
+command ~17 ms after window-open) -- any residual park now names its
+mechanism in a single log with no cross-referencing.
+---
+ Source/Core/Core/Config/MainSettings.cpp      |  11 +-
+ Source/Core/Core/HW/GBADetectLog.cpp          |  20 +++
+ Source/Core/Core/HW/GBADetectLog.h            |   9 ++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 134 +++++++++++++-----
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  17 ++-
+ .../Core/Core/HW/SI/SI_DeviceGCController.cpp |   5 +-
+ 6 files changed, 147 insertions(+), 49 deletions(-)
+
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 0dc96d4..e1afd0b 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -412,10 +412,13 @@ const Info<bool> MAIN_GBA_PRACTICE_DUMMY{{System::Main, "GBA", "PracticeDummy"},
+ // Debounced falling-edge GBA auto-reset (fast fresh-boot-window cadence for
+ // XD's edge-triggered detection). Default on; timer backstop remains either way.
+ const Info<bool> MAIN_GBA_EDGE_RESET{{System::Main, "GBA", "EdgeReset"}, true};
+-// Full-boot presence cycling: 5 s minimum reset spacing so every boot exposes
+-// the cartridge link window, not just the BIOS beacons. False = v0.4.33's
+-// fast short-beacon cycling (escape hatch).
+-const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE{{System::Main, "GBA", "FullBootPresence"}, true};
++// LEGACY full-boot presence cycling (5 s spacing exposing the long cartridge
++// window pre-arm). Default OFF: on-device roll forensics proved XD's menu-entry
++// arming PARKS iff the long window overlaps the ~1 s arming-completion span
++// (4/4 parks), while every arm latches on short beacons -- so pre-arm sockets
++// now run fast dithered beacon cycling and the long window only appears on the
++// post-arm boot, where it belongs. True restores v0.4.35 behavior exactly.
++const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE{{System::Main, "GBA", "FullBootPresence"}, false};
+ #endif
+ 
+ // Main.Network
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index f16e37f..5f027c3 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -191,4 +191,24 @@ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u3
+                         prb, est ? 1 : 0, lck ? 1 : 0, cmd, rd, wr),
+             true);
+ }
++namespace
++{
++std::atomic<u64> s_last_pad_press{0};
++std::atomic<u64> s_hint_claimed{0};
++}  // namespace
++
++void NotePadPress(u64 tick)
++{
++  s_last_pad_press.store(tick, std::memory_order_relaxed);
++}
++
++u64 LastPadPress()
++{
++  return s_last_pad_press.load(std::memory_order_relaxed);
++}
++
++bool TryClaimHint(u64 press_tick)
++{
++  return s_hint_claimed.exchange(press_tick, std::memory_order_relaxed) != press_tick;
++}
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index 8568131..17b1ce2 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -51,4 +51,13 @@ void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool s
+ // ungated data-command counters rd/wr (I4 ground truth).
+ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
+                 u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr);
++
++// Shared last-GC-pad-press tick (A/B/Start rising edges), written by the GC
++// controller tap and read by the GBA devices for the per-roll state lines and
++// the stuck-entry hint. Diagnostic only; never feeds emulation.
++void NotePadPress(u64 tick);
++u64 LastPadPress();
++// One-shot claim so exactly one GBA socket fires the on-screen hint per
++// press-silence span. Returns true iff this call claimed the given press tick.
++bool TryClaimHint(u64 press_tick);
+ }  // namespace GBADetectLog
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 560e774..51c5ceb 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -27,6 +27,7 @@
+ #include "Core/Host.h"
+ #include "Core/NetPlayProto.h"
+ #include "Core/System.h"
++#include "VideoCommon/OnScreenDisplay.h"
+ 
+ namespace SerialInterface
+ {
+@@ -268,6 +269,20 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ 
+     if (probing && !link_now && !handshake_active && !m_link_established && !m_battle_locked)
+     {
++      // Stuck-entry hint: every recorded arm latched within ~1 s of the
++      // player's final press, so 20 s of press-silence on a still-unarmed
++      // socket means the entry roll parked and only backing out re-rolls it.
++      // 20 s clears the longest observed innocent silence (title-screen idle,
++      // 15.9 s) with margin. One-shot per press-silence span, claimed by
++      // whichever socket checks first.
++      if (const u64 press = GBADetectLog::LastPadPress();
++          press != 0 && m_timestamp_sent > press && m_timestamp_sent - press > tps * 20 &&
++          GBADetectLog::TryClaimHint(press))
++      {
++        OSD::AddMessage("GBA link idle - press B to back out and re-enter the link menu", 8000,
++                        OSD::Color::CYAN);
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "hint", "stuck-entry");
++      }
+       // Two ways to decide the GBA should reboot and reopen its boot link
+       // window:
+       //
+@@ -278,46 +293,40 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       // refreshes m_last_link_seen every up-sample and can never accumulate the
+       // down-time; only a genuinely closed window can.
+       //
+-      // FULL-BOOT PRESENCE (default): the minimum spacing between resets is
+-      // 5 s, which lets every boot run past the official BIOS's four short
+-      // JoyBus beacons (+0.78..+3.05 s) into Emerald's long cartridge window
+-      // (+4.79..+7.53 s). 5 s lands INSIDE that window, so the link-down guard
+-      // defers the fire to its closing edge: the observed cycle is ~7.8-8.2 s
+-      // with ~41% presence duty, and every cycle exposes the window XD's ladder
+-      // actually needs. DO NOT pick a spacing in 3.45-4.79 s: that resets in
+-      // the dead gap before the cartridge window and silently recreates the
+-      // short-beacon-only regime (12% duty) that let XD's detection roll miss.
++      // UNIFORM FAST REGIME (default): every pre-arm socket cycles at ~1.1-1.5 s
++      // showing only the BIOS's short (~133 ms) boot beacon. The on-device roll
++      // forensics (9/9 across three builds) settled why: XD's menu-entry arming
++      // completes ~0.6-1.0 s after the player's final press and PARKS iff
++      // Emerald's LONG cartridge window overlaps that span -- while every
++      // recorded arm latched within ~20 ms of a window-open edge, almost always
++      // a beacon. The long window is only needed AFTER arming, for the AXVE
++      // ladder, and the post-arm boot supplies it: the est latch stops all
++      // resets the moment XD engages, so the engaged boot runs uninterrupted
++      // into the cartridge window (proven in every successful session). This
++      // is byte-identical to the handoff regime that has a 100% record.
+       //
+-      // DITHER: a deterministic 0-450 ms term derived from the reset ordinal,
+-      // so consecutive cycles never repeat the same length. The no-arm failure
+-      // mode included a cycle length of exactly 65.0000 video frames -- a
+-      // sampler on the frame grid could stay phase-locked out of every window
+-      // for an entire session. The dither is a pure function of synced state
+-      // (same on every netplay client) and ordinal-global (both sockets stay
+-      // in phase with each other on purpose).
++      // LEGACY (config MAIN_GBA_FULLBOOT_PRESENCE=True): the v0.4.35 per-phase
++      // split -- full ~8 s boots (long window exposed pre-arm) while no socket
++      // is engaged, fast cycling once one is. Kept as an escape hatch. If ever
++      // re-enabled, never pick a spacing in 3.45-4.79 s: that resets in the
++      // dead gap before the cartridge window.
++      //
++      // DITHER: a deterministic 0-350 ms term hashed from the reset ordinal so
++      // consecutive cycles never repeat a length -- the v0.4.33 no-arm mode
++      // included a cycle of exactly 65.0000 video frames, which a frame-grid
++      // sampler could stay phase-locked against forever. Pure function of
++      // synced state (netplay-identical).
+       //
+       // TIMER (backstop, always on): link down >= 1 s and 6 s since the last
+       // reset -- fires only when a boot never opened a window at all, and is
+       // the sole path when the edge trigger is toggled off.
+-      const u64 dither =
+-          (static_cast<u64>(m_auto_reset_ordinal) * 2654435761u % 450u) * (tps / 1000);
+-      // PER-PHASE PRESENCE REGIME. Full boots (5 s spacing, long cartridge
+-      // window) are what XD's INITIAL arming likes -- on-device it armed the
+-      // first socket in 16-34 s under this regime, its fastest ever. But the
+-      // HANDOFF to the pending socket is the opposite: across every recorded
+-      // session on three builds, XD only advanced to the next socket when that
+-      // socket presented SHORT, RARE windows (~1.1 s cycling, 12% duty), and
+-      // never once when it presented long cartridge windows (~41% duty) -- the
+-      // connect flow tells the player to attach a GBA that is powered OFF, and
+-      // evidently samples for that absence before treating the socket as newly
+-      // connected. So: while no GBA socket is engaged, every socket runs full
+-      // boots (fast arming); once any socket establishes, the still-pending
+-      // sockets drop to short-beacon cycling (the proven handoff regime).
+-      // g_gba_link_diag is written by each device during its own poll on this
+-      // same thread, and est/lck derive purely from synced emulation state, so
+-      // this cross-socket read is deterministic across netplay clients.
+       bool other_socket_engaged = false;
++      if (m_fullboot_presence)
+       {
++        // Only the legacy per-phase split needs the cross-socket read.
++        // g_gba_link_diag is written by each device during its own poll on this
++        // same thread, and est/lck derive purely from synced emulation state,
++        // so the read is deterministic across netplay clients.
+         auto& si_for_diag = m_system.GetSerialInterface();
+         for (int ch = 0; ch < MAX_SI_CHANNELS; ++ch)
+         {
+@@ -334,6 +343,13 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       }
+       const u64 min_spacing =
+           (m_fullboot_presence && !other_socket_engaged) ? tps * 5 : tps;
++      // 350 ms cap in fast mode keeps the worst inter-edge gap ~1.5 s (chained
++      // short cycles included); the >>16 spreads the hash so the dither is not
++      // a fixed arithmetic step from cycle to cycle.
++      const u64 dither_range = min_spacing == tps ? 350u : 450u;
++      const u64 dither =
++          ((static_cast<u64>(m_auto_reset_ordinal) * 2654435761u >> 16) % dither_range) *
++          (tps / 1000);
+       const bool link_idle = m_last_link_seen == 0 || elapsed_since(m_last_link_seen) > tps;
+       const bool timer_fire =
+           link_idle && (m_last_auto_reset == 0 || elapsed_since(m_last_auto_reset) > tps * 6);
+@@ -420,6 +436,26 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       if (m_diag_cmd_burst < 8)
+         m_diag_cmd_burst = 8;
+     }
++    // Per-roll state line: whenever a new GC-pad press is observed, snapshot
++    // this socket's link state on the same clock. One line per press per
++    // socket makes every menu-entry roll self-classifying against the park
++    // law (window type/age at the arming-completion span) with no
++    // cross-referencing.
++    if (const u64 press = GBADetectLog::LastPadPress();
++        press != 0 && press != m_diag_last_press_seen)
++    {
++      m_diag_last_press_seen = press;
++      GBADetectLog::LogEvent(
++          m_device_number, m_timestamp_sent, "roll-state",
++          fmt::format("link={} est={} lck={} win_age_ms={} last_dur_ms={} ord={} cfg={}",
++                      link_now ? 1 : 0, m_link_established ? 1 : 0, m_battle_locked ? 1 : 0,
++                      m_diag_window_open_tick == 0 ?
++                          0 :
++                          elapsed_since(m_diag_window_open_tick) / (tps / 1000),
++                      m_diag_last_window_dur_ms, m_auto_reset_ordinal,
++                      m_fullboot_presence ? "full" : "fast"));
++    }
++
+     // Diagnostic tap. Strictly a mirror of the state decided above -- no branch
+     // below this point reads any of it, and nothing above it was moved or
+     // changed. Placed here so it sees the final values of this poll.
+@@ -429,7 +465,15 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       {
+         diag->window_count.fetch_add(1, std::memory_order_relaxed);
+         m_diag_window_open_tick = m_timestamp_sent;
+-        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "window-open", {});  // H2
++        m_diag_first_cmd_logged = false;
++        // gap_ms = time since the previous window closed: the direct per-edge
++        // measure of the inter-presence gap XD's armed watcher must bridge.
++        GBADetectLog::LogEvent(
++            m_device_number, m_timestamp_sent, "window-open",
++            fmt::format("gap_ms={}",
++                        m_diag_window_close_tick == 0 ?
++                            0 :
++                            elapsed_since(m_diag_window_close_tick) / (tps / 1000)));
+         // I2: capture the first probes INTO the fresh window with responses, so
+         // the status byte each listener presents (BIOS boot listener vs
+         // Emerald's cartridge listener) is on the record per window.
+@@ -441,12 +485,28 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+         // Falling edge with duration: a ~0.13 s window is a BIOS boot beacon,
+         // a ~2.7 s window is Emerald's cartridge listener -- the distinction
+         // the presence-regime policy lives on, now measured per window.
++        m_diag_window_close_tick = m_timestamp_sent;
++        m_diag_last_window_dur_ms = m_diag_window_open_tick == 0 ?
++                                        0 :
++                                        elapsed_since(m_diag_window_open_tick) / (tps / 1000);
++        GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "window-close",
++                               fmt::format("dur_ms={}", m_diag_last_window_dur_ms));
++      }
++      // first-data: the armed-watcher signature -- XD's first non-STATUS
++      // command into a fresh window came ~17-20 ms after window-open in every
++      // recorded arm. Its absence across many windows = XD's watcher was never
++      // armed (the exact datum earlier eras' logs lacked).
++      if (link_now && !m_diag_first_cmd_logged &&
++          m_last_cmd != EBufferCommands::CMD_STATUS)
++      {
++        m_diag_first_cmd_logged = true;
+         GBADetectLog::LogEvent(
+-            m_device_number, m_timestamp_sent, "window-close",
+-            fmt::format("dur_ms={}",
++            m_device_number, m_timestamp_sent, "first-data",
++            fmt::format("dt_ms={} cmd={:02x}",
+                         m_diag_window_open_tick == 0 ?
+                             0 :
+-                            elapsed_since(m_diag_window_open_tick) / (tps / 1000)));
++                            elapsed_since(m_diag_window_open_tick) / (tps / 1000),
++                        static_cast<u8>(m_last_cmd)));
+       }
+       if (probing)
+         diag->probe_count.fetch_add(1, std::memory_order_relaxed);
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 40d465d..0d8646f 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -95,11 +95,12 @@ private:
+   // Read once at construction from MAIN_GBA_EDGE_RESET; never re-read so a
+   // mid-session config change can't desync netplay clients.
+   bool m_edge_reset_enabled = true;
+-  // Read once from MAIN_GBA_FULLBOOT_PRESENCE: raise the minimum reset spacing
+-  // to 5 s so every boot cycle exposes Emerald's long cartridge window (the
+-  // one XD's ladder needs), not just the BIOS's short beacons. False restores
+-  // the fast short-beacon cycling (the v0.4.33 behavior) as an escape hatch.
+-  bool m_fullboot_presence = true;
++  // Read once from MAIN_GBA_FULLBOOT_PRESENCE (default false): pre-arm sockets
++  // run fast dithered short-beacon cycling, because XD's menu-entry roll parks
++  // iff the long cartridge window overlaps the arming-completion span -- the
++  // long window belongs only on the post-arm boot. True = legacy v0.4.35
++  // full-boot pre-arm behavior, kept as an escape hatch.
++  bool m_fullboot_presence = false;
+   // Counts every auto/rescue reset this session; drives the deterministic
+   // dither term (pure function of synced state -> netplay-safe).
+   u32 m_auto_reset_ordinal = 0;
+@@ -133,7 +134,11 @@ private:
+   u32 m_diag_rd_count = 0;        // I4: ungated READ count (ground truth in sum)
+   u32 m_diag_wr_count = 0;        // I4: ungated WRITE count (ground truth in sum)
+   u64 m_diag_last_summary_tick = 0;
+-  u64 m_diag_window_open_tick = 0;  // rising-edge tick, for window-close dur_ms=
++  u64 m_diag_window_open_tick = 0;   // rising-edge tick, for window-close dur_ms=
++  u64 m_diag_window_close_tick = 0;  // falling-edge tick, for window-open gap_ms=
++  u64 m_diag_last_window_dur_ms = 0; // last completed window's duration
++  u64 m_diag_last_press_seen = 0;    // last pad-press tick this socket logged roll-state for
++  bool m_diag_first_cmd_logged = false;  // first-data emitted for the current window
+   u64 m_diag_last_joy_tick = 0;   // Review #1 I4: min-gap rate limit for the H8 class path
+ 
+   std::shared_ptr<HW::GBA::Core> m_core;
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
+index d9d4d5e..565004f 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGCController.cpp
+@@ -188,8 +188,9 @@ DataResponse CSIDevice_GCController::GetData(u32& hi, u32& low)
+     const u16 pressed = pad_status.button & ~m_diag_prev_buttons;
+     if (pressed & (PAD_BUTTON_A | PAD_BUTTON_B | PAD_BUTTON_START))
+     {
+-      GBADetectLog::LogEvent(m_device_number,
+-                             m_system.GetCoreTiming().GetTicks(), "pad",
++      const u64 tick = m_system.GetCoreTiming().GetTicks();
++      GBADetectLog::NotePadPress(tick);
++      GBADetectLog::LogEvent(m_device_number, tick, "pad",
+                              fmt::format("a={} b={} start={}", (pressed & PAD_BUTTON_A) ? 1 : 0,
+                                          (pressed & PAD_BUTTON_B) ? 1 : 0,
+                                          (pressed & PAD_BUTTON_START) ? 1 : 0));
+-- 
+2.39.5 (Apple Git-154)
+
