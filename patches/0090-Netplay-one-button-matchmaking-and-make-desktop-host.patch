@@ -1,0 +1,877 @@
+From 96d3e60df1c56f1d62f773a99949976350e3df2c Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 16:15:12 -0700
+Subject: [PATCH] Netplay: one-button matchmaking, and make desktop hosts
+ visible at all
+
+Finding an opponent meant trading host codes by hand. Now there is a
+single "Search for Match": it looks for a room that is open and waiting,
+joins it, and if there is none it hosts one and waits to be found. Both
+platforms, same rule for picking a room (one player present, not in a
+game, no password) so two searchers always agree on which room wins.
+
+The reason this could not have worked before: the desktop XD host never
+published its session at all. PrepareNetplayConfig never set
+NETPLAY_USE_INDEX, whose default is off, so SetupIndex bailed and every
+desktop room was invisible in a lobby that was otherwise working -- the
+"matchmaking is broken" complaint was a config flag. Fixed for the
+manual Host button too, not just the new search.
+
+Published rooms are named to a fixed format so people and the matcher
+read the same thing. Note that the index publishes once from the server
+constructor, before the game is set, so a brand-new room advertises
+UNKNOWN until the next ping (~5 s) and is deliberately not matched until
+then; two people searching in the very same instant can therefore both
+end up hosting, which the code says out loud rather than hiding.
+---
+ .../features/xdnetplay/XdMatchmaker.kt        | 123 +++++++++
+ .../xdnetplay/ui/FindBattlesActivity.kt       |  41 ++-
+ .../xdnetplay/ui/XDLauncherActivity.kt        | 111 ++++++++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  21 ++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 239 +++++++++++++++++-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  16 ++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  24 ++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |  27 ++
+ 8 files changed, 574 insertions(+), 28 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+new file mode 100644
+index 0000000..dab6ab0
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
++import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
++import org.dolphinemu.dolphinemu.features.settings.model.Settings
++import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++
++/**
++ * The rules and config plumbing behind "Search for Match", shared by the XD
++ * launcher's one-button flow and the Find Battles lobby browser.
++ *
++ * Nothing here touches the UI or blocks: [pickMatch] is pure, and the two
++ * apply* helpers only write settings. The blocking index call
++ * ([NetPlayIndexBridge.listSessions]) and the actual join stay with the caller,
++ * because they need a coroutine scope and an Activity.
++ *
++ * The desktop counterpart is Source/Core/DolphinQt/XDNetplay — the naming
++ * convention lives in XDNetplayConfig.{h,cpp} (MakeOpenSessionName /
++ * LooksLikeXdSession) and the selection rule in XDLauncherDialog.cpp
++ * (PickMatch). The two must agree or the platforms will not find each other.
++ */
++object XdMatchmaker {
++
++    /**
++     * Session-name format for every XD room either launcher publishes to
++     * Dolphin's public session index:
++     *
++     *     XD [OC] <nickname>            ("OC" = Open Challenge)
++     *
++     * The IDENTICAL format lives in XDNetplayConfig.cpp::MakeOpenSessionName on
++     * desktop. Keep the two in sync — it is the only thing that lets a human
++     * scanning the lobby and the auto-matcher agree on what an XD room is.
++     *
++     * Matching itself never keys off the name (see [pickMatch]); the tag is for
++     * people, so a differently named open room is still joinable.
++     */
++    const val SESSION_NAME_PREFIX = "XD [OC] "
++
++    const val FILE = Settings.FILE_DOLPHIN
++    const val SECTION = Settings.SECTION_INI_NETPLAY
++    const val KEY_USE_INDEX = "UseIndex"
++    const val KEY_INDEX_NAME = "IndexName"
++    const val KEY_INDEX_REGION = "IndexRegion"
++    const val KEY_INDEX_PASSWORD = "IndexPassword"
++
++    /** Default publish region. Only ever a browser filter — [pickMatch] ignores it. */
++    const val DEFAULT_REGION = "NA"
++
++    fun sessionName(nickname: String): String =
++        SESSION_NAME_PREFIX + nickname.ifEmpty { "Player" }
++
++    /**
++     * Picks the room "Search for Match" should join, or null to host instead.
++     *
++     * The rules are deliberately dumb, so that both platforms reach the same
++     * answer and a bad match is reproducible rather than a coin flip:
++     *  - same build — netplay only connects between identical git hashes, and
++     *    the index keys on the build's version string, so a foreign build's
++     *    room is unjoinable by construction. [NetPlayIndexBridge] already
++     *    filters this natively; re-checking is free.
++     *  - looks like Pokemon XD (the index's "game" field is a display name, not
++     *    a game id — see [LobbySession.isXdBattle]).
++     *  - exactly one player waiting. Zero is a room mid-teardown; two is a
++     *    battle already under way, and XD's GBA link is strictly two-player.
++     *  - not in game, not password protected.
++     *  - first hit in index order wins, i.e. whoever has been waiting longest.
++     */
++    fun pickMatch(sessions: List<LobbySession>): LobbySession? {
++        val localVersion = NetPlayIndexBridge.localVersion
++        return sessions.firstOrNull { session ->
++            session.version == localVersion &&
++                session.isXdBattle &&
++                session.playerCount == 1 &&
++                !session.inGame &&
++                !session.hasPassword
++        }
++    }
++
++    /**
++     * Writes the config a join needs — the same handoff desktop's
++     * NetPlayBrowser::accept() performs. [serverId] is passed separately so a
++     * password-protected room can hand in its decrypted id; auto-matched rooms
++     * never have one, since [pickMatch] drops them.
++     */
++    fun applyJoinConfig(session: LobbySession, serverId: String = session.serverId) {
++        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, session.method)
++        IntSetting.NETPLAY_CONNECT_PORT.setInt(NativeConfig.LAYER_BASE, session.port)
++        if (session.isTraversal) {
++            StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, serverId)
++        } else {
++            StringSetting.NETPLAY_ADDRESS.setString(NativeConfig.LAYER_BASE, serverId)
++        }
++    }
++
++    /**
++     * Turns on index publishing for the host side and saves. Core's
++     * NetPlayServer::SetupIndex() picks these up when the room opens, keeps the
++     * entry fresh from the server ping loop, and unlists it when hosting stops.
++     * It refuses to publish at all with an empty name or region, hence the
++     * fallbacks.
++     */
++    fun applyHostConfig(
++        name: String = sessionName(StringSetting.NETPLAY_NICKNAME.string),
++        region: String = DEFAULT_REGION,
++        password: String = ""
++    ) {
++        NativeConfig.setBoolean(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_USE_INDEX, true)
++        NativeConfig.setString(
++            NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_NAME,
++            name.ifEmpty { sessionName(StringSetting.NETPLAY_NICKNAME.string) }
++        )
++        NativeConfig.setString(
++            NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_REGION,
++            region.ifEmpty { DEFAULT_REGION }
++        )
++        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_PASSWORD, password)
++        // Traversal needs no port forwarding — the sane default on mobile.
++        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, "traversal")
++        NativeConfig.save(NativeConfig.LAYER_BASE)
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+index 5d5ddab..c0fe186 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+@@ -23,12 +23,11 @@ import kotlinx.coroutines.withContext
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
+-import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+-import org.dolphinemu.dolphinemu.features.settings.model.Settings
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
+ import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.XdMatchmaker
+ import org.dolphinemu.dolphinemu.services.GameFileCacheManager
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+@@ -164,13 +163,7 @@ class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
+ 
+         // Same config handoff as desktop NetPlayBrowser::accept();
+         // NetplaySession.nativeJoin() reads exactly these keys.
+-        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, session.method)
+-        IntSetting.NETPLAY_CONNECT_PORT.setInt(NativeConfig.LAYER_BASE, session.port)
+-        if (session.isTraversal) {
+-            StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, serverId)
+-        } else {
+-            StringSetting.NETPLAY_ADDRESS.setString(NativeConfig.LAYER_BASE, serverId)
+-        }
++        XdMatchmaker.applyJoinConfig(session, serverId)
+ 
+         uiState = uiState.copy(
+             joining = true,
+@@ -209,7 +202,9 @@ class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
+     // ---- Publishing (host side) ----
+ 
+     private fun loadPublishPrefs() {
+-        val defaultName = "${StringSetting.NETPLAY_NICKNAME.string}'s XD battle"
++        // Same "XD [OC] <nickname>" shape the auto-matcher publishes, so a
++        // hand-published room reads identically in the lobby.
++        val defaultName = XdMatchmaker.sessionName(StringSetting.NETPLAY_NICKNAME.string)
+         uiState = uiState.copy(
+             publishEnabled = NativeConfig.getBoolean(
+                 NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_USE_INDEX, false
+@@ -257,25 +252,25 @@ class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
+      */
+     private fun hostPublicBattle() {
+         val state = uiState
+-        NativeConfig.setBoolean(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_USE_INDEX, true)
+-        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_NAME, state.publishName)
+-        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_REGION, state.publishRegion)
+-        NativeConfig.setString(NativeConfig.LAYER_BASE, FILE, SECTION, KEY_INDEX_PASSWORD, state.publishPassword)
+-        // Traversal needs no port forwarding - the sane default on mobile.
+-        StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, "traversal")
+-        NativeConfig.save(NativeConfig.LAYER_BASE)
++        XdMatchmaker.applyHostConfig(
++            name = state.publishName,
++            region = state.publishRegion,
++            password = state.publishPassword
++        )
+ 
+         uiState = state.copy(publishEnabled = true)
+         NetplaySetupActivity.launch(this)
+     }
+ 
+     companion object {
+-        private const val FILE = Settings.FILE_DOLPHIN
+-        private const val SECTION = Settings.SECTION_INI_NETPLAY
+-        private const val KEY_USE_INDEX = "UseIndex"
+-        private const val KEY_INDEX_NAME = "IndexName"
+-        private const val KEY_INDEX_REGION = "IndexRegion"
+-        private const val KEY_INDEX_PASSWORD = "IndexPassword"
++        // Aliases of the single definition in XdMatchmaker, so the publish
++        // panel below and the auto-matcher can never drift onto different keys.
++        private const val FILE = XdMatchmaker.FILE
++        private const val SECTION = XdMatchmaker.SECTION
++        private const val KEY_USE_INDEX = XdMatchmaker.KEY_USE_INDEX
++        private const val KEY_INDEX_NAME = XdMatchmaker.KEY_INDEX_NAME
++        private const val KEY_INDEX_REGION = XdMatchmaker.KEY_INDEX_REGION
++        private const val KEY_INDEX_PASSWORD = XdMatchmaker.KEY_INDEX_PASSWORD
+ 
+         @JvmStatic
+         fun launch(context: Context) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 54e8944..ea34b99 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -13,7 +13,21 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.setValue
++import androidx.lifecycle.asFlow
++import androidx.lifecycle.lifecycleScope
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.Job
++import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.flow.launchIn
++import kotlinx.coroutines.flow.onEach
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
++import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
++import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
++import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.XdMatchmaker
+ import java.io.File
+ import java.security.MessageDigest
+ import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
+@@ -46,6 +60,9 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var statusMessage by mutableStateOf<String?>(null)
+     private var cheatsEnabled by mutableStateOf(false)
+ 
++    /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
++    private var searching by mutableStateOf(false)
++
+     /**
+      * Reads a picked file (extracting the first ROM out of a zip if needed),
+      * validates it, and writes it to the app's private GBA folder as a real,
+@@ -180,6 +197,8 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                         NativeConfig.save(NativeConfig.LAYER_BASE)
+                     },
+                     onBattle = { NetplaySetupActivity.launch(this) },
++                    onSearchForMatch = { searchForMatch() },
++                    searching = searching,
+                     onFindBattles = { FindBattlesActivity.launch(this) },
+                     onOpenSettings = {
+                         SettingsActivity.launch(this, MenuTag.SETTINGS)
+@@ -239,6 +258,98 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ 
++    /**
++     * One-button matchmaking: look for someone already waiting and join them;
++     * if nobody is, host a public room and wait to be found. The desktop twin
++     * is XDLauncherDialog::OnSearchForMatch — same selection rule
++     * (XdMatchmaker.pickMatch), same published room name.
++     *
++     * The index call is blocking HTTP, so it runs on Dispatchers.IO; every
++     * status update lands back on the main thread through the normal Compose
++     * state write.
++     */
++    private fun searchForMatch() {
++        if (searching) return
++
++        val xd = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID)
++        if (xd == null) {
++            statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
++            return
++        }
++        if (!biosLinkReady) {
++            statusMessage =
++                "The official GBA BIOS is required — XD cannot detect the GBA without it."
++            return
++        }
++
++        searching = true
++        statusMessage = "Searching for an open battle…"
++
++        lifecycleScope.launch {
++            val sessions = withContext(Dispatchers.IO) {
++                try {
++                    NetPlayIndexBridge.listSessions()
++                } catch (_: Throwable) {
++                    null
++                }
++            }
++
++            // "Could not reach the index" is not "nobody is playing". Hosting
++            // on a network error would strand the user in an unlistable room.
++            if (sessions == null) {
++                searching = false
++                statusMessage =
++                    "Could not reach the session list. Check your connection, then try again."
++                return@launch
++            }
++
++            val match = XdMatchmaker.pickMatch(sessions)
++            if (match != null) {
++                joinMatch(match)
++            } else {
++                statusMessage = "No open battles found — hosting one. " +
++                    "Your room is listed publicly; wait here for an opponent."
++                XdMatchmaker.applyHostConfig()
++                searching = false
++                NetplaySetupActivity.launch(this@XDLauncherActivity)
++            }
++        }
++    }
++
++    /**
++     * Joins an auto-matched room. Mirrors FindBattlesActivity.join() minus the
++     * password path — XdMatchmaker.pickMatch() never returns a password room,
++     * so there is no encrypted server id to unwrap here.
++     */
++    private suspend fun joinMatch(session: LobbySession) {
++        statusMessage = "Found \"${session.name}\" — joining…"
++        XdMatchmaker.applyJoinConfig(session)
++        NativeConfig.save(NativeConfig.LAYER_BASE)
++
++        var errorForwarding: Job? = null
++        try {
++            // NetplaySession's UI callbacks need the game list; wait like
++            // NetplaySetupViewModel.connect() does.
++            GameFileCacheManager.isLoading().asFlow().first { it == false }
++
++            val netplaySession = NetplayManager.createSession()
++            errorForwarding = netplaySession.connectionErrors
++                .onEach { statusMessage = it }
++                .launchIn(lifecycleScope)
++
++            if (netplaySession.join()) {
++                statusMessage = null
++                NetplayActivity.launch(this)
++            } else {
++                statusMessage = "Could not connect to \"${session.name}\". " +
++                    "It may have just closed — tap Search for Match again."
++            }
++        } finally {
++            errorForwarding?.cancel()
++            searching = false
++        }
++    }
++
+     override fun onResume() {
+         super.onResume()
+         if (DirectoryInitialization.areDolphinDirectoriesReady()) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index f6c179a..bb6684d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -51,6 +51,8 @@ fun XDLauncherScreen(
+     onBattle: () -> Unit,
+     cheatsEnabled: Boolean,
+     onCheatsChanged: (Boolean) -> Unit,
++    onSearchForMatch: () -> Unit,
++    searching: Boolean,
+     onFindBattles: () -> Unit,
+     onOpenSettings: () -> Unit,
+     onOpenDolphin: () -> Unit,
+@@ -134,6 +136,25 @@ fun XDLauncherScreen(
+                     Switch(checked = cheatsEnabled, onCheckedChange = onCheatsChanged)
+                 }
+                 Spacer(Modifier.height(12.dp))
++                // The headline action: no codes to trade, no lobby to read.
++                // Joins whoever is already waiting, or becomes the room that
++                // the next person's search finds.
++                Button(
++                    onClick = onSearchForMatch,
++                    enabled = xdGameFound && biosLinkReady && !searching,
++                    modifier = Modifier.fillMaxWidth()
++                ) {
++                    if (searching) {
++                        CircularProgressIndicator(
++                            modifier = Modifier.size(18.dp),
++                            strokeWidth = 2.dp,
++                            color = MaterialTheme.colorScheme.onPrimary
++                        )
++                        Spacer(Modifier.width(12.dp))
++                    }
++                    Text("Search for Match", style = MaterialTheme.typography.titleMedium)
++                }
++                Spacer(Modifier.height(12.dp))
+                 Button(
+                     onClick = onBattle,
+                     enabled = xdGameFound && biosLinkReady,
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 44f0c47..4d91ace 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -5,8 +5,13 @@
+ 
+ #include <array>
+ #include <initializer_list>
++#include <map>
++#include <optional>
+ #include <string>
+ #include <string_view>
++#include <thread>
++#include <utility>
++#include <vector>
+ 
+ #include <QAbstractItemModel>
+ #include <QCheckBox>
+@@ -15,6 +20,7 @@
+ #include <QGroupBox>
+ #include <QLabel>
+ #include <QLineEdit>
++#include <QPointer>
+ #include <QPushButton>
+ #include <QShowEvent>
+ #include <QSignalBlocker>
+@@ -24,6 +30,7 @@
+ #include "Common/FileUtil.h"
+ #include "Common/IOFile.h"
+ #include "Common/StringUtil.h"
++#include "Common/Version.h"
+ 
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Config/NetplaySettings.h"
+@@ -31,11 +38,13 @@
+ 
+ #include "DolphinQt/QtUtils/ModalMessageBox.h"
+ #include "DolphinQt/QtUtils/NonDefaultQPushButton.h"
++#include "DolphinQt/QtUtils/QueueOnObject.h"
+ #include "DolphinQt/Settings.h"
+ #include "DolphinQt/XDNetplay/TeamEditorDialog.h"
+ #include "DolphinQt/XDNetplay/XDNetplayConfig.h"
+ 
+ #include "UICommon/GameFile.h"
++#include "UICommon/NetPlayIndex.h"
+ 
+ namespace
+ {
+@@ -128,6 +137,81 @@ void PrepareNetplayConfig()
+   if (Config::Get(Config::NETPLAY_NICKNAME).empty())
+     Config::SetBaseOrCurrent(Config::NETPLAY_NICKNAME, "Player");
+ }
++
++// Hosting only: publish the room to Dolphin's public session index.
++//
++// This closes a hole that made the whole desktop lobby look empty. The XD
++// launcher's Host button used to write nothing but the traversal settings, and
++// NETPLAY_USE_INDEX defaults to false -- so NetPlayServer::SetupIndex()
++// early-returned and every desktop host was invisible both in the session
++// browser and to the auto-matcher, while Android hosts (which do set the key,
++// in FindBattlesActivity.hostPublicBattle) showed up fine. Desktop now matches
++// Android.
++//
++// SetupIndex() also refuses to publish with an empty region, so fall back to
++// "NA" when the user has never picked one. The region is only ever a browser
++// filter and the matcher deliberately ignores it: a player base this small,
++// split seven ways by continent, would never find each other.
++//
++// |open_challenge| clears any index password. The launcher has no password UI,
++// so a leftover password could only come from the NetPlay Browser's publish
++// panel -- worth respecting for a deliberate Host click, but an auto-matched
++// room must be joinable by a stranger (and the matcher skips password rooms
++// anyway, so leaving one set would make the host unmatchable by its own
++// opponents).
++//
++// Timing worth knowing when debugging "my room is not findable": SetupIndex()
++// runs from the NetPlayServer constructor, BEFORE MainWindow::NetPlayHost gets
++// to ChangeGame(), so the very first publish carries game_id "UNKNOWN" and
++// LooksLikeXdSession rejects it. NetPlayServer's ping loop pushes the real
++// name through NetPlayIndex::SetGame() within ~1s and the index's own
++// notification loop uploads it every 5s, so a room becomes matchable a few
++// seconds after it opens -- irrelevant when waiting minutes for an opponent,
++// but it does mean two clients searching in the same instant can both end up
++// hosting. Searching again resolves it.
++void PreparePublishConfig(bool open_challenge)
++{
++  Config::SetBaseOrCurrent(Config::NETPLAY_USE_INDEX, true);
++  Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_NAME,
++                           XDNetplay::MakeOpenSessionName(Config::Get(Config::NETPLAY_NICKNAME)));
++  if (Config::Get(Config::NETPLAY_INDEX_REGION).empty())
++    Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_REGION, "NA");
++  if (open_challenge)
++    Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_PASSWORD, "");
++}
++
++// Pick the room "Search for Match" should join, or nothing to host instead.
++//
++// The rules are deliberately dumb so that both platforms reach the same answer
++// and a failed match is explainable:
++//   * same build -- netplay only connects between identical git hashes
++//     (GetScmRevGitStr), and the index keys on GetScmDescStr, so a foreign
++//     build's room is unjoinable by construction. The server-side filter
++//     already asks for this; re-checking costs nothing and the index is a
++//     third-party service we do not control.
++//   * looks like Pokemon XD (see XDNetplay::LooksLikeXdSession -- the index's
++//     "game" field is a display name, not a game id).
++//   * exactly one player waiting. Zero would be a room mid-teardown; two is a
++//     battle already under way, and XD's link is strictly two-player.
++//   * not in game, not password protected.
++//   * first hit in index order wins. The index returns rooms in the order they
++//     registered, so this is "join whoever has been waiting longest" -- and,
++//     more importantly, it is deterministic, which makes a bad match
++//     reproducible instead of a coin flip.
++std::optional<NetPlaySession> PickMatch(const std::vector<NetPlaySession>& sessions)
++{
++  for (const NetPlaySession& session : sessions)
++  {
++    if (session.version != Common::GetScmDescStr())
++      continue;
++    if (!XDNetplay::LooksLikeXdSession(session.game_id))
++      continue;
++    if (session.player_count != 1 || session.in_game || session.has_password)
++      continue;
++    return session;
++  }
++  return std::nullopt;
++}
+ }  // namespace
+ 
+ XDLauncherDialog::XDLauncherDialog(const GameListModel& game_list_model, QWidget* parent)
+@@ -172,19 +256,32 @@ void XDLauncherDialog::CreateMainLayout()
+   m_practice_dummy_check = new QCheckBox(tr("Practice vs dummy"));
+   m_practice_dummy_check->setToolTip(
+       tr("Auto-plays GBA port 3 so you can practice link battles alone."));
++  // The headline action: one button, no codes to trade. Everything below it is
++  // the manual escape hatch for people who already know their opponent.
++  m_search_button = new NonDefaultQPushButton(tr("Search for Match"));
++  m_search_button->setToolTip(tr("Looks for someone already waiting and joins them. "
++                                 "If nobody is waiting, hosts a public room and waits "
++                                 "for an opponent."));
+   m_host_button = new NonDefaultQPushButton(tr("Host Battle"));
+   m_join_code_edit = new QLineEdit;
+   m_join_code_edit->setPlaceholderText(tr("Host code"));
+   m_join_button = new NonDefaultQPushButton(tr("Join Battle"));
+   m_browse_button = new NonDefaultQPushButton(tr("Browse Public Sessions"));
+   m_team_editor_button = new NonDefaultQPushButton(tr("Team Editor..."));
++  // Empty until a search runs, so the dialog does not grow a permanently blank
++  // row; word wrap because the "hosting and waiting" line is a sentence.
++  m_match_status = new QLabel;
++  m_match_status->setWordWrap(true);
++  m_match_status->hide();
+   battle_layout->addWidget(m_boot_button, 0, 0);
+   battle_layout->addWidget(m_practice_dummy_check, 0, 1);
+-  battle_layout->addWidget(m_host_button, 1, 0, 1, 2);
+-  battle_layout->addWidget(m_join_code_edit, 2, 0);
+-  battle_layout->addWidget(m_join_button, 2, 1);
+-  battle_layout->addWidget(m_browse_button, 3, 0, 1, 2);
+-  battle_layout->addWidget(m_team_editor_button, 4, 0, 1, 2);
++  battle_layout->addWidget(m_search_button, 1, 0, 1, 2);
++  battle_layout->addWidget(m_match_status, 2, 0, 1, 2);
++  battle_layout->addWidget(m_host_button, 3, 0, 1, 2);
++  battle_layout->addWidget(m_join_code_edit, 4, 0);
++  battle_layout->addWidget(m_join_button, 4, 1);
++  battle_layout->addWidget(m_browse_button, 5, 0, 1, 2);
++  battle_layout->addWidget(m_team_editor_button, 6, 0, 1, 2);
+   battle_box->setLayout(battle_layout);
+   layout->addWidget(battle_box);
+ 
+@@ -226,6 +323,7 @@ void XDLauncherDialog::ConnectWidgets()
+           &XDLauncherDialog::OnGbaInputInfo);
+ 
+   connect(m_boot_button, &QPushButton::clicked, this, &XDLauncherDialog::OnBootSolo);
++  connect(m_search_button, &QPushButton::clicked, this, &XDLauncherDialog::OnSearchForMatch);
+   connect(m_host_button, &QPushButton::clicked, this, &XDLauncherDialog::OnHost);
+   connect(m_join_button, &QPushButton::clicked, this, &XDLauncherDialog::OnJoin);
+   connect(m_browse_button, &QPushButton::clicked, this, [this] { emit BrowsePublic(); });
+@@ -520,6 +618,137 @@ void XDLauncherDialog::OnHost()
+   }
+ 
+   PrepareNetplayConfig();
++  // A manually hosted room is published too -- otherwise nobody can find it
++  // except by the host reading their code aloud, which is exactly the workflow
++  // "Search for Match" exists to retire. |false|: a password the user set in
++  // the NetPlay Browser's publish panel is honoured here.
++  PreparePublishConfig(false);
++  Config::Save();
++  emit HostXD(*game);
++}
++
++void XDLauncherDialog::SetMatchStatus(const QString& text)
++{
++  m_match_status->setText(text);
++  m_match_status->setVisible(!text.isEmpty());
++}
++
++void XDLauncherDialog::OnSearchForMatch()
++{
++  if (m_searching)
++    return;
++
++  const auto game = FindXdGame();
++  if (!game)
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("Pokémon XD (USA) was not found in your game list. Add its folder first."));
++    return;
++  }
++
++  if (!XDNetplay::CheckOfficialBios(nullptr))
++  {
++    ModalMessageBox::warning(
++        this, tr("XD Netplay"),
++        tr("The official GBA BIOS is required — XD cannot detect the GBA without it. "
++           "Add it with \"Choose BIOS...\" first."));
++    return;
++  }
++
++  // Do the local setup up front: whichever way the search lands, joining and
++  // hosting both need the GBA config and a nickname in place.
++  PrepareNetplayConfig();
++  Config::Save();
++
++  m_searching = true;
++  m_search_button->setEnabled(false);
++  SetMatchStatus(tr("Searching for an open battle…"));
++
++  // NetPlayIndex::List() is a blocking HTTP round trip. Running it on the GUI
++  // thread would freeze the whole launcher for however long the index server
++  // takes to answer (and it can time out), so it goes to a worker and comes
++  // back through QueueOnObject -- same shape as TeamEditorDialog's paste
++  // fetch. QPointer, not a raw this: Dolphin can be quit mid-search, and
++  // QueueOnObject on a destroyed receiver is undefined.
++  QPointer<XDLauncherDialog> self(this);
++  std::thread([self] {
++    NetPlayIndex client;
++
++    // Coarse server-side cut; PickMatch re-checks all of it locally.
++    // Deliberately no "game" filter: the index matches that field literally
++    // and hosts publish differently shaped display names (see
++    // XDNetplay::LooksLikeXdSession), so a server-side game filter would drop
++    // valid rooms. No region filter either -- we want any opponent, anywhere.
++    std::map<std::string, std::string> filters;
++    filters["version"] = Common::GetScmDescStr();
++    filters["in_game"] = "0";
++    filters["password"] = "0";
++
++    const auto entries = client.List(filters);
++    const bool listed = entries.has_value();
++    std::optional<NetPlaySession> match;
++    if (listed)
++      match = PickMatch(*entries);
++
++    if (!self)
++      return;
++    // QueueOnObject takes a raw receiver; the QPointer copy inside the lambda
++    // is what guards the deferred call.
++    QueueOnObject(self.data(), [self, listed, match = std::move(match)] {
++      if (!self)
++        return;
++      self->FinishSearch(listed, match);
++    });
++  }).detach();
++}
++
++void XDLauncherDialog::FinishSearch(bool listed, const std::optional<NetPlaySession>& match)
++{
++  m_searching = false;
++  m_search_button->setEnabled(true);
++
++  // "Could not reach the index" is not "nobody is playing". Silently hosting
++  // on a network error would strand the user in a room no one can see.
++  if (!listed)
++  {
++    SetMatchStatus(tr("Could not reach the session list. Check your connection, then try again."));
++    return;
++  }
++
++  if (match)
++  {
++    SetMatchStatus(tr("Found \"%1\" — joining…").arg(QString::fromStdString(match->name)));
++
++    // Exactly the handoff NetPlayBrowser::accept() performs. Password rooms
++    // never get this far (PickMatch drops them), so there is no server_id to
++    // decrypt here.
++    Config::SetBaseOrCurrent(Config::NETPLAY_TRAVERSAL_CHOICE, match->method);
++    Config::SetBaseOrCurrent(Config::NETPLAY_CONNECT_PORT, static_cast<u16>(match->port));
++    if (match->method == "traversal")
++      Config::SetBaseOrCurrent(Config::NETPLAY_HOST_CODE, match->server_id);
++    else
++      Config::SetBaseOrCurrent(Config::NETPLAY_ADDRESS, match->server_id);
++    Config::Save();
++
++    emit JoinXD();
++    return;
++  }
++
++  // Nobody waiting: become the room everyone else's search will find. Re-look
++  // up the game rather than capturing it -- the game list rescans on its own
++  // thread and could have dropped the entry while the search was in flight.
++  const auto game = FindXdGame();
++  if (!game)
++  {
++    SetMatchStatus(
++        tr("No open battles found, and Pokémon XD is no longer in your game list."));
++    return;
++  }
++
++  SetMatchStatus(tr("No open battles found — hosting one. Your room is listed publicly; "
++                    "leave the NetPlay window open and wait for an opponent."));
++  PreparePublishConfig(true);
+   Config::Save();
+   emit HostXD(*game);
+ }
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 0a24064..9bcde76 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -4,10 +4,12 @@
+ #pragma once
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include <QDialog>
+ 
+ #include "DolphinQt/GameList/GameListModel.h"
++#include "UICommon/NetPlayIndex.h"
+ 
+ class QCheckBox;
+ class QLabel;
+@@ -75,8 +77,16 @@ private:
+   void OnBootSolo();
+   void OnHost();
+   void OnJoin();
++  void OnSearchForMatch();
+   void OnTeamEditor();
+ 
++  // GUI-thread tail of OnSearchForMatch(), invoked via QueueOnObject once the
++  // worker thread has finished talking to the session index. |listed| is false
++  // when the index could not be reached at all (which is NOT the same as "no
++  // rooms"); |match| holds the room to join, or nothing to host instead.
++  void FinishSearch(bool listed, const std::optional<NetPlaySession>& match);
++  void SetMatchStatus(const QString& text);
++
+   const GameListModel& m_game_list_model;
+ 
+   ChecklistRow m_game_row;
+@@ -93,7 +103,13 @@ private:
+   QPushButton* m_host_button;
+   QLineEdit* m_join_code_edit;
+   QPushButton* m_join_button;
++  QPushButton* m_search_button;
+   QPushButton* m_browse_button;
+   QPushButton* m_team_editor_button;
++  QLabel* m_match_status;
++  // Guards against a second search being kicked off while one is in flight.
++  // The worker thread is detached and only ever touches the GUI through
++  // QueueOnObject, so this flag lives on the GUI thread alone.
++  bool m_searching = false;
+   TeamEditorDialog* m_team_editor = nullptr;
+ };
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 3768d69..2f895f1 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -4,6 +4,7 @@
+ #include "DolphinQt/XDNetplay/XDNetplayConfig.h"
+ 
+ #include <string>
++#include <string_view>
+ #include <vector>
+ 
+ #include "Common/CommonPaths.h"
+@@ -56,6 +57,29 @@ bool IsXdGameId(const std::string& game_id)
+   return game_id.rfind(XD_GAME_ID, 0) == 0;
+ }
+ 
++std::string MakeOpenSessionName(const std::string& nickname)
++{
++  // Mirrors XdMatchmaker.sessionName() on Android, byte for byte.
++  return "XD [OC] " + (nickname.empty() ? std::string("Player") : nickname);
++}
++
++bool LooksLikeXdSession(const std::string& published_game_name)
++{
++  std::string lower = published_game_name;
++  Common::ToLower(&lower);
++  // "pokémon xd" is matched as raw UTF-8: Common::ToLower only folds ASCII, so
++  // the accented byte pair survives untouched and the literal below (already
++  // lowercase) lines up. Desktop hosts publish the ASCII "Pokemon XD ..."
++  // title anyway; the accented needle is for title databases that localize it.
++  for (const std::string_view needle :
++       {"gxxe01", "gale of darkness", "pokemon xd", "pokémon xd"})
++  {
++    if (lower.find(needle) != std::string::npos)
++      return true;
++  }
++  return false;
++}
++
+ bool EnsureGbaConfig()
+ {
+   // Rom2/Rom3 point at the Emerald dump the launcher imported. Re-assert both
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index 783d050..406e319 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -25,6 +25,33 @@ constexpr char OFFICIAL_GBA_BIOS_SHA1[] = "300c20df6731a33952ded8c436f7f186d25d3
+ // merely append a revision to the base id.
+ bool IsXdGameId(const std::string& game_id);
+ 
++// ---- Public-lobby naming, shared with the Android launcher ----
++
++// Session-name format for every XD room the launcher publishes to Dolphin's
++// public session index:
++//
++//     XD [OC] <nickname>            ("OC" = Open Challenge)
++//
++// The IDENTICAL format lives on the Android side in XdMatchmaker.kt
++// (SESSION_NAME_PREFIX). Keep the two in sync -- it is the only thing that
++// lets a human scanning the session browser and the one-button auto-matcher
++// agree on what an XD room looks like.
++//
++// Matching itself never keys off the name: it keys off player_count /
++// in_game / has_password, so a room named anything else is still joinable.
++// The tag exists purely so the lobby reads sensibly to people.
++std::string MakeOpenSessionName(const std::string& nickname);
++
++// True when an index entry's published "game" string looks like Pokemon XD.
++//
++// Note that the index's game field is NOT a game id. NetPlayServer::SetupIndex
++// publishes m_selected_game_name, which desktop fills from GameListModel's
++// netplay name ("Pokemon XD: Gale of Darkness (GXXE01, USA)") while this
++// fork's Android host fills it with the plain long name (no id at all). So a
++// server-side game filter cannot be trusted and we substring-match instead --
++// the exact same set of needles as LobbySession.isXdBattle on Android.
++bool LooksLikeXdSession(const std::string& published_game_name);
++
+ // Force the local settings an XD link battle expects: GBA ROM paths for ports
+ // 2/3 (re-asserted only while the imported dump still exists), SI devices
+ // (pad, GBA, GBA), cheats on for the $XD OU Fixes code, and netplay tuned to
+-- 
+2.39.5 (Apple Git-154)
+
