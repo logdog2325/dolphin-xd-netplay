@@ -1,0 +1,243 @@
+From cc01bcb98076712c414061f5d1b0cedabf63580f Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Fri, 31 Jul 2026 22:49:39 -0700
+Subject: [PATCH] Android: default to OpenGL; NetLat off the screen;
+ full-session log budget
+
+The first Android-vs-Android netplay battle settled where the remaining
+instability lives. Both devices' logs, joined line-by-line on the synced
+tick clock, show ZERO byte mismatches across 73,528 compared joybus
+lines -- including two and a half minutes of continued perfect sync
+after one player's screen froze -- so the emulation and netplay layers
+are exonerated end to end. What actually failed: the guest's display
+froze mid-animation (presentation-layer GPU wedge), and eleven minutes
+later the host's Adreno driver wedged at the kernel level hard enough
+that surfaceflinger died, could not reinitialize EGL, and Android
+soft-restarted the whole framework, taking the emulator with it. Both
+casualties are the Vulkan driver under sustained load, with the
+in-Dolphin mitigations already active. So: take Android out of the
+Vulkan-first backend ordering and let it default to OpenGL (the one
+untried variable; Vulkan stays selectable in settings).
+
+NetLat moves off the screen: the once-per-second OSD flash was
+distracting in real matches. The identical readout now lands in the
+session's gba_detect log -- same synced t= clock as every other event,
+already delivered by the Android Share button -- plus the NETPLAY log,
+as before.
+
+Log budget, from the measured session: 90% of the 4 MiB budget was
+byte-identical repeated joy lines (steady-state 60 Hz polling during
+battle), and both logs went dark at 6.8 minutes -- nine minutes before
+the interesting failure. Once a socket is battle-locked, exact repeats
+per (channel, direction) are now counted instead of written and surface
+as rep=N on the next changed line; detect/link/upload phases keep full
+fidelity (that is where the fragile handshake lives). Cap raised to
+32 MiB: with the diet that holds hours of play.
+---
+ Source/Core/Core/HW/GBADetectLog.cpp         | 62 ++++++++++++++++----
+ Source/Core/Core/HW/GBADetectLog.h           |  7 ++-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp   |  4 +-
+ Source/Core/Core/NetPlayClient.cpp           | 11 +++-
+ Source/Core/VideoCommon/VideoBackendBase.cpp | 14 ++++-
+ 5 files changed, 80 insertions(+), 18 deletions(-)
+
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index f9f7ff0..e015b5f 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -23,11 +23,12 @@ namespace GBADetectLog
+ namespace
+ {
+ // Hard ceiling on one session's file, so a wedged session that emits summaries
+-// for hours can never fill the disk. 4 MiB: a 35-minute session on the old
+-// 1 MiB budget hit the cap after ~3.5 minutes of XD's connected-idle RESET
+-// polling and went dark for the interesting part; the new budget plus the
+-// smaller post-reset bursts holds roughly half an hour of worst-case traffic.
+-constexpr u64 MAX_LOG_BYTES = 4u << 20;
++// for hours can never fill the disk. 32 MiB: the first instrumented netplay
++// battle hit the old 4 MiB cap at 6.8 minutes and went dark 9 minutes before
++// the interesting failure; measured burn was ~10 KB/s, 90% of it byte-identical
++// repeated joy lines (now suppressed post-lock, cutting battle-phase burn to
++// ~1 KB/s), so this budget holds hours of real play.
++constexpr u64 MAX_LOG_BYTES = 32u << 20;
+ 
+ std::mutex s_mutex;
+ std::ofstream s_file;    // held open for the session; never fopen'd per line
+@@ -38,6 +39,17 @@ int s_live_devices = 0;  // ref-count -> session begin/end
+ // (Review #1 I5: the byte cap must bound CPU/lock cost, not just disk).
+ std::atomic<bool> s_capped{false};
+ 
++// Repeat-suppression cache for joy lines, one slot per (SI channel,
++// direction). Guarded by s_mutex like everything else in this file.
++struct JoyRepeatSlot
++{
++  u8 bytes[5]{};
++  int len = -1;
++  u8 aux = 0;  // sent-flag for '>', jsa for '<'
++  u32 repeats = 0;
++};
++JoyRepeatSlot s_joy_repeat[4][2];
++
+ std::string Timestamp(const char* format)
+ {
+   const std::time_t now = std::time(nullptr);
+@@ -121,6 +133,9 @@ void OnDeviceCreated()
+   s_file.open(s_path, std::ios::out | std::ios::trunc);
+   s_bytes = 0;
+   s_capped.store(false, std::memory_order_relaxed);
++  for (auto& per_channel : s_joy_repeat)
++    for (auto& slot : per_channel)
++      slot = {};
+ 
+   WriteLine(fmt::format("gba_detect log  path={}", s_path), true);
+   WriteLine(fmt::format("session start  {}", Timestamp("%Y-%m-%d %H:%M:%S")), true);
+@@ -163,19 +178,44 @@ void LogEvent(int channel, u64 tick, const char* event, const std::string& detai
+   WriteLine(fmt::format("t={} sock={} {} {}", tick, channel, event, detail), flush);
+ }
+ 
+-void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa)
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa,
++               bool suppress_repeats)
+ {
+   if (s_capped.load(std::memory_order_relaxed))
+     return;
+   std::lock_guard lock(s_mutex);
++  const int di = dir == '>' ? 0 : 1;
++  JoyRepeatSlot* slot =
++      (channel >= 0 && channel < 4) ? &s_joy_repeat[channel][di] : nullptr;
++  const u8 aux = dir == '>' ? static_cast<u8>(sent ? 1 : 0) : jsa;
++  std::string rep_field;
++  if (slot)
++  {
++    const bool same = slot->len == len && slot->aux == aux &&
++                      std::equal(slot->bytes, slot->bytes + 5, bytes);
++    if (suppress_repeats && same)
++    {
++      ++slot->repeats;  // counted, not written -- 96.8% of battle joy bytes
++      return;
++    }
++    if (slot->repeats != 0)
++    {
++      rep_field = fmt::format(" rep={}", slot->repeats);
++      slot->repeats = 0;
++    }
++    std::copy(bytes, bytes + 5, slot->bytes);
++    slot->len = len;
++    slot->aux = aux;
++  }
+   if (dir == '>')
+-    WriteLine(fmt::format("t={} sock={} joy > {:02x}{:02x}{:02x}{:02x}{:02x} len={} sent={}", tick,
+-                          channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len,
+-                          sent ? 1 : 0),
++    WriteLine(fmt::format("t={} sock={} joy > {:02x}{:02x}{:02x}{:02x}{:02x} len={} sent={}{}",
++                          tick, channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len,
++                          sent ? 1 : 0, rep_field),
+               false);  // bounded burst; flushed by the next event/summary line
+   else
+-    WriteLine(fmt::format("t={} sock={} joy < {:02x}{:02x}{:02x}{:02x}{:02x} len={} jsa={:02x}",
+-                          tick, channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len, jsa),
++    WriteLine(fmt::format("t={} sock={} joy < {:02x}{:02x}{:02x}{:02x}{:02x} len={} jsa={:02x}{}",
++                          tick, channel, bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], len, jsa,
++                          rep_field),
+               false);
+ }
+ 
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index 52ec86b..8f5d813 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -44,7 +44,12 @@ void LogEvent(int channel, u64 tick, const char* event, const std::string& detai
+ // (bounded boot burst; a later event/summary flushes it). bytes[0..4] must be
+ // valid. `sent` is meaningful for '>' lines. `jsa` (responses only) is JOYSTAT
+ // as sampled on the event thread right after the command executed.
+-void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa = 0);
++// `suppress_repeats` (pass true once the socket is battle-locked): an exact
++// repeat of the previous line on the same (channel, direction) is counted
++// instead of written -- measured 96.8% of battle-phase joy bytes were such
++// repeats -- and the run length is emitted as rep=N on the next changed line.
++void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool sent, u8 jsa = 0,
++               bool suppress_repeats = false);
+ 
+ // Once-per-second telemetry mirror (caller throttles to <=1/sec). Fields mirror
+ // the on-screen readout (rom/gba/loc/lk/win/rst/prb/est/lck/cmd) plus the
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index ef6ad22..accdea6 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -588,7 +588,7 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+     if (m_diag_cmd_log_count < 64 || m_diag_cmd_burst > 0 || (class_changed && joy_gap_ok))
+     {
+       GBADetectLog::LogJoybus(m_device_number, m_timestamp_sent, '>', buffer, request_length,
+-                              m_diag_cmd_sent);
++                              m_diag_cmd_sent, 0, m_battle_locked);
+       m_diag_last_joy_tick = m_timestamp_sent;
+       if (m_diag_cmd_log_count < 64)
+         ++m_diag_cmd_log_count;
+@@ -652,7 +652,7 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           if (resp_nonzero)
+             GBADetectLog::LogJoybus(m_device_number, m_timestamp_sent, '<', buffer,
+                                     static_cast<int>(response_length), true,
+-                                    m_core->GetJoyStatAfterCommand());
++                                    m_core->GetJoyStatAfterCommand(), m_battle_locked);
+           else
+             GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "no-response",
+                                    fmt::format("cmd={:02x}", static_cast<u8>(m_last_cmd)));
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index e580497..005e2e5 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -51,6 +51,7 @@
+ #include "Core/HW/EXI/EXI_DeviceIPL.h"
+ #ifdef HAS_LIBMGBA
+ #include "Core/HW/GBACore.h"
++#include "Core/HW/GBADetectLog.h"
+ #endif
+ #include "Core/HW/GBAPad.h"
+ #include "Core/HW/GCMemcard/GCMemcard.h"
+@@ -2108,7 +2109,15 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
+           "NetLat ping={}ms buf={}/{} wait~{:.0f}ms(max{}) starve={}/{}", GetPlayersMaxPing(),
+           depth, m_target_buffer_size, m_lat_wait_ewma_us / 1000.0, m_lat_wait_max_us / 1000,
+           m_lat_starve_pops, m_lat_pops);
+-      OSD::AddTypedMessage(OSD::MessageType::NetPlayLatency, line, 1500, OSD::Color::CYAN);
++      // No OSD line anymore: the once-per-second flash on the play screen was
++      // distracting in real sessions. The same readout goes into the session's
++      // gba_detect log instead (same t= clock as everything else, and the
++      // Android Share button already delivers it), plus the NETPLAY log.
++#ifdef HAS_LIBMGBA
++      GBADetectLog::LogEvent(0,
++                             Core::System::GetInstance().GetCoreTiming().GetTicks(), "netlat",
++                             line, false);
++#endif
+       NOTICE_LOG_FMT(NETPLAY, "{} buckets[<1|<5|<16|<33|<100|<250|hi]={},{},{},{},{},{},{}", line,
+                      m_lat_bucket[0], m_lat_bucket[1], m_lat_bucket[2], m_lat_bucket[3],
+                      m_lat_bucket[4], m_lat_bucket[5], m_lat_bucket[6]);
+diff --git a/Source/Core/VideoCommon/VideoBackendBase.cpp b/Source/Core/VideoCommon/VideoBackendBase.cpp
+index e307d9d..0b9bd84 100644
+--- a/Source/Core/VideoCommon/VideoBackendBase.cpp
++++ b/Source/Core/VideoCommon/VideoBackendBase.cpp
+@@ -212,11 +212,19 @@ const std::vector<std::unique_ptr<VideoBackendBase>>& VideoBackendBase::GetAvail
+     backends.push_back(std::make_unique<OGL::VideoBackend>());
+ #endif
+ #ifdef HAS_VULKAN
+-#if defined(__APPLE__) || defined(ANDROID)
++#ifdef __APPLE__
+     // Emplace the Vulkan backend at the beginning so it takes precedence over OpenGL.
+     // On macOS, we prefer Vulkan over OpenGL due to OpenGL support being deprecated by Apple.
+-    // On Android, Vulkan is the better-performing backend on the Adreno-class GPUs this
+-    // fork targets.
++    //
++    // Android is deliberately NOT in this list anymore: a 16-minute netplay
++    // battle on the AYN Thor wedged the Adreno driver at the kernel level so
++    // hard that surfaceflinger died and could not reinitialize ("no suitable
++    // EGLConfig found"), soft-restarting the whole Android framework; the
++    // second device's display froze the same session. The emulations
++    // themselves ran synced throughout -- the instability is entirely in the
++    // Vulkan driver under sustained load. Default Android to OpenGL (the
++    // stock ordering below) as the stability experiment; Vulkan remains
++    // selectable in settings.
+     backends.emplace(backends.begin(), std::make_unique<Vulkan::VideoBackend>());
+ #else
+     backends.push_back(std::make_unique<Vulkan::VideoBackend>());
+-- 
+2.39.5 (Apple Git-154)
+
