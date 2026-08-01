@@ -1,0 +1,793 @@
+From f2f1957657529c925e8e78443526be4eacccab03 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 11:20:04 -0700
+Subject: [PATCH] Netplay: let a joiner submit their own team from the room
+
+Until now the host had to build BOTH players' teams before hosting,
+because netplay ships the host's GBA saves to everyone at start and the
+joiner's local team files are never used. Now a joiner pastes their own
+Showdown export (or a pokepast.es link) in the room and the host writes
+it into the socket-3 save it is about to sync.
+
+Wire: a new TeamData message alongside ChatMessage, carrying the export
+as text -- not a prebuilt party, because the Pokemon must be built
+against the HOST save's trainer name and ID. A pokepaste link is
+resolved on the submitting device, so the host only ever parses text it
+was handed and never fetches a URL a stranger chose. The payload is
+capped, and the parser it feeds is name-whitelisted, bounded, and writes
+through the verified writer with a .bak, so a hostile paste can at worst
+produce a silly-but-legal party.
+
+The write is the shared UICommon injector (Core cannot call uicommon, so
+it hops through a NetPlayUI virtual that both the Qt dialog and the
+Android JNI callbacks implement) and completes BEFORE the ack, so the
+file is on disk before any Start can read it. Result goes to the room
+chat -- "<player> submitted a team: 6 Pokemon written to the guest save"
+-- so both sides see it land. Any party size is accepted; people play
+whatever format they like. A submission during a running battle is
+rejected honestly: saves are already synced and the live core owns the
+file, so it would be silently discarded.
+
+Buttons on all three platforms: a Submit Team button in the desktop
+room's chat panel, and on Android the joiner's FAB where the host's
+Start button sits (only one of them is ever visible). Any host can
+accept any joiner's team -- the injector is in the layer Android,
+macOS and Windows all compile.
+---
+ .../features/netplay/NetplaySession.kt        |  15 +++
+ .../netplay/model/NetplayViewModel.kt         |  35 +++++
+ .../features/netplay/ui/NetplayActivity.kt    |   1 +
+ .../features/netplay/ui/NetplayScreen.kt      |  48 +++++++
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |  12 ++
+ .../Android/jni/NetPlay/NetPlayUICallbacks.h  |   1 +
+ Source/Android/jni/NetPlay/Netplay.cpp        |  11 ++
+ Source/Core/Core/NetPlayClient.cpp            |  13 ++
+ Source/Core/Core/NetPlayClient.h              |  11 ++
+ Source/Core/Core/NetPlayProto.h               |   4 +
+ Source/Core/Core/NetPlayServer.cpp            |  39 ++++++
+ Source/Core/DolphinLib.props                  |   2 +
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  88 ++++++++++++
+ Source/Core/DolphinQt/NetPlay/NetPlayDialog.h |   3 +
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 127 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  28 ++++
+ 17 files changed, 440 insertions(+)
+ create mode 100644 Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/TeamInjector.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+index 56676c4..6643bcb 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+@@ -167,6 +167,19 @@ class NetplaySession(
+         nativeSendMessage(message)
+     }
+ 
++    /**
++     * Send this player's own Showdown team to the host, which writes it into
++     * the GBA save it syncs when the battle starts. A pokepast.es link must be
++     * resolved to text by the caller -- the host never fetches a URL. The host
++     * announces the result in the room chat once the write lands.
++     */
++    fun submitTeam(showdownText: String) = nativeSubmitTeam(showdownText)
++
++    /** Show a line in this player's own chat log; nothing is sent over the wire. */
++    fun showLocalMessage(message: String) {
++        _chatMessages.tryEmit(message)
++    }
++
+     fun setHostInputAuthority(enable: Boolean) = nativeSetHostInputAuthority(enable)
+ 
+     fun adjustClientPadBufferSize(buffer: Int) = nativeAdjustClientPadBufferSize(buffer)
+@@ -252,6 +265,8 @@ class NetplaySession(
+ 
+     private external fun nativeSendMessage(message: String)
+ 
++    private external fun nativeSubmitTeam(showdownText: String)
++
+     private external fun nativeSetHostInputAuthority(enable: Boolean)
+ 
+     private external fun nativeAdjustClientPadBufferSize(buffer: Int)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index adea1a1..327612c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -19,6 +19,7 @@ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.flow.onEach
+ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
+ import org.dolphinemu.dolphinemu.features.netplay.NetplaySession
+ import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+@@ -116,6 +117,40 @@ class NetplayViewModel(
+         netplaySession.startGame()
+     }
+ 
++    /**
++     * XD Netplay: hand this player's own team to the host, which writes it into
++     * the GBA save it syncs when the battle starts. A pokepast.es link is
++     * resolved HERE, on the submitting device, so the host only ever parses
++     * plain text it was handed -- it never fetches a URL a stranger chose.
++     */
++    fun submitTeam(text: String) {
++        val trimmed = text.trim()
++        if (trimmed.isEmpty()) {
++            return
++        }
++        val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+").find(trimmed)?.value
++        if (pokepaste == null) {
++            netplaySession.submitTeam(trimmed)
++            return
++        }
++        viewModelScope.launch(Dispatchers.IO) {
++            val body = try {
++                java.net.URL("$pokepaste/raw").readText()
++            } catch (e: Exception) {
++                null
++            }
++            withContext(Dispatchers.Main) {
++                if (body == null) {
++                    netplaySession.showLocalMessage(
++                        "Could not fetch that paste (network error)."
++                    )
++                } else {
++                    netplaySession.submitTeam(body)
++                }
++            }
++        }
++    }
++
+     fun sendMessage(message: String) {
+         val trimmedMessage = message.trim()
+         if (trimmedMessage.isEmpty()) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index eb9cece..1405071 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -53,6 +53,7 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     fatalTraversalError = viewModel.fatalTraversalError,
+                     messages = viewModel.messages.collectAsState().value,
+                     onSendMessage = viewModel::sendMessage,
++                    onSubmitTeam = viewModel::submitTeam,
+                     game = viewModel.game.collectAsState().value,
+                     onStartGame = viewModel::startGame,
+                     onGameSelected = viewModel::changeGame,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 789a3ce..156c8c7 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -141,8 +141,48 @@ fun NetplayScreen(
+     saveTransferProgress: SaveTransferProgress?,
+     gameDigestProgress: GameDigestProgress?,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
++    onSubmitTeam: (String) -> Unit,
+ ) {
+     val scrollState = rememberScrollState()
++    // XD Netplay: joiner's "Submit Team" paste sheet.
++    var showSubmitTeam by rememberSaveable { mutableStateOf(false) }
++    var teamDraft by rememberSaveable { mutableStateOf("") }
++    if (showSubmitTeam) {
++        AlertDialog(
++            title = { Text("Submit Team") },
++            text = {
++                Column {
++                    Text(
++                        "Paste a Showdown team export, or a pokepast.es link. " +
++                            "The host writes it into the save you'll play with."
++                    )
++                    Spacer(Modifier.height(12.dp))
++                    OutlinedTextField(
++                        value = teamDraft,
++                        onValueChange = { teamDraft = it },
++                        modifier = Modifier.fillMaxWidth().height(220.dp)
++                    )
++                }
++            },
++            confirmButton = {
++                TextButton(
++                    onClick = {
++                        onSubmitTeam(teamDraft.trim())
++                        showSubmitTeam = false
++                    },
++                    enabled = teamDraft.isNotBlank()
++                ) {
++                    Text("Send")
++                }
++            },
++            dismissButton = {
++                TextButton(onClick = { showSubmitTeam = false }) {
++                    Text(stringResource(R.string.cancel))
++                }
++            },
++            onDismissRequest = { showSubmitTeam = false },
++        )
++    }
+ 
+     DolphinScaffold(
+         title = {
+@@ -161,6 +201,13 @@ fun NetplayScreen(
+                 ExtendedFloatingActionButton(onClick = onStartGame) {
+                     Text(stringResource(R.string.netplay_start))
+                 }
++            } else {
++                // XD Netplay: a joiner hands their own team to the host, which
++                // writes it into the save it syncs at start. Sits where the
++                // host's Start button is, since only one of them ever shows.
++                ExtendedFloatingActionButton(onClick = { showSubmitTeam = true }) {
++                    Text("Submit Team")
++                }
+             }
+         },
+     ) { innerPadding ->
+@@ -1375,6 +1422,7 @@ private fun PreviewNetplayScreen() {
+             JoinInfoType.EXTERNAL to JoinAddress.Loaded("203.0.113.1:2626"),
+             JoinInfoType.LOCAL to JoinAddress.Loaded("192.168.1.5:2626"),
+         ),
++        onSubmitTeam = {},
+ //        saveTransferProgress = SaveTransferProgress(
+ //            title = "Title",
+ //            totalSize = 1024L,
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index 7d58b88..dcc5130 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -14,6 +14,7 @@
+ #include "NetPlayUICallbacks.h"
+ #include "UICommon/GameFile.h"
+ #include "UICommon/UICommon.h"
++#include "UICommon/XDNetplay/TeamInjector.h"
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+ 
+@@ -165,6 +166,17 @@ void NetPlayUICallbacks::AppendChat(const std::string& message)
+   });
+ }
+ 
++std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
++                                                 const std::string& text)
++{
++  // Host side. Writes the joiner's team into the socket-3 save that netplay
++  // syncs at start; the caller relays the returned line into the room chat.
++  std::string status;
++  if (!XDNetplay::InjectGuestTeam(text, 2, &status))
++    return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
++  return status;
++}
++
+ void NetPlayUICallbacks::OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                                          const std::string& netplay_name)
+ {
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.h b/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
+index 946948d..e5528f0 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
+@@ -31,6 +31,7 @@ public:
+   bool IsHosting() const override;
+   void Update() override;
+   void AppendChat(const std::string& msg) override;
++  std::string OnTeamSubmission(const std::string& player, const std::string& text) override;
+   void OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                        const std::string& netplay_name) override;
+   void OnMsgChangeGBARom(int pad, const NetPlay::GBAConfig& config) override;
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index ea18b06..521b2f7 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -52,6 +52,17 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSendMessage
+     client->SendChatMessage(GetJString(env, jmessage));
+ }
+ 
++JNIEXPORT void JNICALL
++Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(JNIEnv* env,
++                                                                                jobject obj,
++                                                                                jstring jteam)
++{
++  // XD Netplay: hand this player's Showdown team to the host, which writes it
++  // into the GBA save it syncs at start (UICommon/XDNetplay/TeamInjector.h).
++  if (auto* client = GetClientPointer(env, obj))
++    client->SendTeamSubmission(GetJString(env, jteam));
++}
++
+ JNIEXPORT void JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSetHostInputAuthority(
+     JNIEnv* env, jobject obj, jboolean enable)
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index 005e2e5..fd9262c 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -1706,6 +1706,19 @@ void NetPlayClient::SendChatMessage(const std::string& msg)
+   SendAsync(std::move(packet));
+ }
+ 
++void NetPlayClient::SendTeamSubmission(const std::string& showdown_text)
++{
++  // Showdown text, not prebuilt party bytes: the host has to construct the
++  // Pokemon against ITS save's trainer name/ID, and it is the single place
++  // that parses untrusted team text. Pokepaste links are resolved by the
++  // submitting client before this call, so the host never fetches a URL.
++  sf::Packet packet;
++  packet << MessageID::TeamData;
++  packet << showdown_text;
++
++  SendAsync(std::move(packet));
++}
++
+ // called from ---CPU--- thread
+ void NetPlayClient::AddPadStateToPacket(const int in_game_pad, const GCPadStatus& pad,
+                                         sf::Packet& packet)
+diff --git a/Source/Core/Core/NetPlayClient.h b/Source/Core/Core/NetPlayClient.h
+index cbe0fe5..eb4ccb7 100644
+--- a/Source/Core/Core/NetPlayClient.h
++++ b/Source/Core/Core/NetPlayClient.h
+@@ -53,6 +53,13 @@ public:
+ 
+   virtual void Update() = 0;
+   virtual void AppendChat(const std::string& msg) = 0;
++  // XD Netplay, host side: a joiner submitted a Showdown team. The
++  // implementation writes it into the GBA save that will be synced at start
++  // (UICommon/XDNetplay/TeamInjector.h -- Core cannot call uicommon directly,
++  // hence the hop through the UI layer) and returns a one-line result for the
++  // room chat. Called on the NETPLAY thread; must finish before the ack, so
++  // the file is on disk before any Start can read it.
++  virtual std::string OnTeamSubmission(const std::string& player, const std::string& text) = 0;
+ 
+   virtual void OnMsgChangeGame(const SyncIdentifier& sync_identifier,
+                                const std::string& netplay_name) = 0;
+@@ -128,6 +135,10 @@ public:
+   void Stop();
+   bool ChangeGame(const std::string& game);
+   void SendChatMessage(const std::string& msg);
++  // XD Netplay: submit this player's own team to the host, which writes it
++  // into the save it syncs at start. No-op unless the host is running this
++  // fork's XD flow. See UICommon/XDNetplay/TeamInjector.h.
++  void SendTeamSubmission(const std::string& showdown_text);
+   void RequestStopGame();
+   void SendPowerButtonEvent();
+   void RequestGolfControl(PlayerId pid);
+diff --git a/Source/Core/Core/NetPlayProto.h b/Source/Core/Core/NetPlayProto.h
+index 0cc897e..c17695c 100644
+--- a/Source/Core/Core/NetPlayProto.h
++++ b/Source/Core/Core/NetPlayProto.h
+@@ -160,6 +160,10 @@ enum class MessageID : u8
+   PlayerLeave = 0x11,
+ 
+   ChatMessage = 0x30,
++  // XD Netplay: a joiner submits their own Showdown team, which the host
++  // writes into the GBA save it will sync at start. Safe to add without a
++  // protocol version bump: netplay already refuses to connect across builds.
++  TeamData = 0x31,
+ 
+   ChunkedDataStart = 0x40,
+   ChunkedDataEnd = 0x41,
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 7898137..86442b1 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -796,6 +796,45 @@ unsigned int NetPlayServer::OnData(sf::Packet& packet, Client& player)
+   }
+   break;
+ 
++  case MessageID::TeamData:
++  {
++    std::string text;
++    packet >> text;
++
++    // Untrusted remote input: cap it before it reaches the parser. A real
++    // six-Pokemon Showdown export is well under 2 KB.
++    constexpr size_t MAX_TEAM_TEXT = 16 * 1024;
++    std::string result;
++    if (text.size() > MAX_TEAM_TEXT)
++    {
++      result = "team rejected (too large)";
++    }
++    else if (m_is_running)
++    {
++      // Saves were read and synced when this battle started, and the host's
++      // save file is now owned by the live mGBA core (which rewrites it from
++      // its in-memory copy at shutdown), so a write here would be silently
++      // discarded. Reject honestly instead of claiming a queue we don't have.
++      result = "not applied - a battle is already running. Back out, then submit "
++               "before the host starts the next one.";
++    }
++    else
++    {
++      // The write completes synchronously here, before the chat ack below and
++      // therefore before any Start can read the file.
++      result = m_dialog ? m_dialog->OnTeamSubmission(player.name, text) : std::string{};
++    }
++
++    if (!result.empty())
++    {
++      const std::string line = fmt::format("{} submitted a team: {}", player.name, result);
++      SendChatMessage(line);
++      if (m_dialog)
++        m_dialog->AppendChat(line);
++    }
++  }
++  break;
++
+   case MessageID::ChunkedDataProgress:
+   {
+     u32 cid;
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 977ab43..44e8993 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -602,6 +602,7 @@
+     <ClInclude Include="UICommon\XDNetplay\Gen3Text.h" />
+     <ClInclude Include="UICommon\XDNetplay\MonFactory.h" />
+     <ClInclude Include="UICommon\XDNetplay\ShowdownParser.h" />
++    <ClInclude Include="UICommon\XDNetplay\TeamInjector.h" />
+     <ClInclude Include="UpdaterCommon\UI.h" />
+     <ClInclude Include="UpdaterCommon\UpdaterCommon.h" />
+     <ClInclude Include="VideoBackends\D3D\D3DBase.h" />
+@@ -1311,6 +1312,7 @@
+     <ClCompile Include="UICommon\XDNetplay\Gen3Text.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\MonFactory.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\ShowdownParser.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\TeamInjector.cpp" />
+     <ClCompile Include="UpdaterCommon\UpdaterCommon.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBase.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBoundingBox.cpp" />
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 71ffd05..2691a79 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -12,10 +12,13 @@
+ #include <QGridLayout>
+ #include <QGroupBox>
+ #include <QHeaderView>
++#include <QInputDialog>
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QMenu>
++#include <QPointer>
+ #include <QPushButton>
++#include <QRegularExpression>
+ #include <QSignalBlocker>
+ #include <QSpinBox>
+ #include <QSplitter>
+@@ -23,8 +26,11 @@
+ #include <QTextBrowser>
+ 
+ #include <algorithm>
++#include <thread>
+ #include <utility>
+ 
++#include "Common/HttpRequest.h"
++
+ #ifdef HAS_LIBMGBA
+ #include <fmt/ranges.h>
+ #endif
+@@ -62,6 +68,7 @@
+ 
+ #include "UICommon/DiscordPresence.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/UICommon.h"
+ 
+ #include "VideoCommon/NetPlayChatUI.h"
+@@ -277,9 +284,21 @@ void NetPlayDialog::CreateChatLayout()
+ 
+   auto* layout = new QGridLayout;
+ 
++  // XD Netplay: a joiner can hand their own team to the host, which writes it
++  // into the save it syncs at start. Hidden for the host (who edits its saves
++  // directly in the team editor) and shown once connected as a client.
++  m_submit_team_button = new QPushButton(tr("Submit Team..."));
++  m_submit_team_button->setToolTip(
++      tr("Send your own Showdown team to the host, so you play your own Pokémon.\n"
++         "Applies to the next battle the host starts."));
++  m_submit_team_button->setDefault(false);
++  m_submit_team_button->setAutoDefault(false);
++  m_submit_team_button->hide();
++
+   layout->addWidget(m_chat_edit, 0, 0, 1, -1);
+   layout->addWidget(m_chat_type_edit, 1, 0);
+   layout->addWidget(m_chat_send_button, 1, 1);
++  layout->addWidget(m_submit_team_button, 2, 0, 1, -1);
+ 
+   m_chat_box->setLayout(layout);
+ }
+@@ -346,6 +365,7 @@ void NetPlayDialog::ConnectWidgets()
+   // Chat
+   connect(m_chat_send_button, &QPushButton::clicked, this, &NetPlayDialog::OnChat);
+   connect(m_chat_type_edit, &QLineEdit::returnPressed, this, &NetPlayDialog::OnChat);
++  connect(m_submit_team_button, &QPushButton::clicked, this, &NetPlayDialog::OnSubmitTeam);
+   connect(m_chat_type_edit, &QLineEdit::textChanged, this,
+           [this] { m_chat_send_button->setEnabled(!m_chat_type_edit->text().isEmpty()); });
+ 
+@@ -543,6 +563,8 @@ void NetPlayDialog::show(std::string nickname, bool use_traversal)
+ #else
+   m_hide_remote_gbas_action->setVisible(false);
+ #endif
++  // Only a joiner submits a team; the host edits its own saves directly.
++  m_submit_team_button->setHidden(is_hosting);
+   m_start_button->setHidden(!is_hosting);
+   m_kick_button->setHidden(!is_hosting);
+   m_assign_ports_button->setHidden(!is_hosting);
+@@ -816,6 +838,72 @@ void NetPlayDialog::AppendChat(const std::string& msg)
+   QApplication::alert(this);
+ }
+ 
++std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std::string& text)
++{
++  // Host side, NETPLAY thread. The write must finish before we return: the
++  // caller acks only afterwards, so the file is on disk before any Start can
++  // read it. Touches no widgets -- the caller relays the text into chat.
++  std::string status;
++  if (!XDNetplay::InjectGuestTeam(text, 2, &status))
++    return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
++  return status;
++}
++
++void NetPlayDialog::OnSubmitTeam()
++{
++  // Joiner side. A pokepast.es link is resolved HERE, on the submitting
++  // client, so the host only ever parses plain text it was handed -- it never
++  // fetches a URL a stranger chose.
++  QInputDialog dialog(this);
++  dialog.setWindowTitle(tr("Submit Team"));
++  dialog.setLabelText(tr("Paste a Showdown team export, or a pokepast.es link.\n"
++                         "The host writes it into the save you'll play with."));
++  dialog.setInputMode(QInputDialog::TextInput);
++  dialog.setOption(QInputDialog::UsePlainTextEditForTextInput);
++  dialog.resize(500, 400);
++  if (dialog.exec() != QDialog::Accepted)
++    return;
++
++  const QString text = dialog.textValue().trimmed();
++  if (text.isEmpty())
++    return;
++
++  const QRegularExpression pokepaste_re(
++      QStringLiteral("^https?://pokepast\\.es/[A-Za-z0-9]+"));
++  const QRegularExpressionMatch match = pokepaste_re.match(text);
++  if (!match.hasMatch())
++  {
++    Settings::Instance().GetNetPlayClient()->SendTeamSubmission(text.toStdString());
++    DisplayMessage(tr("Team sent to the host."), "");
++    return;
++  }
++
++  const std::string url = match.captured(0).toStdString() + "/raw";
++  DisplayMessage(tr("Fetching %1…").arg(match.captured(0)), "");
++  QPointer<NetPlayDialog> self(this);
++  std::thread([self, url] {
++    Common::HttpRequest request;
++    request.FollowRedirects();
++    Common::HttpRequest::Response response = request.Get(url);
++    if (!self)
++      return;
++    QueueOnObject(self.data(), [self, response = std::move(response)] {
++      if (!self)
++        return;
++      if (!response)
++      {
++        self->DisplayMessage(tr("Could not fetch that paste (network error)."), "");
++        return;
++      }
++      if (auto client = Settings::Instance().GetNetPlayClient())
++      {
++        client->SendTeamSubmission(std::string(response->begin(), response->end()));
++        self->DisplayMessage(tr("Team sent to the host."), "");
++      }
++    });
++  }).detach();
++}
++
+ void NetPlayDialog::OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                                     const std::string& netplay_name)
+ {
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+index 54cc111..328d7a0 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+@@ -54,6 +54,7 @@ public:
+ 
+   void Update() override;
+   void AppendChat(const std::string& msg) override;
++  std::string OnTeamSubmission(const std::string& player, const std::string& text) override;
+ 
+   void OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                        const std::string& netplay_name) override;
+@@ -108,6 +109,7 @@ private:
+   void CreateMainLayout();
+   void ConnectWidgets();
+   void OnChat();
++  void OnSubmitTeam();
+   void OnStart();
+   void DisplayMessage(const QString& msg, const std::string& color,
+                       int duration = OSD::Duration::NORMAL);
+@@ -124,6 +126,7 @@ private:
+   QTextEdit* m_chat_edit;
+   QLineEdit* m_chat_type_edit;
+   QPushButton* m_chat_send_button;
++  QPushButton* m_submit_team_button;
+ 
+   // Players
+   QGroupBox* m_players_box;
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index 45eaae9..3c800d6 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -31,6 +31,8 @@ add_library(uicommon
+   XDNetplay/MonFactory.h
+   XDNetplay/ShowdownParser.cpp
+   XDNetplay/ShowdownParser.h
++  XDNetplay/TeamInjector.cpp
++  XDNetplay/TeamInjector.h
+ )
+ 
+ target_link_libraries(uicommon
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+new file mode 100644
+index 0000000..b4e1131
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -0,0 +1,127 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/TeamInjector.h"
++
++#include <optional>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/CommonTypes.h"
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++
++#include "Core/Config/MainSettings.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBACore.h"
++#endif
++
++#include "UICommon/XDNetplay/Gen3Data.h"
++#include "UICommon/XDNetplay/Gen3Mon.h"
++#include "UICommon/XDNetplay/Gen3Save.h"
++#include "UICommon/XDNetplay/MonFactory.h"
++#include "UICommon/XDNetplay/ShowdownParser.h"
++
++namespace XDNetplay
++{
++#ifdef HAS_LIBMGBA
++namespace
++{
++bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
++{
++  File::IOFile file(path, "rb");
++  if (!file)
++    return false;
++  out->resize(file.GetSize());
++  return out->empty() || file.ReadBytes(out->data(), out->size());
++}
++}  // namespace
++#endif
++
++bool InjectGuestTeam(const std::string& showdown_text, int device, std::string* status)
++{
++  const auto fail = [status](std::string message) {
++    if (status)
++      *status = std::move(message);
++    return false;
++  };
++
++#ifndef HAS_LIBMGBA
++  return fail("this build has no GBA support");
++#else
++  std::string error;
++  const auto data = Gen3Data::LoadBundled(&error);
++  if (!data)
++    return fail(fmt::format("game data unavailable ({})", error));
++
++  // Same ROM resolution the team editor uses: the socket's own ROM, falling
++  // back to the other socket's (a launcher-made setup points both at one dump).
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++    return fail("no Emerald ROM configured on the host");
++
++  // GetSavePath is exactly what SyncSaveData reads at start, so writing here
++  // is guaranteed to be the file the guest receives.
++  const std::string save_path = HW::GBA::Core::GetSavePath(rom, device);
++
++  std::vector<u8> bytes;
++  if (!(File::Exists(save_path) && ReadFileBytes(save_path, &bytes)))
++  {
++    const std::string template_path =
++        File::GetSysDirectory() +
++        (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++    if (!ReadFileBytes(template_path, &bytes))
++      return fail("host has no save for that socket and no bundled template");
++  }
++
++  auto save = EmeraldSave::Create(std::move(bytes), &error);
++  if (!save)
++    return fail(fmt::format("host save unreadable ({})", error));
++
++  const std::vector<ShowdownSet> sets = ShowdownParser::ParseTeam(showdown_text);
++  if (sets.empty())
++    return fail("nothing recognizable in that paste");
++
++  // Any party size is accepted: players run whatever format they like, and the
++  // game itself enforces its own rules at battle setup.
++  std::vector<Gen3Mon> built;
++  size_t skipped = 0;
++  for (const ShowdownSet& set : sets)
++  {
++    if (built.size() == EmeraldSave::PARTY_MAX)
++    {
++      ++skipped;
++      continue;
++    }
++    std::string mon_error;
++    auto mon = MonFactory::Build(set, *data, save->GetTrainerName(), save->GetTrainerId(),
++                                 &mon_error);
++    if (mon)
++      built.push_back(std::move(*mon));
++    else
++      ++skipped;
++  }
++  if (built.empty())
++    return fail("no usable Pokemon in that team");
++
++  const size_t count = built.size();
++  if (!save->WriteParty(built))
++    return fail("party too large");
++  if (!VerifiedWriteSaveFile(save_path, *save, &error))
++    return fail(fmt::format("save NOT written ({})", error));
++
++  if (status)
++  {
++    *status = skipped == 0 ?
++                  fmt::format("{} Pokemon written to the guest save", count) :
++                  fmt::format("{} Pokemon written to the guest save ({} entries skipped)", count,
++                              skipped);
++  }
++  return true;
++#endif
++}
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+new file mode 100644
+index 0000000..4a68add
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <string>
++
++namespace XDNetplay
++{
++// Writes a Showdown-format team into the GBA save the netplay host syncs to
++// the guest, so a joiner can bring their own team to someone else's room.
++//
++// The host owns both players' teams by construction: netplay ships the HOST's
++// GBA saves to every client at start, so the guest's party has to exist in the
++// host's socket-3 save before RequestStartGame reads it. This runs host-side
++// when a TeamData message arrives, and MUST complete before that read -- the
++// caller acknowledges only after this returns.
++//
++// The text is untrusted remote input. Everything downstream is name-whitelisted
++// and bounded (unknown species/moves are skipped, stats clamped, party capped),
++// and the write is verified with a .bak of the previous save, so a hostile paste
++// can at worst produce a silly-but-legal party or an empty result.
++//
++// device is the SI channel of the guest's socket (2 in this fork's 2-player
++// layout). status, when given, receives a human-readable one-line summary
++// suitable for relaying into the room chat.
++bool InjectGuestTeam(const std::string& showdown_text, int device, std::string* status);
++}  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
