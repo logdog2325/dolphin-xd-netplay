@@ -1,0 +1,199 @@
+From 52ed898034bdd8fc798ed11840d175c0a24a0ba2 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 14:27:24 -0700
+Subject: [PATCH] Netplay: give the host its own team back when the room closes
+
+A guest's submitted team is written into the host's socket-3 save, and
+it stayed there: the next solo boot used the guest's Pokemon, and so did
+the next guest who submitted nothing -- they would battle with a
+stranger's team without ever being told. Field-confirmed after a session
+where the opponent's imported team carried into the following one.
+
+The first injection of a session now stashes the host's own save beside
+it, and closing the room restores that stash. Only the first injection
+stashes, so a second submission cannot overwrite the host's copy with
+the first guest's team, and a room where nobody submitted leaves nothing
+behind to restore. The restore rides the same NetPlayUI hop the
+injection uses, so it works on desktop and Android alike.
+---
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |  5 +++
+ .../Android/jni/NetPlay/NetPlayUICallbacks.h  |  1 +
+ Source/Core/Core/NetPlayClient.h              |  3 ++
+ Source/Core/Core/NetPlayServer.cpp            |  6 +++
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  5 +++
+ Source/Core/DolphinQt/NetPlay/NetPlayDialog.h |  1 +
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 39 +++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/TeamInjector.h | 10 +++++
+ 8 files changed, 70 insertions(+)
+
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index dcc5130..167e5b2 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -177,6 +177,11 @@ std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
+   return status;
+ }
+ 
++void NetPlayUICallbacks::OnRoomClosed()
++{
++  XDNetplay::RestoreHostTeam(2);
++}
++
+ void NetPlayUICallbacks::OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                                          const std::string& netplay_name)
+ {
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.h b/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
+index e5528f0..cfe5130 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.h
+@@ -32,6 +32,7 @@ public:
+   void Update() override;
+   void AppendChat(const std::string& msg) override;
+   std::string OnTeamSubmission(const std::string& player, const std::string& text) override;
++  void OnRoomClosed() override;
+   void OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                        const std::string& netplay_name) override;
+   void OnMsgChangeGBARom(int pad, const NetPlay::GBAConfig& config) override;
+diff --git a/Source/Core/Core/NetPlayClient.h b/Source/Core/Core/NetPlayClient.h
+index eb4ccb7..367ad1a 100644
+--- a/Source/Core/Core/NetPlayClient.h
++++ b/Source/Core/Core/NetPlayClient.h
+@@ -60,6 +60,9 @@ public:
+   // room chat. Called on the NETPLAY thread; must finish before the ack, so
+   // the file is on disk before any Start can read it.
+   virtual std::string OnTeamSubmission(const std::string& player, const std::string& text) = 0;
++  // XD Netplay, host side: the room closed. Puts the host's own team back if a
++  // guest's submission overwrote it (UICommon/XDNetplay/TeamInjector.h).
++  virtual void OnRoomClosed() = 0;
+ 
+   virtual void OnMsgChangeGame(const SyncIdentifier& sync_identifier,
+                                const std::string& netplay_name) = 0;
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 86442b1..3b11f3f 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -93,6 +93,12 @@ namespace NetPlay
+ {
+ NetPlayServer::~NetPlayServer()
+ {
++  // A guest's submitted team lives in the host's socket-3 save; hand that save
++  // back to its owner now the room is gone, so the next solo boot (or the next
++  // guest who submits nothing) uses the host's own team again.
++  if (m_dialog)
++    m_dialog->OnRoomClosed();
++
+   if (is_connected)
+   {
+     m_do_loop = false;
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 2691a79..8115f60 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -849,6 +849,11 @@ std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std
+   return status;
+ }
+ 
++void NetPlayDialog::OnRoomClosed()
++{
++  XDNetplay::RestoreHostTeam(2);
++}
++
+ void NetPlayDialog::OnSubmitTeam()
+ {
+   // Joiner side. A pokepast.es link is resolved HERE, on the submitting
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+index 328d7a0..bf30b61 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+@@ -55,6 +55,7 @@ public:
+   void Update() override;
+   void AppendChat(const std::string& msg) override;
+   std::string OnTeamSubmission(const std::string& player, const std::string& text) override;
++  void OnRoomClosed() override;
+ 
+   void OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+                        const std::string& netplay_name) override;
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index b4e1131..938f181 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -26,6 +26,27 @@
+ 
+ namespace XDNetplay
+ {
++namespace
++{
++constexpr const char* HOST_STASH_SUFFIX = ".hostteam";
++
++// The save path netplay will read for this socket, or empty when the setup
++// isn't complete enough to have one.
++std::string SavePathForDevice(int device)
++{
++#ifdef HAS_LIBMGBA
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++    return {};
++  return HW::GBA::Core::GetSavePath(rom, device);
++#else
++  return {};
++#endif
++}
++}  // namespace
++
+ #ifdef HAS_LIBMGBA
+ namespace
+ {
+@@ -78,6 +99,12 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+       return fail("host has no save for that socket and no bundled template");
+   }
+ 
++  // Stash the host's own team once per session, so it can be put back when the
++  // room closes. Only the FIRST injection stashes: a second submission must not
++  // overwrite the stash with the first guest's team.
++  if (File::Exists(save_path) && !File::Exists(save_path + HOST_STASH_SUFFIX))
++    File::CopyRegularFile(save_path, save_path + HOST_STASH_SUFFIX);
++
+   auto save = EmeraldSave::Create(std::move(bytes), &error);
+   if (!save)
+     return fail(fmt::format("host save unreadable ({})", error));
+@@ -124,4 +151,16 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+   return true;
+ #endif
+ }
++
++void RestoreHostTeam(int device)
++{
++  const std::string save_path = SavePathForDevice(device);
++  if (save_path.empty())
++    return;
++  const std::string stash = save_path + HOST_STASH_SUFFIX;
++  if (!File::Exists(stash))
++    return;  // no guest team was ever written this session
++  File::CopyRegularFile(stash, save_path);
++  File::Delete(stash);
++}
+ }  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 4a68add..0f56da2 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -25,4 +25,14 @@ namespace XDNetplay
+ // layout). status, when given, receives a human-readable one-line summary
+ // suitable for relaying into the room chat.
+ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string* status);
++
++// Put the host's own team back after a netplay room closes.
++//
++// A guest's submitted team overwrites the host's socket-3 save, and without
++// this it would still be there next time the host played solo (or hosted
++// someone who submitted nothing, who would then battle with a stranger's
++// team). The first injection of a session stashes the host's save alongside
++// it; this restores that stash and removes it. No stash means the host never
++// had a guest team written this session, so nothing happens.
++void RestoreHostTeam(int device);
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
