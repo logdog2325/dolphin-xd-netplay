@@ -1,0 +1,31 @@
+From b3a6d94d3cb5e07b347091cebb39f00fded16bb7 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 12:57:09 -0700
+Subject: [PATCH] PBR: define the Wiimote Point group constant used by the Wii
+ Remote mapping
+
+Patch 86 mapped the Wii Remote pointer through GROUP_POINT but the
+constant itself never made it into the series, so the Android build
+failed to compile. Define it next to the other control-group names.
+---
+ .../dolphinemu/features/xdnetplay/input/AutoMapper.kt         | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+index 7835f9d..ca06827 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/input/AutoMapper.kt
+@@ -39,6 +39,10 @@ object AutoMapper {
+     // ControlGroup UI names (see GCPadEmu.cpp / GBAPadEmu.cpp; no string translator is
+     // registered on Android, so getUiName() returns these raw strings).
+     private const val GROUP_BUTTONS = "Buttons"
++    // Wiimote groups (PBR). "Point" is the Cursor group's ui_name (its internal
++    // name is "IR"); binding its directions to a stick gives a pointer the
++    // handheld can actually aim, which the touchscreen does unreliably.
++    private const val GROUP_POINT = "Point"
+     private const val GROUP_MAIN_STICK = "Control Stick" // ui_name of the "Main Stick" group
+     private const val GROUP_C_STICK = "C Stick" // ui_name of the "C-Stick" group
+     private const val GROUP_TRIGGERS = "Triggers"
+-- 
+2.39.5 (Apple Git-154)
+
