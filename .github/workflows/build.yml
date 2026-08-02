@@ -111,14 +111,26 @@ jobs:
             -Pkeypass="$KEYSTORE_PASSWORD" \
             -Pstoretype=PKCS12
       - name: Confirm the APK carries the expected signature
+        env:
+          EXPECTED_SIGNER: ${{ vars.ANDROID_SIGNER_SHA256 }}
         run: |
           set -euo pipefail
           apk="$(ls Source/Android/app/build/outputs/apk/debug/*.apk | head -1)"
-          signer="$("$ANDROID_HOME"/build-tools/3*/apksigner verify --print-certs "$apk" \
-            | grep -m1 'SHA-256 digest' | awk '{print $NF}')"
+          # Runners carry several build-tools versions, so this must resolve to exactly one
+          # apksigner -- an unquoted glob passes the others along as arguments.
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)"
+          # awk over grep: no match is an empty result to report, not a pipeline failure that
+          # reads like the signature itself was wrong.
+          signer="$("$apksigner" verify --print-certs "$apk" \
+            | awk '/SHA-256 digest/ { print $NF; exit }')"
+          if [ -z "$signer" ]; then
+            echo "::error::Could not read the APK's signer certificate."
+            exit 1
+          fi
           echo "signer SHA-256: $signer"
-          if [ "$signer" != "${{ vars.ANDROID_SIGNER_SHA256 }}" ] && [ -n "${{ vars.ANDROID_SIGNER_SHA256 }}" ]; then
-            echo "::error::APK signer changed -- users could not update over their existing install."
+          if [ -n "${EXPECTED_SIGNER:-}" ] && [ "$signer" != "$EXPECTED_SIGNER" ]; then
+            echo "::error::Signer changed ($signer, expected $EXPECTED_SIGNER) -- users could not"
+            echo "::error::update over their existing install without uninstalling first."
             exit 1
           fi
       - name: Verify APK contents
