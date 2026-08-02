@@ -1,0 +1,111 @@
+From d018a2155040851c52f998dc7df0170b1e3f8a2f Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 21:41:41 -0700
+Subject: [PATCH] Make the update check see pre-releases
+
+Ask GitHub for the release LIST rather than .../releases/latest. That endpoint
+skips pre-releases by design, and every build this project has shipped is one,
+so it answered with a version from weeks earlier and told every user they were
+current no matter how far behind they were -- the one failure mode an update
+check must not have.
+
+The newest release is now chosen by version, not by position in the list:
+GitHub orders by creation date, which stops matching the tags the moment a
+build is re-cut. Drafts are skipped, since they have no download page yet, and
+a tag this code cannot order (a "nightly", say) is only ever a last resort, so
+one odd entry at the top cannot hide the real releases behind it.
+---
+ .../Core/UICommon/XDNetplay/UpdateCheck.cpp   | 51 +++++++++++++++++--
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 2 files changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp b/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
+index 3b6bccc..24650d7 100644
+--- a/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
++++ b/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
+@@ -21,8 +21,11 @@ namespace XDNetplay
+ {
+ namespace
+ {
++// The release LIST, deliberately not .../releases/latest: that endpoint ignores pre-releases, and
++// every build this project has ever shipped is one, so it would report a version from months back
++// and tell everybody they were current forever. Newest-first, so one page is plenty.
+ constexpr char RELEASE_API_URL[] =
+-    "https://api.github.com/repos/logdog2325/dolphin-xd-netplay/releases/latest";
++    "https://api.github.com/repos/logdog2325/dolphin-xd-netplay/releases?per_page=20";
+ constexpr char RELEASES_PAGE_URL[] = "https://github.com/logdog2325/dolphin-xd-netplay/releases";
+ 
+ // GitHub rejects API requests that arrive without a User-Agent.
+@@ -164,14 +167,56 @@ UpdateCheckResult CheckForUpdate()
+   const char* data = reinterpret_cast<const char*>(response->data());
+   picojson::value json;
+   const std::string parse_error = picojson::parse(json, data, data + response->size());
+-  if (!parse_error.empty() || !json.is<picojson::object>())
++  if (!parse_error.empty() || !json.is<picojson::array>())
+   {
+     result.status = Status::Unknown;
+     result.message = "GitHub's reply could not be read, so the latest release is unknown.";
+     return result;
+   }
+ 
+-  const picojson::object& release = json.get<picojson::object>();
++  // Newest by VERSION, not by position. GitHub returns the list newest-created-first, which is not
++  // the same ordering as the tags whenever a build is re-cut, and a draft has no download page yet.
++  const picojson::array& releases = json.get<picojson::array>();
++  const picojson::object* newest = nullptr;
++  std::string newest_tag;
++  for (const picojson::value& entry : releases)
++  {
++    if (!entry.is<picojson::object>())
++      continue;
++    const picojson::object& candidate = entry.get<picojson::object>();
++    const auto draft = candidate.find("draft");
++    if (draft != candidate.end() && draft->second.evaluate_as_boolean())
++      continue;
++    const std::optional<std::string> tag = GetStringField(candidate, "tag_name");
++    if (!tag)
++      continue;
++
++    // A tag comparable with itself is one this code can order; an odd one (say "nightly") must not
++    // shadow the real releases just for being listed first, so it is only a last resort.
++    const bool candidate_ranks = CompareVersions(*tag, *tag).has_value();
++    if (newest)
++    {
++      const bool newest_ranks = CompareVersions(newest_tag, newest_tag).has_value();
++      if (newest_ranks && !candidate_ranks)
++        continue;
++      if (newest_ranks == candidate_ranks &&
++          (!candidate_ranks || CompareVersions(newest_tag, *tag).value_or(0) >= 0))
++      {
++        continue;
++      }
++    }
++    newest = &candidate;
++    newest_tag = *tag;
++  }
++
++  if (!newest)
++  {
++    result.status = Status::Unknown;
++    result.message = "GitHub listed no releases, so the latest release is unknown.";
++    return result;
++  }
++
++  const picojson::object& release = *newest;
+   const std::optional<std::string> tag_name = GetStringField(release, "tag_name");
+   const std::optional<std::string> name = GetStringField(release, "name");
+   const std::optional<std::string> html_url = GetStringField(release, "html_url");
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index d62ce68..0773f77 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "0.4.44";
++constexpr char VERSION[] = "0.4.45";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
