@@ -1,0 +1,883 @@
+From 03c928dadfc5e07e009ea1d629da260a99b268ad Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 18:24:12 -0700
+Subject: [PATCH] Add a Check for Updates button
+
+Asks GitHub for the newest release, compares it against this build, and offers to
+open the download page. Nothing is downloaded or installed automatically.
+
+The build did not previously know which release it was: CI stamps binaries with
+upstream Dolphin's git describe, and the only version-looking strings in the fork
+are matchmaking compatibility keys that the session index filters on for exact
+equality, so they cannot double as a display version. Hence XDNetplay::VERSION,
+which must be bumped in the same patch a release is tagged from.
+
+Tags are compared component-wise as integers, because 0.4.9 is older than 0.4.44
+and a string comparison says the opposite. A tag that cannot be parsed that way
+reports the two versions and lets the user judge, and no failure -- transport
+error, rate limit, unparseable reply -- can report "up to date", which would
+otherwise hide every future release behind one bad response.
+
+Release title and date are treated as optional, since GitHub returns a null name
+for an untitled release; only the tag and the URL decide anything. Both are
+remote text: the message box escapes them, or an <a href> in a release title
+would render as a live link that opens an arbitrary URL on one click, on the
+up-to-date path where no download button is offered at all. The URL is honored
+only if it points inside this repository, since both front ends hand it to an OS
+opener that acts on more schemes than the web; anything else falls back to the
+releases page.
+---
+ .../features/xdnetplay/UpdateCheckBridge.kt   |  77 ++++++
+ .../xdnetplay/ui/PokemonHubActivity.kt        | 114 +++++++++
+ .../app/src/main/res/values/strings.xml       |   8 +
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        |  50 +++-
+ Source/Core/DolphinLib.props                  |   3 +
+ .../DolphinQt/XDNetplay/PokemonHubDialog.cpp  |  92 +++++++
+ .../DolphinQt/XDNetplay/PokemonHubDialog.h    |   8 +
+ Source/Core/UICommon/CMakeLists.txt           |   3 +
+ .../Core/UICommon/XDNetplay/UpdateCheck.cpp   | 229 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/UpdateCheck.h  |  53 ++++
+ Source/Core/UICommon/XDNetplay/Version.h      |  15 ++
+ 11 files changed, 651 insertions(+), 1 deletion(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/UpdateCheckBridge.kt
+ create mode 100644 Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/UpdateCheck.h
+ create mode 100644 Source/Core/UICommon/XDNetplay/Version.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/UpdateCheckBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/UpdateCheckBridge.kt
+new file mode 100644
+index 0000000..3eb9031
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/UpdateCheckBridge.kt
+@@ -0,0 +1,77 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++/**
++ * Kotlin side of the release check in Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp, which
++ * forwards to UICommon/XDNetplay/UpdateCheck so desktop and Android reach the same verdict.
++ *
++ * [check] is a blocking HTTP call; call it from Dispatchers.IO only.
++ */
++object UpdateCheckBridge {
++
++    /** The XD Netplay release this build belongs to (XDNetplay::VERSION). */
++    val localVersion: String
++        get() = nativeGetVersion()
++
++    /**
++     * Asks GitHub for the newest published release and compares it against [localVersion].
++     * Never reports [UpdateStatus.UP_TO_DATE] for a check that did not complete.
++     */
++    fun check(): UpdateCheckResult {
++        val row = nativeCheckForUpdate()
++        if (row.size < 6) {
++            return UpdateCheckResult(
++                status = UpdateStatus.UNKNOWN,
++                message = "The update check did not return a result."
++            )
++        }
++        return UpdateCheckResult(
++            status = UpdateStatus.fromToken(row[0]),
++            latestTag = row[1],
++            releaseName = row[2],
++            htmlUrl = row[3],
++            publishedAt = row[4],
++            message = row[5]
++        )
++    }
++
++    private external fun nativeGetVersion(): String
++
++    private external fun nativeCheckForUpdate(): Array<String>
++}
++
++enum class UpdateStatus {
++    UP_TO_DATE,
++    UPDATE_AVAILABLE,
++    UNKNOWN,
++    NETWORK_ERROR;
++
++    companion object {
++        /** Tokens are produced by the JNI bridge; anything unrecognised stays [UNKNOWN]. */
++        fun fromToken(token: String): UpdateStatus = when (token) {
++            "uptodate" -> UP_TO_DATE
++            "update" -> UPDATE_AVAILABLE
++            "network" -> NETWORK_ERROR
++            else -> UNKNOWN
++        }
++    }
++}
++
++data class UpdateCheckResult(
++    val status: UpdateStatus,
++    val latestTag: String = "",
++    val releaseName: String = "",
++    val htmlUrl: String = "",
++    val publishedAt: String = "",
++    val message: String = ""
++) {
++    /**
++     * Whether to offer the release page. [UpdateStatus.UNKNOWN] with a tag qualifies: that verdict
++     * means the two versions could not be ordered automatically, so the user has to look.
++     */
++    val canOpenReleasePage: Boolean
++        get() = htmlUrl.isNotEmpty() &&
++            (status == UpdateStatus.UPDATE_AVAILABLE ||
++                (status == UpdateStatus.UNKNOWN && latestTag.isNotEmpty()))
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
+index 9e05fed..55323f7 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/PokemonHubActivity.kt
+@@ -2,7 +2,11 @@
+ 
+ package org.dolphinemu.dolphinemu.features.xdnetplay.ui
+ 
++import android.content.ActivityNotFoundException
++import android.content.Intent
++import android.net.Uri
+ import android.os.Bundle
++import android.widget.Toast
+ import androidx.activity.compose.setContent
+ import androidx.activity.enableEdgeToEdge
+ import androidx.appcompat.app.AppCompatActivity
+@@ -13,14 +17,30 @@ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.height
+ import androidx.compose.foundation.layout.padding
++import androidx.compose.material3.AlertDialog
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedButton
+ import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.rememberCoroutineScope
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.LocalContext
++import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.R
++import org.dolphinemu.dolphinemu.features.xdnetplay.UpdateCheckBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.UpdateCheckResult
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+ import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
+@@ -56,6 +76,12 @@ class PokemonHubActivity : AppCompatActivity(), ThemeProvider {
+ 
+ @Composable
+ private fun PokemonHubScreen(onXd: () -> Unit, onPbr: () -> Unit) {
++    val context = LocalContext.current
++    val scope = rememberCoroutineScope()
++    val localVersion = remember { UpdateCheckBridge.localVersion }
++    var checking by remember { mutableStateOf(false) }
++    var updateResult by remember { mutableStateOf<UpdateCheckResult?>(null) }
++
+     Column(
+         modifier = Modifier
+             .fillMaxSize()
+@@ -95,5 +121,93 @@ private fun PokemonHubScreen(onXd: () -> Unit, onPbr: () -> Unit) {
+                 Text("Pokémon Battle Revolution, online", style = MaterialTheme.typography.bodySmall)
+             }
+         }
++        Spacer(Modifier.height(32.dp))
++
++        OutlinedButton(
++            onClick = {
++                checking = true
++                scope.launch {
++                    // Blocking HTTP: never on the main thread.
++                    val result = withContext(Dispatchers.IO) { UpdateCheckBridge.check() }
++                    checking = false
++                    updateResult = result
++                }
++            },
++            enabled = !checking,
++            modifier = Modifier.fillMaxWidth()
++        ) {
++            Text(
++                stringResource(
++                    if (checking) R.string.xd_update_checking else R.string.xd_update_check
++                )
++            )
++        }
++        Spacer(Modifier.height(8.dp))
++        Text(
++            text = stringResource(R.string.xd_update_current_version, localVersion),
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
+     }
++
++    updateResult?.let { result ->
++        UpdateResultDialog(
++            result = result,
++            onDismiss = { updateResult = null },
++            onDownload = {
++                updateResult = null
++                // A handheld build is not guaranteed to have anything registered for http.
++                try {
++                    context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.htmlUrl)))
++                } catch (_: ActivityNotFoundException) {
++                    Toast.makeText(context, R.string.xd_update_no_browser, Toast.LENGTH_LONG).show()
++                }
++            }
++        )
++    }
++}
++
++@Composable
++private fun UpdateResultDialog(
++    result: UpdateCheckResult,
++    onDismiss: () -> Unit,
++    onDownload: () -> Unit
++) {
++    val details = listOfNotNull(
++        result.releaseName.takeIf { it.isNotEmpty() },
++        result.publishedAt.takeIf { it.isNotEmpty() }
++    ).joinToString(" — ")
++
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        title = { Text(stringResource(R.string.xd_update_title)) },
++        text = {
++            Column {
++                Text(result.message)
++                if (details.isNotEmpty()) {
++                    Spacer(Modifier.height(8.dp))
++                    Text(details, style = MaterialTheme.typography.bodySmall)
++                }
++            }
++        },
++        confirmButton = {
++            // Nothing is downloaded here; the release page is where a build gets picked.
++            if (result.canOpenReleasePage) {
++                TextButton(onClick = onDownload) {
++                    Text(stringResource(R.string.xd_update_download))
++                }
++            } else {
++                TextButton(onClick = onDismiss) {
++                    Text(stringResource(R.string.xd_update_close))
++                }
++            }
++        },
++        dismissButton = {
++            if (result.canOpenReleasePage) {
++                TextButton(onClick = onDismiss) {
++                    Text(stringResource(R.string.xd_update_close))
++                }
++            }
++        }
++    )
+ }
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index b5946d9..c5ad9ce 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1106,4 +1106,12 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="netplay_address_share">Share address</string>
+     <string name="netplay_address_retry">Retry</string>
+     <string name="netplay_transfer_progress">%1$s/%2$s MiB</string>
++
++    <string name="xd_update_check">Check for Updates</string>
++    <string name="xd_update_checking">Checking…</string>
++    <string name="xd_update_title">Check for Updates</string>
++    <string name="xd_update_download">Download</string>
++    <string name="xd_update_close">Close</string>
++    <string name="xd_update_current_version">XD Netplay %1$s</string>
++    <string name="xd_update_no_browser">No app on this device can open the release page.</string>
+ </resources>
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index c97aff8..adcf535 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -2,7 +2,9 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ // Android bridge for the NetPlay session index ("lobby server", NETPLAY_INDEX_URL,
+-// default https://lobby.dolphin-emu.org).
++// default https://lobby.dolphin-emu.org), plus the XD Netplay release check that shares this
++// file because it is the other stateless xdnetplay-package bridge (see the second extern "C"
++// group at the bottom; Kotlin counterpart features/xdnetplay/UpdateCheckBridge).
+ //
+ // Listing only. Publishing is deliberately NOT exposed here: Core's NetPlayServer
+ // already owns a NetPlayIndex (NetPlayServer::m_index) and publishes automatically
+@@ -39,6 +41,8 @@
+ 
+ #include "Common/Version.h"
+ #include "UICommon/NetPlayIndex.h"
++#include "UICommon/XDNetplay/UpdateCheck.h"
++#include "UICommon/XDNetplay/Version.h"
+ 
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ 
+@@ -187,4 +191,48 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_NetPlayIndexBridge_nativeGetRe
+   return SpanToJStringArray(env, flat);
+ }
+ 
++// The XD Netplay release this build belongs to, for the hub's version line.
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_UpdateCheckBridge_nativeGetVersion(JNIEnv* env,
++                                                                                     jobject)
++{
++  return ToJString(env, XDNetplay::VERSION);
++}
++
++// Blocking HTTP call -- must be invoked off the Android main thread (Dispatchers.IO on the
++// Kotlin side). Flattened as [status, latest_tag, release_name, html_url, published_at, message];
++// status is one of "uptodate" / "update" / "unknown" / "network", matching UpdateStatus.
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_UpdateCheckBridge_nativeCheckForUpdate(
++    JNIEnv* env, jobject)
++{
++  const XDNetplay::UpdateCheckResult result = XDNetplay::CheckForUpdate();
++
++  const char* status = "unknown";
++  switch (result.status)
++  {
++  case XDNetplay::Status::UpToDate:
++    status = "uptodate";
++    break;
++  case XDNetplay::Status::UpdateAvailable:
++    status = "update";
++    break;
++  case XDNetplay::Status::NetworkError:
++    status = "network";
++    break;
++  case XDNetplay::Status::Unknown:
++    break;
++  }
++
++  const std::vector<std::string> fields{
++      status,
++      result.latest_tag,
++      result.release_name,
++      result.html_url,
++      result.published_at,
++      result.message,
++  };
++  return SpanToJStringArray(env, fields);
++}
++
+ }  // extern "C"
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 44e8993..6fffc93 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -603,6 +603,8 @@
+     <ClInclude Include="UICommon\XDNetplay\MonFactory.h" />
+     <ClInclude Include="UICommon\XDNetplay\ShowdownParser.h" />
+     <ClInclude Include="UICommon\XDNetplay\TeamInjector.h" />
++    <ClInclude Include="UICommon\XDNetplay\UpdateCheck.h" />
++    <ClInclude Include="UICommon\XDNetplay\Version.h" />
+     <ClInclude Include="UpdaterCommon\UI.h" />
+     <ClInclude Include="UpdaterCommon\UpdaterCommon.h" />
+     <ClInclude Include="VideoBackends\D3D\D3DBase.h" />
+@@ -1313,6 +1315,7 @@
+     <ClCompile Include="UICommon\XDNetplay\MonFactory.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\ShowdownParser.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\TeamInjector.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\UpdateCheck.cpp" />
+     <ClCompile Include="UpdaterCommon\UpdaterCommon.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBase.cpp" />
+     <ClCompile Include="VideoBackends\D3D\D3DBoundingBox.cpp" />
+diff --git a/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.cpp b/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.cpp
+index a754559..39f9543 100644
+--- a/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.cpp
+@@ -4,18 +4,27 @@
+ #include "DolphinQt/XDNetplay/PokemonHubDialog.h"
+ 
+ #include <initializer_list>
++#include <thread>
++#include <utility>
+ 
+ #include <QCheckBox>
++#include <QDesktopServices>
+ #include <QFont>
+ #include <QLabel>
++#include <QPointer>
+ #include <QPushButton>
+ #include <QShowEvent>
+ #include <QSignalBlocker>
++#include <QUrl>
+ #include <QVBoxLayout>
+ 
++#include "DolphinQt/QtUtils/ModalMessageBox.h"
+ #include "DolphinQt/QtUtils/NonDefaultQPushButton.h"
++#include "DolphinQt/QtUtils/QueueOnObject.h"
+ #include "DolphinQt/Settings.h"
+ 
++#include "UICommon/XDNetplay/Version.h"
++
+ PokemonHubDialog::PokemonHubDialog(QWidget* parent) : QDialog(parent)
+ {
+   setWindowTitle(tr("Pokémon Hub"));
+@@ -73,6 +82,12 @@ void PokemonHubDialog::CreateMainLayout()
+     layout->addWidget(button);
+   }
+ 
++  m_update_button = new NonDefaultQPushButton(tr("Check for Updates"));
++  layout->addWidget(m_update_button);
++
++  auto* version_label = new QLabel(tr("XD Netplay %1").arg(QString::fromUtf8(XDNetplay::VERSION)));
++  layout->addWidget(version_label);
++
+   m_show_on_startup_check = new QCheckBox(tr("Show this at startup"));
+   m_show_on_startup_check->setChecked(ShowOnStartup());
+   layout->addWidget(m_show_on_startup_check);
+@@ -94,7 +109,84 @@ void PokemonHubDialog::ConnectWidgets()
+     emit OpenPbrLauncher();
+   });
+ 
++  connect(m_update_button, &QPushButton::clicked, this, &PokemonHubDialog::CheckForUpdates);
++
+   connect(m_show_on_startup_check, &QCheckBox::toggled, this, [](bool checked) {
+     Settings::GetQSettings().setValue(QStringLiteral("xdnetplay/showlauncheronstartup"), checked);
+   });
+ }
++
++void PokemonHubDialog::CheckForUpdates()
++{
++  if (m_checking_for_update)
++    return;
++
++  m_checking_for_update = true;
++  m_update_button->setEnabled(false);
++  m_update_button->setText(tr("Checking…"));
++
++  // QPointer, not a raw this: the request outlives the hub whenever the user closes it mid-check,
++  // and QueueOnObject on a destroyed receiver is undefined.
++  QPointer<PokemonHubDialog> self(this);
++  std::thread([self] {
++    XDNetplay::UpdateCheckResult result = XDNetplay::CheckForUpdate();
++    if (!self)
++      return;
++    // QueueOnObject takes a raw receiver; the QPointer copy inside the lambda is what guards the
++    // deferred call.
++    QueueOnObject(self.data(), [self, result = std::move(result)] {
++      if (!self)
++        return;
++      self->ShowUpdateResult(result);
++    });
++  }).detach();
++}
++
++void PokemonHubDialog::ShowUpdateResult(const XDNetplay::UpdateCheckResult& result)
++{
++  m_checking_for_update = false;
++  m_update_button->setEnabled(true);
++  m_update_button->setText(tr("Check for Updates"));
++
++  const bool up_to_date = result.status == XDNetplay::Status::UpToDate;
++  const bool update_available = result.status == XDNetplay::Status::UpdateAvailable;
++
++  ModalMessageBox box(this);
++  box.setWindowTitle(tr("Check for Updates"));
++  box.setIcon(up_to_date || update_available ? QMessageBox::Information : QMessageBox::Warning);
++  // Everything below carries text straight from the release metadata, and a QMessageBox label
++  // defaults to Qt::AutoText with external links enabled -- so an unescaped "<a href=...>" in a
++  // release title would render as a live link that opens an arbitrary URL on one click, including
++  // on the up-to-date path where no download button is offered at all. Escape at the point of
++  // conversion, as the chat log does (NetPlayDialog::AppendChat). Escaping the argument before
++  // .arg() also keeps the translated literal itself untouched.
++  box.setText(QString::fromStdString(result.message).toHtmlEscaped());
++
++  // Only ever populated by a fetch that parsed, so this doubles as "we actually heard back".
++  if (!result.release_name.empty())
++  {
++    const QString name = QString::fromStdString(result.release_name).toHtmlEscaped();
++    box.setInformativeText(
++        result.published_at.empty() ?
++            name :
++            tr("%1 — published %2")
++                .arg(name, QString::fromStdString(result.published_at).toHtmlEscaped()));
++  }
++
++  // Nothing is downloaded here; the release page is where the user picks a build for their
++  // platform. Offered for Unknown too: that verdict means the user has to judge the tags
++  // themselves.
++  const bool unknown_with_tag =
++      result.status == XDNetplay::Status::Unknown && !result.latest_tag.empty();
++  const bool offer_page = !result.html_url.empty() && (update_available || unknown_with_tag);
++
++  QPushButton* open_button = nullptr;
++  if (offer_page)
++    open_button = box.addButton(tr("Open Download Page"), QMessageBox::ActionRole);
++  box.addButton(QMessageBox::Close);
++
++  box.exec();
++
++  if (open_button && box.clickedButton() == open_button)
++    QDesktopServices::openUrl(QUrl(QString::fromStdString(result.html_url)));
++}
+diff --git a/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.h b/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.h
+index 271c4e8..a541ee2 100644
+--- a/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/PokemonHubDialog.h
+@@ -5,6 +5,8 @@
+ 
+ #include <QDialog>
+ 
++#include "UICommon/XDNetplay/UpdateCheck.h"
++
+ class QCheckBox;
+ class QPushButton;
+ class QShowEvent;
+@@ -42,7 +44,13 @@ private:
+   void CreateMainLayout();
+   void ConnectWidgets();
+ 
++  void CheckForUpdates();
++  void ShowUpdateResult(const XDNetplay::UpdateCheckResult& result);
++
+   QPushButton* m_xd_button;
+   QPushButton* m_pbr_button;
++  QPushButton* m_update_button;
+   QCheckBox* m_show_on_startup_check;
++
++  bool m_checking_for_update = false;
+ };
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index 3c800d6..b6a67a7 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -33,6 +33,9 @@ add_library(uicommon
+   XDNetplay/ShowdownParser.h
+   XDNetplay/TeamInjector.cpp
+   XDNetplay/TeamInjector.h
++  XDNetplay/UpdateCheck.cpp
++  XDNetplay/UpdateCheck.h
++  XDNetplay/Version.h
+ )
+ 
+ target_link_libraries(uicommon
+diff --git a/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp b/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
+new file mode 100644
+index 0000000..3b6bccc
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/UpdateCheck.cpp
+@@ -0,0 +1,229 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/UpdateCheck.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstddef>
++#include <string_view>
++#include <vector>
++
++#include <fmt/format.h>
++#include <picojson.h>
++
++#include "Common/CommonTypes.h"
++#include "Common/HttpRequest.h"
++
++#include "UICommon/XDNetplay/Version.h"
++
++namespace XDNetplay
++{
++namespace
++{
++constexpr char RELEASE_API_URL[] =
++    "https://api.github.com/repos/logdog2325/dolphin-xd-netplay/releases/latest";
++constexpr char RELEASES_PAGE_URL[] = "https://github.com/logdog2325/dolphin-xd-netplay/releases";
++
++// GitHub rejects API requests that arrive without a User-Agent.
++constexpr char USER_AGENT[] = "dolphin-xd-netplay";
++
++constexpr std::chrono::milliseconds REQUEST_TIMEOUT{10000};
++
++// Long enough for any version anyone will ever tag, short enough that the accumulator below cannot
++// overflow.
++constexpr std::size_t MAX_COMPONENT_DIGITS = 9;
++
++std::string_view Trim(std::string_view text)
++{
++  const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
++  while (!text.empty() && is_space(text.front()))
++    text.remove_prefix(1);
++  while (!text.empty() && is_space(text.back()))
++    text.remove_suffix(1);
++  return text;
++}
++
++// std::nullopt for anything that is not a plain run of digits, which is what makes a suffixed tag
++// ("0.5.0-rc1") report as uncomparable instead of silently ordering wrong.
++std::optional<u64> ParseComponent(std::string_view component)
++{
++  if (component.empty() || component.size() > MAX_COMPONENT_DIGITS)
++    return std::nullopt;
++
++  u64 value = 0;
++  for (const char c : component)
++  {
++    if (c < '0' || c > '9')
++      return std::nullopt;
++    value = value * 10 + static_cast<u64>(c - '0');
++  }
++  return value;
++}
++
++std::optional<std::vector<u64>> ParseVersion(std::string_view tag)
++{
++  tag = Trim(tag);
++  if (!tag.empty() && (tag.front() == 'v' || tag.front() == 'V'))
++    tag.remove_prefix(1);
++  if (tag.empty())
++    return std::nullopt;
++
++  std::vector<u64> components;
++  while (true)
++  {
++    const std::size_t dot = tag.find('.');
++    const std::optional<u64> component =
++        ParseComponent(dot == std::string_view::npos ? tag : tag.substr(0, dot));
++    if (!component)
++      return std::nullopt;
++
++    components.push_back(*component);
++    if (dot == std::string_view::npos)
++      break;
++    tag.remove_prefix(dot + 1);
++  }
++  return components;
++}
++
++// The date half of an ISO 8601 timestamp ("2026-07-30T18:12:03Z" -> "2026-07-30").
++std::string DateOf(const std::string& timestamp)
++{
++  return timestamp.substr(0, timestamp.find('T'));
++}
++
++std::optional<std::string> GetStringField(const picojson::object& object, const char* key)
++{
++  const auto it = object.find(key);
++  if (it == object.end() || !it->second.is<std::string>())
++    return std::nullopt;
++
++  const std::string& value = it->second.get<std::string>();
++  if (value.empty())
++    return std::nullopt;
++
++  return value;
++}
++
++UpdateCheckResult MakeNetworkError(std::string message)
++{
++  UpdateCheckResult result;
++  result.status = Status::NetworkError;
++  result.html_url = RELEASES_PAGE_URL;
++  result.message = std::move(message);
++  return result;
++}
++}  // namespace
++
++std::optional<int> CompareVersions(std::string_view a, std::string_view b)
++{
++  const std::optional<std::vector<u64>> left = ParseVersion(a);
++  const std::optional<std::vector<u64>> right = ParseVersion(b);
++  if (!left || !right)
++    return std::nullopt;
++
++  const std::size_t count = std::max(left->size(), right->size());
++  for (std::size_t i = 0; i < count; i++)
++  {
++    const u64 lhs = i < left->size() ? (*left)[i] : 0;
++    const u64 rhs = i < right->size() ? (*right)[i] : 0;
++    if (lhs != rhs)
++      return lhs < rhs ? -1 : 1;
++  }
++  return 0;
++}
++
++UpdateCheckResult CheckForUpdate()
++{
++  Common::HttpRequest request{REQUEST_TIMEOUT};
++  if (!request.IsValid())
++    return MakeNetworkError("Could not start the update check on this system.");
++
++  // AllowedReturnCodes::All so the status code below can be read and explained; Ok_Only would
++  // collapse a rate limit and an unreachable server into the same empty response.
++  const Common::HttpRequest::Response response =
++      request.Get(RELEASE_API_URL,
++                  {{"User-Agent", USER_AGENT}, {"Accept", "application/vnd.github+json"}},
++                  Common::HttpRequest::AllowedReturnCodes::All);
++
++  if (!response)
++  {
++    return MakeNetworkError(
++        "Could not reach GitHub to check for updates. Check your connection and try again.");
++  }
++
++  const s32 code = request.GetLastResponseCode();
++  if (code == 403 || code == 429)
++    return MakeNetworkError("GitHub is rate-limiting update checks, try again later.");
++  if (code != 200)
++    return MakeNetworkError(fmt::format("GitHub replied with HTTP {} to the update check.", code));
++
++  UpdateCheckResult result;
++  result.html_url = RELEASES_PAGE_URL;
++
++  const char* data = reinterpret_cast<const char*>(response->data());
++  picojson::value json;
++  const std::string parse_error = picojson::parse(json, data, data + response->size());
++  if (!parse_error.empty() || !json.is<picojson::object>())
++  {
++    result.status = Status::Unknown;
++    result.message = "GitHub's reply could not be read, so the latest release is unknown.";
++    return result;
++  }
++
++  const picojson::object& release = json.get<picojson::object>();
++  const std::optional<std::string> tag_name = GetStringField(release, "tag_name");
++  const std::optional<std::string> name = GetStringField(release, "name");
++  const std::optional<std::string> html_url = GetStringField(release, "html_url");
++  const std::optional<std::string> published_at = GetStringField(release, "published_at");
++
++  // Only the two fields the verdict actually rests on are required. A field that is absent or the
++  // wrong type means the check failed, not that this build is current: reporting "up to date" off a
++  // reply we could not read would hide every future release.
++  //
++  // The other two are cosmetic and genuinely optional at the source: GitHub returns name as null
++  // for a release published without a title, and a draft has no published_at. Requiring them would
++  // turn a perfectly readable "you are behind" into "unknown" over a missing headline.
++  if (!tag_name || !html_url)
++  {
++    result.status = Status::Unknown;
++    result.message =
++        "GitHub's reply was missing release details, so the latest release is unknown.";
++    return result;
++  }
++
++  result.latest_tag = *tag_name;
++  result.release_name = name.value_or(*tag_name);
++  result.published_at = published_at ? DateOf(*published_at) : std::string{};
++
++  // Both front ends hand this to the OS URL opener (QDesktopServices::openUrl,
++  // Intent.ACTION_VIEW), which will happily act on schemes that are not the web. Only a URL that
++  // is actually inside this repository is taken at its word; anything else falls back to the
++  // hardcoded releases page, which is never wrong, only less specific.
++  constexpr std::string_view REPO_PREFIX = "https://github.com/logdog2325/dolphin-xd-netplay/";
++  result.html_url = html_url->starts_with(REPO_PREFIX) ? *html_url : RELEASES_PAGE_URL;
++
++  const std::optional<int> order = CompareVersions(VERSION, result.latest_tag);
++  if (!order)
++  {
++    result.status = Status::Unknown;
++    result.message =
++        fmt::format("This build is {}, and the newest release is {}. They cannot be compared "
++                    "automatically -- open the release page to see which is newer.",
++                    VERSION, result.latest_tag);
++    return result;
++  }
++
++  if (*order < 0)
++  {
++    result.status = Status::UpdateAvailable;
++    result.message = fmt::format("XD Netplay {} is available. This build is {}.", result.latest_tag,
++                                 VERSION);
++    return result;
++  }
++
++  result.status = Status::UpToDate;
++  result.message = fmt::format("XD Netplay {} is the newest release.", VERSION);
++  return result;
++}
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/UpdateCheck.h b/Source/Core/UICommon/XDNetplay/UpdateCheck.h
+new file mode 100644
+index 0000000..3fdf7f1
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/UpdateCheck.h
+@@ -0,0 +1,53 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <string_view>
++
++namespace XDNetplay
++{
++enum class Status
++{
++  // The build's XDNetplay::VERSION is at least as new as the newest published tag.
++  UpToDate,
++  // A newer tag exists; html_url points at its release page.
++  UpdateAvailable,
++  // GitHub answered but the answer could not be turned into a verdict (unparseable body,
++  // missing field, or a tag that is not purely numeric). latest_tag may still be set.
++  Unknown,
++  // GitHub could not be reached, or replied with an error status.
++  NetworkError,
++};
++
++struct UpdateCheckResult
++{
++  Status status = Status::Unknown;
++  std::string latest_tag;
++  std::string release_name;
++  std::string html_url;
++  std::string published_at;  // YYYY-MM-DD, empty if GitHub did not supply one
++  // One line, already phrased for a message box. Never claims "up to date" unless status is
++  // UpToDate.
++  std::string message;
++};
++
++// Queries the newest release of the fork's GitHub repository and compares it against
++// XDNetplay::VERSION.
++//
++// BLOCKING: this performs an HTTP request and must never be called from a UI thread. Callers own
++// the threading (Qt runs it on a worker and posts the result back; Android calls it from
++// Dispatchers.IO).
++UpdateCheckResult CheckForUpdate();
++
++// Orders two release tags the way a human reads them: an optional leading 'v' is ignored, the rest
++// is split on '.' and compared component by component as integers, and a missing component counts
++// as 0 ("1.2" == "1.2.0"). Returns <0 if a is older, 0 if equal, >0 if a is newer.
++//
++// std::nullopt means "cannot compare" -- some component was not a plain number (e.g. "0.4.4-rc1").
++// Callers must surface that to the user rather than assume either side is newer. Comparing as
++// integers is the entire point: a lexical compare puts "0.4.9" after "0.4.44".
++std::optional<int> CompareVersions(std::string_view a, std::string_view b);
++}  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+new file mode 100644
+index 0000000..d62ce68
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -0,0 +1,15 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++namespace XDNetplay
++{
++// The XD Netplay release this build belongs to.
++//
++// Common::GetScmDescStr() describes the upstream Dolphin commit CI happened to build, not this
++// fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
++// that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
++// this string and every user of that release is told they are out of date forever.
++constexpr char VERSION[] = "0.4.44";
++}  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
