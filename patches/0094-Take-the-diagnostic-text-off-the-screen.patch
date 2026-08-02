@@ -1,23 +1,28 @@
-From 3cda2662feef34152a605dd86707cc9b0eb6a035 Mon Sep 17 00:00:00 2001
+From 4722835c9510692876ae232b364cd32b0e61ff05 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sun, 2 Aug 2026 10:38:36 -0700
-Subject: [PATCH] Take the link diagnostic off the GBA screen
+Subject: [PATCH] Take the diagnostic text off the screen
 
-It was built to debug detection failures on-device, back when the only
-alternative was an OSD message that fired during the boot logos and expired
-before anyone reached VS mode. The per-session log replaced it: every field it
-printed -- win, rst, prb, est, lck, cmd -- is in the summary lines, at one
-sample a second, in a file that survives the session and can be handed over.
+Two leftovers from working out why sockets were not being detected.
 
-So it now costs a screenful of yellow text on every launch and buys nothing.
-The long-press-to-switch gesture stays; only the readout that described it is
-gone.
+The GBA-screen readout was built when the only alternative was an OSD message
+that fired during the boot logos and expired before anyone reached VS mode. The
+per-session log replaced it: every field it printed -- win, rst, prb, est, lck,
+cmd -- is in the summary lines, at one sample a second, in a file that survives
+the session and can be handed over. It now costs a screenful of yellow text on
+every launch and buys nothing. The long-press-to-switch gesture stays; only the
+readout that described it is gone.
+
+The log's path was also announced across the game for twelve seconds at every
+boot. FilePath() is what the share action uses and the release notes give the
+folder per platform, so nothing needed the banner.
 
 Version 1.0.0.
 ---
  .../features/dualscreen/GbaScreenView.kt      | 99 +------------------
+ Source/Core/Core/HW/GBADetectLog.cpp          |  7 +-
  Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
- 2 files changed, 3 insertions(+), 98 deletions(-)
+ 3 files changed, 6 insertions(+), 102 deletions(-)
 
 diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaScreenView.kt
 index a4c9e77..49d47b4 100644
@@ -164,6 +169,31 @@ index a4c9e77..49d47b4 100644
          private val LONG_PRESS_MILLIS = ViewConfiguration.getLongPressTimeout().toLong()
      }
  }
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index 3fa2aee..22c1c90 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -16,8 +16,6 @@
+ #include "Common/CommonPaths.h"
+ #include "Common/FileUtil.h"
+ 
+-#include "VideoCommon/OnScreenDisplay.h"
+-
+ namespace GBADetectLog
+ {
+ namespace
+@@ -143,8 +141,9 @@ void OnDeviceCreated()
+   WriteLine("note: a per-socket 'role' line prints once under netplay; rd=/wr= in sum lines are "
+             "ungated data-command counts",
+             true);
+-
+-  OSD::AddMessage(fmt::format("GBA detect log: {}", s_path), 12000, OSD::Color::CYAN);
++  // The path is deliberately not announced on screen. FilePath() is what the UI's share/reveal
++  // action uses, and the release notes give the folder per platform -- neither needs a banner
++  // across the game at every boot.
+ }
+ 
+ void OnDeviceDestroyed()
 diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
 index 0773f77..bde6051 100644
 --- a/Source/Core/UICommon/XDNetplay/Version.h
