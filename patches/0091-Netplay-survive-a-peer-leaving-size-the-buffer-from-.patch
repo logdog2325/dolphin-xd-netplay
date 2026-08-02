@@ -1,0 +1,3721 @@
+From 62d2fe64c270fa198c732692c6347527939184de Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 1 Aug 2026 17:46:55 -0700
+Subject: [PATCH] Netplay: survive a peer leaving, size the buffer from ping,
+ and keep teams private
+
+Four release blockers, one commit.
+
+Session loss. A peer that vanished used to leave everyone else waiting on an
+unbounded event with crit_netplay_client held, so closing the Android app froze
+the desktop side until ENet gave up 30s later -- and often not even then. The
+wait is now bounded and re-checked, and a session only ends when something
+corroborates that the peer is really gone: the pad's owner has left the room,
+or the socket has been silent for 20s. A peer that merely paused or backgrounded
+never ends anyone's session. Ordinary stops stay silent; only genuine losses say
+so. Android also announces its own departure through a task watcher, so a swipe
+away is a clean goodbye rather than a timeout.
+
+Buffer. The host now sizes the input buffer from measured ping --
+ceil(ping / 16.67) + 2 frames, clamped to [3, 20] -- raising quickly when the
+link degrades and lowering one frame at a time only after 30 quiet samples, so
+it cannot oscillate. Editing the buffer by hand turns the sizer off for the rest
+of the session.
+
+Trainer name. The team editor can set the in-game name, and a netplay submission
+carries it alongside the team, so a guest playing in someone else's room shows
+up under their own name instead of the host's. The payload stays one string and
+both directions interoperate with older clients.
+
+Team privacy. A Gen 3 save carries every EV, IV and nature, so a leftover copy
+is a scouting tool. End-of-session cleanup now also takes the .bak, .tmp and
+marker files and netplay's NetPlayTemp staging saves, and -- because the live
+mGBA core rewrites the save during teardown -- it waits for emulation to reach
+Uninitialized before doing any of it. The desktop guest-slot lock is now scoped
+to the room rather than to the running game, which is when submissions actually
+arrive.
+---
+ .../Android/app/src/main/AndroidManifest.xml  |   8 +
+ .../features/netplay/NetplayManager.kt        |  39 +-
+ .../features/netplay/NetplaySession.kt        |  20 +-
+ .../netplay/NetplayTaskWatcherService.kt      | 139 ++++++
+ .../netplay/model/NetplayViewModel.kt         |  50 +-
+ .../features/netplay/ui/NetplayActivity.kt    |   3 +
+ .../features/netplay/ui/NetplayScreen.kt      |  65 ++-
+ .../features/settings/model/BooleanSetting.kt |  13 +-
+ .../features/xdnetplay/gen3/Gen3Save.kt       |  54 +++
+ .../features/xdnetplay/gen3/Gen3Text.kt       |  28 ++
+ .../features/xdnetplay/gen3/MonFactory.kt     |  19 +-
+ .../xdnetplay/ui/TeamEditorActivity.kt        | 127 ++++-
+ .../features/xdnetplay/ui/TeamEditorScreen.kt |  33 +-
+ .../app/src/main/res/values/strings.xml       |   2 +
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |  11 +-
+ Source/Android/jni/NetPlay/Netplay.cpp        |  28 +-
+ Source/Core/Core/Config/NetplaySettings.cpp   |   5 +
+ Source/Core/Core/Config/NetplaySettings.h     |   1 +
+ Source/Core/Core/HW/GBADetectLog.cpp          |  27 ++
+ Source/Core/Core/HW/GBADetectLog.h            |  13 +
+ Source/Core/Core/NetPlayClient.cpp            | 449 +++++++++++++++++-
+ Source/Core/Core/NetPlayClient.h              |  80 +++-
+ Source/Core/Core/NetPlayServer.cpp            | 263 +++++++++-
+ Source/Core/Core/NetPlayServer.h              |  29 ++
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  | 145 +++++-
+ Source/Core/DolphinQt/NetPlay/NetPlayDialog.h |   1 +
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  | 111 ++++-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.h    |   7 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  10 +-
+ Source/Core/UICommon/XDNetplay/Gen3Save.cpp   |  57 +++
+ Source/Core/UICommon/XDNetplay/Gen3Save.h     |  24 +
+ Source/Core/UICommon/XDNetplay/Gen3Text.cpp   |  18 +
+ Source/Core/UICommon/XDNetplay/Gen3Text.h     |   8 +
+ Source/Core/UICommon/XDNetplay/MonFactory.cpp |  16 +-
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 352 +++++++++++++-
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  93 +++-
+ 36 files changed, 2227 insertions(+), 121 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayTaskWatcherService.kt
+
+diff --git a/Source/Android/app/src/main/AndroidManifest.xml b/Source/Android/app/src/main/AndroidManifest.xml
+index c5abc3e..cd91051 100644
+--- a/Source/Android/app/src/main/AndroidManifest.xml
++++ b/Source/Android/app/src/main/AndroidManifest.xml
+@@ -191,6 +191,14 @@
+             android:exported="false"
+             android:theme="@style/Theme.Dolphin.Main" />
+ 
++        <!-- Only runs while a netplay session is live. android:stopWithTask must stay
++             false: "true" makes the system kill the service silently on a task swipe,
++             which is exactly the callback we need. -->
++        <service
++            android:name=".features.netplay.NetplayTaskWatcherService"
++            android:exported="false"
++            android:stopWithTask="false"/>
++
+         <service
+             android:name=".services.SyncChannelJobService"
+             android:exported="false"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayManager.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayManager.kt
+index 32742c7..3b14210 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayManager.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayManager.kt
+@@ -5,6 +5,7 @@ package org.dolphinemu.dolphinemu.features.netplay
+ import kotlinx.coroutines.CompletableDeferred
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
++import org.dolphinemu.dolphinemu.DolphinApplication
+ 
+ object NetplayManager {
+ 
+@@ -25,13 +26,37 @@ object NetplayManager {
+ 
+         closeComplete = CompletableDeferred()
+ 
+-        NetplaySession(
+-            onClosed = {
+-                activeSession = null
+-                closeComplete?.complete(Unit)
+-            }
+-        ).also {
+-            activeSession = it
++        val session = try {
++            NetplaySession(
++                onClosed = {
++                    activeSession = null
++                    NetplayTaskWatcherService.stop(DolphinApplication.getAppContext())
++                    closeComplete?.complete(Unit)
++                }
++            )
++        } catch (t: Throwable) {
++            // No session was created, so onClosed will never run to open the gate again.
++            // Leaving the deferred armed would wedge every future createSession() on the
++            // await() at the top of this function.
++            closeComplete?.complete(Unit)
++            throw t
+         }
++
++        activeSession = session
++
++        // Watch for the task being swiped out of recents while this session is live. That is
++        // the one teardown path Android will not run onCleared()/onDestroy() for, so without
++        // this the other players never receive an ENet disconnect and are left waiting on a
++        // console that no longer exists. See NetplayTaskWatcherService.
++        //
++        // Started here, after construction succeeded AND after activeSession is published,
++        // rather than before the constructor. The service is useless without a session --
++        // onTaskRemoved does nothing but read activeSession -- and starting it first meant a
++        // throwing constructor left it running for the rest of the process lifetime with
++        // nothing left to stop it. The service double-checks activeSession itself and stops
++        // when there is none, so neither half depends on the other being right.
++        NetplayTaskWatcherService.start(DolphinApplication.getAppContext())
++
++        session
+     }
+ }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+index 6643bcb..f8e6ab4 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+@@ -172,8 +172,14 @@ class NetplaySession(
+      * the GBA save it syncs when the battle starts. A pokepast.es link must be
+      * resolved to text by the caller -- the host never fetches a URL. The host
+      * announces the result in the room chat once the write lands.
++     *
++     * [trainerName] is the in-game name to play under; "" leaves the host
++     * save's existing name alone. It rides along in the same message as the
++     * team (see UICommon/XDNetplay/TeamInjector.h) and is clamped to seven
++     * Gen 3 characters host-side.
+      */
+-    fun submitTeam(showdownText: String) = nativeSubmitTeam(showdownText)
++    fun submitTeam(showdownText: String, trainerName: String) =
++        nativeSubmitTeam(showdownText, trainerName)
+ 
+     /** Show a line in this player's own chat log; nothing is sent over the wire. */
+     fun showLocalMessage(message: String) {
+@@ -184,8 +190,16 @@ class NetplaySession(
+ 
+     fun adjustClientPadBufferSize(buffer: Int) = nativeAdjustClientPadBufferSize(buffer)
+ 
++    /**
++     * Host-side manual buffer edit. Manual always wins, so this also switches
++     * the automatic sizer off native-side; the UI mirrors that by clearing its
++     * "Auto" switch.
++     */
+     fun adjustServerPadBufferSize(buffer: Int) = nativeAdjustServerPadBufferSize(buffer)
+ 
++    /** Turn host-side automatic buffer sizing (from measured ping) on or off. */
++    fun setAutoPadBuffer(enable: Boolean) = nativeSetAutoPadBuffer(enable)
++
+     fun changeGame(gameFile: GameFile) = nativeChangeGame(gameFile)
+ 
+     fun doAllPlayersHaveGame(): Boolean = nativeDoAllPlayersHaveGame()
+@@ -265,7 +279,7 @@ class NetplaySession(
+ 
+     private external fun nativeSendMessage(message: String)
+ 
+-    private external fun nativeSubmitTeam(showdownText: String)
++    private external fun nativeSubmitTeam(showdownText: String, trainerName: String)
+ 
+     private external fun nativeSetHostInputAuthority(enable: Boolean)
+ 
+@@ -273,6 +287,8 @@ class NetplaySession(
+ 
+     private external fun nativeAdjustServerPadBufferSize(buffer: Int)
+ 
++    private external fun nativeSetAutoPadBuffer(enable: Boolean)
++
+     private external fun nativeReleaseUICallbacks(pointer: Long)
+ 
+     private external fun nativeReleaseClient(pointer: Long)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayTaskWatcherService.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayTaskWatcherService.kt
+new file mode 100644
+index 0000000..697f29c
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplayTaskWatcherService.kt
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.netplay
++
++import android.app.Service
++import android.content.Context
++import android.content.Intent
++import android.os.Handler
++import android.os.IBinder
++import android.os.Looper
++import android.util.Log
++
++/**
++ * Sends a real netplay goodbye when the user swipes Dolphin out of the recents list.
++ *
++ * The problem this exists for: a swiped-away task is killed outright. `Activity.onDestroy`,
++ * `ViewModel.onCleared` and JVM shutdown hooks are all *not* guaranteed to run, so
++ * [NetplaySession.closeBlocking] never fires, `~NetPlayClient` never runs, and no ENet
++ * disconnect is ever put on the wire. The other players are then left waiting on pad frames
++ * from a console that no longer exists, and the only thing that eventually rescues them is a
++ * 30 s protocol timeout.
++ *
++ * `Service.onTaskRemoved` is the one callback Android *does* reliably deliver on task swipe
++ * (as long as the service is started and `android:stopWithTask` is left false), and it runs
++ * before the process is torn down. That is our window to disconnect politely.
++ *
++ * This is the *courtesy* half of the fix and nothing may depend on it. The load-bearing half
++ * lives in `NetPlayClient::WaitOnRemote()` on the C++ side, which keeps the surviving clients
++ * safe when this never gets to run at all -- battery death, airplane mode, a low-memory kill,
++ * or any of the OEM task killers that skip this callback entirely.
++ *
++ * Note what is deliberately NOT hooked: `onStop` / `onTrimMemory(TRIM_MEMORY_UI_HIDDEN)`.
++ * Those fire on ordinary backgrounding -- answering a phone call mid-battle -- and hanging up
++ * on your opponent because they checked a notification would be a far worse bug than the one
++ * being fixed.
++ *
++ * The service is also strictly self-limiting: it stops itself as soon as there is no live
++ * session to watch, so it can never outlive one. [NetplayManager] calling [stop] is the fast
++ * path, not the guarantee -- see [selfCheck].
++ */
++class NetplayTaskWatcherService : Service() {
++
++    private val handler = Handler(Looper.getMainLooper())
++
++    /**
++     * Stops the service the moment [NetplayManager.activeSession] stops being a live session.
++     *
++     * This exists because `NetplayManager`'s call to [stop] rides on `NetplaySession.onClosed`,
++     * which only `closeBlocking()` ever invokes. A session that is simply dropped and finalized
++     * instead runs `finalize()` -> `releaseNativeResources()` and never touches `onClosed`, so
++     * without this poll the service would sit in the process forever -- still registered for
++     * `onTaskRemoved`, still holding the app in a state where the system thinks something is
++     * running. One no-op comparison every 30 s is a cheap price for a hard bound.
++     */
++    private val selfCheck = object : Runnable {
++        override fun run() {
++            val session = NetplayManager.activeSession
++            if (session == null || session.isClosed) {
++                stopSelf()
++                return
++            }
++            handler.postDelayed(this, SELF_CHECK_INTERVAL_MS)
++        }
++    }
++
++    override fun onBind(intent: Intent?): IBinder? = null
++
++    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
++        // The first pass runs immediately rather than after an interval: if we were started
++        // with no live session -- nothing to watch, nothing to say goodbye for -- the right
++        // answer is to stop right now instead of lingering until the first tick.
++        handler.removeCallbacks(selfCheck)
++        handler.post(selfCheck)
++
++        // START_NOT_STICKY: if we are ever killed there is nothing worth restarting -- the
++        // session we were watching died with the process.
++        return Service.START_NOT_STICKY
++    }
++
++    override fun onDestroy() {
++        handler.removeCallbacks(selfCheck)
++        super.onDestroy()
++    }
++
++    override fun onTaskRemoved(rootIntent: Intent?) {
++        val session = NetplayManager.activeSession
++        if (session != null && !session.isClosed) {
++            // Synchronous on purpose. closeBlocking() is what actually reaches
++            // enet_peer_disconnect(); handing it to another thread would race the process
++            // death we are already inside of. The cost is a short main-thread block in a
++            // process that is going away regardless.
++            try {
++                session.closeBlocking()
++            } catch (e: Exception) {
++                Log.e(TAG, "Failed to close netplay session on task removal", e)
++            }
++        }
++
++        super.onTaskRemoved(rootIntent)
++        stopSelf()
++    }
++
++    companion object {
++        private const val TAG = "NetplayTaskWatcher"
++
++        /**
++         * How often the service re-checks that it still has a session to watch. Long enough to
++         * be free, short enough that a leaked service is measured in seconds, not in the
++         * lifetime of the process.
++         */
++        private const val SELF_CHECK_INTERVAL_MS = 30_000L
++
++        /**
++         * Must only be called once a live session exists and is published to
++         * [NetplayManager.activeSession] -- the service has nothing to do without one and will
++         * simply stop itself again.
++         */
++        @JvmStatic
++        fun start(context: Context) {
++            // Only ever called while a netplay UI is in the foreground, so the background
++            // service start restrictions do not apply -- but a failure here must never take
++            // the session down with it, hence the catch.
++            try {
++                context.startService(Intent(context, NetplayTaskWatcherService::class.java))
++            } catch (e: Exception) {
++                Log.w(TAG, "Could not start netplay task watcher", e)
++            }
++        }
++
++        @JvmStatic
++        fun stop(context: Context) {
++            try {
++                context.stopService(Intent(context, NetplayTaskWatcherService::class.java))
++            } catch (e: Exception) {
++                Log.w(TAG, "Could not stop netplay task watcher", e)
++            }
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index 327612c..55bd744 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -21,9 +21,11 @@ import kotlinx.coroutines.flow.stateIn
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import org.dolphinemu.dolphinemu.features.netplay.NetplaySession
++import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
+ import org.dolphinemu.dolphinemu.model.GameFile
+ import org.dolphinemu.dolphinemu.services.GameFileCacheManager
+ import org.dolphinemu.dolphinemu.utils.NetworkHelper
+@@ -76,6 +78,9 @@ class NetplayViewModel(
+     private val _buffer = MutableStateFlow(IntSetting.NETPLAY_BUFFER_SIZE.int)
+     val buffer = _buffer.asStateFlow()
+ 
++    private val _autoBuffer = MutableStateFlow(BooleanSetting.NETPLAY_AUTO_BUFFER.boolean)
++    val autoBuffer = _autoBuffer.asStateFlow()
++
+     private val _clientBuffer = MutableStateFlow(IntSetting.NETPLAY_CLIENT_BUFFER_SIZE.int)
+     val clientBuffer = _clientBuffer.asStateFlow()
+ 
+@@ -92,6 +97,14 @@ class NetplayViewModel(
+     val gameDigestProgress = netplaySession.gameDigestProgress
+ 
+     init {
++        // The host's buffer can now move on its own (automatic sizing decides on
++        // the netplay thread and broadcasts MessageID::PadBuffer). Mirror every
++        // broadcast value into the field so it always shows what is actually
++        // live, not just what someone last typed.
++        netplaySession.padBuffer
++            .onEach { _buffer.value = it }
++            .launchIn(viewModelScope)
++
+         if (netplaySession.isHosting) {
+             setInitialGame()
+             if (isTraversal) {
+@@ -117,20 +130,36 @@ class NetplayViewModel(
+         netplaySession.startGame()
+     }
+ 
++    /** Default in-game name offered in the submit sheet: this player's netplay
++     *  nickname, cut down to what a Gen 3 save can actually hold. */
++    val defaultTrainerName: String
++        get() = EmeraldSave.sanitizeTrainerName(netplaySession.nickName)
++
+     /**
+      * XD Netplay: hand this player's own team to the host, which writes it into
+      * the GBA save it syncs when the battle starts. A pokepast.es link is
+      * resolved HERE, on the submitting device, so the host only ever parses
+      * plain text it was handed -- it never fetches a URL a stranger chose.
++     *
++     * [trainerName] is the in-game name to play under. It is sanitized to at
++     * most seven Gen 3 characters; anything that survives nothing (an all-emoji
++     * name, say) is sent as "", which the host reads as "keep your own name"
++     * rather than as a reason to reject the team.
+      */
+-    fun submitTeam(text: String) {
++    fun submitTeam(text: String, trainerName: String) {
+         val trimmed = text.trim()
+         if (trimmed.isEmpty()) {
+             return
+         }
++        val name = EmeraldSave.sanitizeTrainerName(trainerName)
++        if (name.isEmpty() && trainerName.isNotBlank()) {
++            netplaySession.showLocalMessage(
++                "That in-game name has no Gen 3 equivalent — sending the team without it."
++            )
++        }
+         val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+").find(trimmed)?.value
+         if (pokepaste == null) {
+-            netplaySession.submitTeam(trimmed)
++            netplaySession.submitTeam(trimmed, name)
+             return
+         }
+         viewModelScope.launch(Dispatchers.IO) {
+@@ -145,7 +174,7 @@ class NetplayViewModel(
+                         "Could not fetch that paste (network error)."
+                     )
+                 } else {
+-                    netplaySession.submitTeam(body)
++                    netplaySession.submitTeam(body, name)
+                 }
+             }
+         }
+@@ -166,12 +195,27 @@ class NetplayViewModel(
+         netplaySession.setHostInputAuthority(mode.isHostInputAuthority)
+     }
+ 
++    /**
++     * The host typed/stepped a buffer value. Manual always wins: the automatic
++     * sizer switches off rather than overwriting this a few seconds later, and
++     * the switch in the UI flips with it so the reason is visible.
++     */
+     fun setBuffer(value: Int) {
+         _buffer.value = value
+         IntSetting.NETPLAY_BUFFER_SIZE.setInt(NativeConfig.LAYER_BASE, value)
++        if (_autoBuffer.value) {
++            _autoBuffer.value = false
++            BooleanSetting.NETPLAY_AUTO_BUFFER.setBoolean(NativeConfig.LAYER_BASE, false)
++        }
+         netplaySession.adjustServerPadBufferSize(value)
+     }
+ 
++    fun setAutoBuffer(enabled: Boolean) {
++        _autoBuffer.value = enabled
++        BooleanSetting.NETPLAY_AUTO_BUFFER.setBoolean(NativeConfig.LAYER_BASE, enabled)
++        netplaySession.setAutoPadBuffer(enabled)
++    }
++
+     fun setClientBuffer(value: Int) {
+         _clientBuffer.value = value
+         IntSetting.NETPLAY_CLIENT_BUFFER_SIZE.setInt(NativeConfig.LAYER_BASE, value)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index 1405071..a196aa0 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -54,6 +54,7 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     messages = viewModel.messages.collectAsState().value,
+                     onSendMessage = viewModel::sendMessage,
+                     onSubmitTeam = viewModel::submitTeam,
++                    defaultTrainerName = viewModel.defaultTrainerName,
+                     game = viewModel.game.collectAsState().value,
+                     onStartGame = viewModel::startGame,
+                     onGameSelected = viewModel::changeGame,
+@@ -66,6 +67,8 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     onNetworkModeChanged = viewModel::setNetworkMode,
+                     buffer = viewModel.buffer.collectAsState().value,
+                     onBufferChanged = viewModel::setBuffer,
++                    autoBuffer = viewModel.autoBuffer.collectAsState().value,
++                    onAutoBufferChanged = viewModel::setAutoBuffer,
+                     clientBuffer = viewModel.clientBuffer.collectAsState().value,
+                     onClientBufferChanged = viewModel::setClientBuffer,
+                     saveTransferProgress = viewModel.saveTransferProgress.collectAsState().value,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 156c8c7..e953c07 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -59,6 +59,7 @@ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.ModalBottomSheet
+ import androidx.compose.material3.OutlinedTextField
+ import androidx.compose.material3.SheetValue
++import androidx.compose.material3.Switch
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.material3.adaptive.currentWindowAdaptiveInfo
+@@ -103,6 +104,8 @@ import org.dolphinemu.dolphinemu.features.netplay.model.NetworkMode
+ import org.dolphinemu.dolphinemu.features.netplay.model.Player
+ import org.dolphinemu.dolphinemu.features.netplay.model.SaveTransferProgress
+ import org.dolphinemu.dolphinemu.features.netplay.model.TraversalState
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Text
+ import org.dolphinemu.dolphinemu.model.GameFile
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinScaffold
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+@@ -135,18 +138,24 @@ fun NetplayScreen(
+     onNetworkModeChanged: (NetworkMode) -> Unit,
+     buffer: Int,
+     onBufferChanged: (Int) -> Unit,
++    autoBuffer: Boolean,
++    onAutoBufferChanged: (Boolean) -> Unit,
+     clientBuffer: Int,
+     onClientBufferChanged: (Int) -> Unit,
+     players: List<Player>,
+     saveTransferProgress: SaveTransferProgress?,
+     gameDigestProgress: GameDigestProgress?,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+-    onSubmitTeam: (String) -> Unit,
++    onSubmitTeam: (String, String) -> Unit,
++    defaultTrainerName: String,
+ ) {
+     val scrollState = rememberScrollState()
+     // XD Netplay: joiner's "Submit Team" paste sheet.
+     var showSubmitTeam by rememberSaveable { mutableStateOf(false) }
+     var teamDraft by rememberSaveable { mutableStateOf("") }
++    // In-game name, pre-filled with the netplay nickname (already cut down to
++    // what a Gen 3 save can hold) so the common case is zero typing.
++    var nameDraft by rememberSaveable { mutableStateOf(defaultTrainerName) }
+     if (showSubmitTeam) {
+         AlertDialog(
+             title = { Text("Submit Team") },
+@@ -157,6 +166,19 @@ fun NetplayScreen(
+                             "The host writes it into the save you'll play with."
+                     )
+                     Spacer(Modifier.height(12.dp))
++                    OutlinedTextField(
++                        value = nameDraft,
++                        // Reject unencodable keystrokes as they are typed, and
++                        // stop at the Gen 3 limit of seven characters.
++                        onValueChange = {
++                            nameDraft = Gen3Text.sanitize(it, EmeraldSave.TRAINER_NAME_LEN)
++                        },
++                        singleLine = true,
++                        label = { Text("In-game name (max 7)") },
++                        supportingText = { Text("Shown to your opponent in the battle.") },
++                        modifier = Modifier.fillMaxWidth()
++                    )
++                    Spacer(Modifier.height(12.dp))
+                     OutlinedTextField(
+                         value = teamDraft,
+                         onValueChange = { teamDraft = it },
+@@ -167,7 +189,7 @@ fun NetplayScreen(
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+-                        onSubmitTeam(teamDraft.trim())
++                        onSubmitTeam(teamDraft.trim(), nameDraft.trim())
+                         showSubmitTeam = false
+                     },
+                     enabled = teamDraft.isNotBlank()
+@@ -246,6 +268,8 @@ fun NetplayScreen(
+                 onNetworkModeChanged = onNetworkModeChanged,
+                 buffer = buffer,
+                 onBufferChanged = onBufferChanged,
++                autoBuffer = autoBuffer,
++                onAutoBufferChanged = onAutoBufferChanged,
+                 clientBuffer = clientBuffer,
+                 onClientBufferChanged = onClientBufferChanged,
+                 joinAddresses = joinAddresses,
+@@ -273,6 +297,8 @@ fun NetplayScreen(
+                 onNetworkModeChanged = onNetworkModeChanged,
+                 buffer = buffer,
+                 onBufferChanged = onBufferChanged,
++                autoBuffer = autoBuffer,
++                onAutoBufferChanged = onAutoBufferChanged,
+                 clientBuffer = clientBuffer,
+                 onClientBufferChanged = onClientBufferChanged,
+                 joinAddresses = joinAddresses,
+@@ -392,6 +418,8 @@ private fun PortraitContent(
+     onNetworkModeChanged: (NetworkMode) -> Unit,
+     buffer: Int,
+     onBufferChanged: (Int) -> Unit,
++    autoBuffer: Boolean,
++    onAutoBufferChanged: (Boolean) -> Unit,
+     clientBuffer: Int,
+     onClientBufferChanged: (Int) -> Unit,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+@@ -431,6 +459,8 @@ private fun PortraitContent(
+             onNetworkModeChanged = onNetworkModeChanged,
+             buffer = buffer,
+             onBufferChanged = onBufferChanged,
++            autoBuffer = autoBuffer,
++            onAutoBufferChanged = onAutoBufferChanged,
+             clientBuffer = clientBuffer,
+             onClientBufferChanged = onClientBufferChanged,
+             isHosting = isHosting,
+@@ -465,6 +495,8 @@ private fun LandscapeContent(
+     onNetworkModeChanged: (NetworkMode) -> Unit,
+     buffer: Int,
+     onBufferChanged: (Int) -> Unit,
++    autoBuffer: Boolean,
++    onAutoBufferChanged: (Boolean) -> Unit,
+     clientBuffer: Int,
+     onClientBufferChanged: (Int) -> Unit,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+@@ -516,6 +548,8 @@ private fun LandscapeContent(
+                 onNetworkModeChanged = onNetworkModeChanged,
+                 buffer = buffer,
+                 onBufferChanged = onBufferChanged,
++                autoBuffer = autoBuffer,
++                onAutoBufferChanged = onAutoBufferChanged,
+                 clientBuffer = clientBuffer,
+                 onClientBufferChanged = onClientBufferChanged,
+                 isHosting = isHosting,
+@@ -545,6 +579,8 @@ private fun PlayersAndSettings(
+     onNetworkModeChanged: (NetworkMode) -> Unit,
+     buffer: Int,
+     onBufferChanged: (Int) -> Unit,
++    autoBuffer: Boolean,
++    onAutoBufferChanged: (Boolean) -> Unit,
+     clientBuffer: Int,
+     onClientBufferChanged: (Int) -> Unit,
+     isHosting: Boolean,
+@@ -609,6 +645,26 @@ private fun PlayersAndSettings(
+         if (isHosting && !hostInputAuthorityEnabled) {
+             MenuSpacer()
+ 
++            // Host-side automatic buffer sizing. Only the host has one to size,
++            // and only in fixed delay -- under host input authority each client
++            // owns its own buffer, so the server leaves it alone.
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                verticalAlignment = Alignment.CenterVertically
++            ) {
++                Column(Modifier.weight(1f)) {
++                    Text(
++                        stringResource(R.string.netplay_auto_buffer),
++                        style = MaterialTheme.typography.bodyLarge
++                    )
++                    Text(
++                        stringResource(R.string.netplay_auto_buffer_description),
++                        style = MaterialTheme.typography.bodySmall
++                    )
++                }
++                Switch(checked = autoBuffer, onCheckedChange = onAutoBufferChanged)
++            }
++
+             BufferInput(
+                 value = buffer,
+                 onValueChange = onBufferChanged,
+@@ -1414,6 +1470,8 @@ private fun PreviewNetplayScreen() {
+         onNetworkModeChanged = {},
+         buffer = 5,
+         onBufferChanged = {},
++        autoBuffer = true,
++        onAutoBufferChanged = {},
+         clientBuffer = 10,
+         onClientBufferChanged = {},
+         saveTransferProgress = null,
+@@ -1422,7 +1480,8 @@ private fun PreviewNetplayScreen() {
+             JoinInfoType.EXTERNAL to JoinAddress.Loaded("203.0.113.1:2626"),
+             JoinInfoType.LOCAL to JoinAddress.Loaded("192.168.1.5:2626"),
+         ),
+-        onSubmitTeam = {},
++        onSubmitTeam = { _, _ -> },
++        defaultTrainerName = "PLAYER",
+ //        saveTransferProgress = SaveTransferProgress(
+ //            title = "Title",
+ //            totalSize = 1024L,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index 0772fa1..0637866 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -984,7 +984,18 @@ enum class BooleanSetting(
+         "ProgressEnabled",
+         false
+     ),
+-    NETPLAY_USE_UPNP(Settings.FILE_DOLPHIN, Settings.SECTION_INI_NETPLAY, "UseUPNP", false);
++    NETPLAY_USE_UPNP(Settings.FILE_DOLPHIN, Settings.SECTION_INI_NETPLAY, "UseUPNP", false),
++
++    /**
++     * Host-side automatic netplay buffer sizing from the measured ping. On by
++     * default; editing the buffer by hand turns it off.
++     */
++    NETPLAY_AUTO_BUFFER(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_NETPLAY,
++        "AutoBuffer",
++        true
++    );
+ 
+     override val isOverridden: Boolean
+         get() = NativeConfig.isOverridden(file, section, key)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+index 1d94823..f45d405 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+@@ -193,6 +193,40 @@ class EmeraldSave(raw: ByteArray) {
+     val trainerName: String
+         get() = Gen3Text.decode(raw, sectionOffsets[0] + TRAINER_NAME_OFFSET, TRAINER_NAME_LEN)
+ 
++    /**
++     * Overwrite the trainer name in the trainer block and fix section 0's
++     * checksum. [name] must be 1..[TRAINER_NAME_LEN] (7) characters, every one
++     * of them encodable in the Gen 3 charset.
++     *
++     * An unencodable character throws and leaves the save completely
++     * untouched, rather than writing a '?' or a truncated field. Use
++     * [sanitizeTrainerName] first for input that should degrade instead.
++     *
++     * NOTE for callers that also rebuild the party: every Pokemon carries its
++     * own OT name copy, so renaming the trainer does NOT rename the mons
++     * already in the party. Set the name FIRST, then build/re-stamp the party.
++     *
++     * @throws IllegalArgumentException on an empty, over-long, or unencodable name.
++     */
++    fun setTrainerName(name: String) {
++        require(name.isNotEmpty()) { "trainer name cannot be empty" }
++        // encode() would silently truncate; for a name a human just typed, say
++        // so instead.
++        require(name.length <= TRAINER_NAME_LEN) {
++            "trainer name is longer than $TRAINER_NAME_LEN characters"
++        }
++        // Encode first: it throws on any character with no Gen 3 byte, before
++        // a single byte of the save has been touched.
++        val encoded = Gen3Text.encode(name, TRAINER_NAME_LEN)
++        val off = sectionOffsets[0] + TRAINER_NAME_OFFSET
++        encoded.copyInto(raw, off)
++        // encode() already 0xFF-pads the 7 usable bytes; byte 7 is the field's
++        // hard terminator, which the game keeps at 0xFF even for a 7-character
++        // name. Byte 8 is the gender and must not be disturbed.
++        raw[off + TRAINER_NAME_LEN] = Gen3Text.TERMINATOR.toByte()
++        updateSectionChecksum(0)
++    }
++
+     /** Raw u32: low u16 = public (visible) trainer ID, high u16 = secret ID. */
+     val trainerId: Int
+         get() = Gen3Bytes.readU32(raw, sectionOffsets[0] + TRAINER_ID_OFFSET)
+@@ -265,9 +299,29 @@ class EmeraldSave(raw: ByteArray) {
+         // Section 0 (Trainer Info) offsets - Emerald.
+         const val TRAINER_NAME_OFFSET = 0x0000 // 7 bytes + 0xFF
+         const val TRAINER_NAME_LEN = 7
++        // The field the game reserves is 8 bytes (pokeemerald: playerName is
++        // PLAYER_NAME_LENGTH + 1): 7 usable characters plus a byte that is
++        // ALWAYS the 0xFF terminator. Byte 8 is the gender.
++        const val TRAINER_NAME_FIELD_SIZE = TRAINER_NAME_LEN + 1
+         const val TRAINER_GENDER_OFFSET = 0x0008
+         const val TRAINER_ID_OFFSET = 0x000A   // u32: low u16 public, high u16 secret
+ 
++        /**
++         * Coerce arbitrary (possibly untrusted, possibly over-long) text into
++         * something [setTrainerName] will accept: trim surrounding whitespace,
++         * map straight quotes to the charset's curly forms, DROP anything still
++         * unencodable, clamp to [TRAINER_NAME_LEN] characters.
++         *
++         * Returns "" when nothing survives -- callers decide whether that means
++         * "keep the existing name" or "reject the request".
++         */
++        fun sanitizeTrainerName(name: String): String =
++            // Trim first: a leading space IS encodable (0x00) and would
++            // otherwise eat one of the seven slots and render blank in-game.
++            // Trim again after dropping unencodable characters, since dropping
++            // one can expose new surrounding whitespace ("Lo 🐬 gan").
++            Gen3Text.sanitize(name.trim(), TRAINER_NAME_LEN).trim()
++
+         /**
+          * Per-section valid data length used by the checksum (Emerald).
+          * Index = logical section ID. Empirically confirmed: with these exact
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
+index 3fdb410..7d82473 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Text.kt
+@@ -89,4 +89,32 @@ object Gen3Text {
+         }
+         return out
+     }
++
++    /**
++     * Make [text] Gen 3-encodable by force: straight ASCII quotes become the
++     * charset's curly forms, anything else unencodable is DROPPED, and the
++     * result is clamped to [maxLen] characters (0 = no clamp).
++     *
++     * Use this for input that must degrade rather than fail (a nickname out of
++     * a Showdown paste, a trainer name that arrived over the wire); use
++     * [encode]'s exception when a human is typing and deserves to be told which
++     * character is the problem.
++     */
++    fun sanitize(text: String, maxLen: Int = 0): String {
++        val sb = StringBuilder()
++        for (c in text) {
++            if (maxLen != 0 && sb.length == maxLen) {
++                break
++            }
++            val mapped = when (c) {
++                '\'' -> '’'
++                '"' -> '”'
++                else -> c
++            }
++            if (canEncode(mapped)) {
++                sb.append(mapped)
++            }
++        }
++        return sb.toString()
++    }
+ }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+index d2e87a1..55cfd15 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+@@ -158,22 +158,11 @@ object MonFactory {
+ 
+     /**
+      * Make [text] Gen 3-encodable: straight ASCII quotes become the charset's
+-     * curly forms, anything else unencodable is dropped.
++     * curly forms, anything else unencodable is dropped. (The implementation
++     * moved to Gen3Text so the save's trainer-name setter shares exactly this
++     * behaviour.)
+      */
+-    private fun sanitizeText(text: String): String {
+-        val sb = StringBuilder(text.length)
+-        for (c in text) {
+-            val mapped = when (c) {
+-                '\'' -> '’'
+-                '"' -> '”'
+-                else -> c
+-            }
+-            if (Gen3Text.canEncode(mapped)) {
+-                sb.append(mapped)
+-            }
+-        }
+-        return sb.toString()
+-    }
++    private fun sanitizeText(text: String): String = Gen3Text.sanitize(text)
+ 
+     // -- stats ---------------------------------------------------------------
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index 7a0759d..443b559 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -16,10 +16,12 @@ import androidx.lifecycle.lifecycleScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Data
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Text
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.MonFactory
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveNaming
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.ShowdownParser
+@@ -52,6 +54,7 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+                     names = if (uiState.ready) repo.displayNames() else null,
+                     onRoleChange = { reload(it) },
+                     onSelect = { uiState = uiState.copy(selected = it) },
++                    onTrainerNameChange = { setTrainerName(it) },
+                     onImport = { importShowdown(it) },
+                     onRemoveSelected = { removeSelected() },
+                     onSave = { saveTeam() },
+@@ -62,13 +65,43 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         }
+     }
+ 
++    /**
++     * The trainer-name field. Only characters the Gen 3 charset can hold are
++     * accepted, and only seven of them: rejecting the keystroke is how the user
++     * finds out, instead of a save-time error about something typed minutes
++     * ago. (Straight quotes are folded to the charset's curly forms.)
++     */
++    private fun setTrainerName(text: String) {
++        val filtered = Gen3Text.sanitize(text, EmeraldSave.TRAINER_NAME_LEN)
++        uiState = uiState.copy(trainerName = filtered, dirty = true)
++    }
++
+     private fun reload(role: TeamRole) {
++        // Competitive integrity. While this device is HOSTING a room, the socket-3 save is the
++        // opponent's submitted party -- every EV, IV and nature -- written there so netplay can
++        // sync it at start. Opening it here would be a scouting tool. The host's own socket-2
++        // save stays editable, and the end-of-session cleanup puts the host's team back in
++        // socket 3, so this unlocks on its own when the room closes. Joiners are unaffected:
++        // their local socket-3 save is their own team; netplay runs them from NetPlayTemp copies.
++        if (role == TeamRole.GUEST && NetplayManager.activeSession?.isHosting == true) {
++            uiState = TeamEditorState(
++                role = role,
++                ready = false,
++                messages = listOf(
++                    "The guest slot is hidden while you are hosting — it holds your opponent's " +
++                        "submitted team. Close the room to see your own team here again."
++                )
++            )
++            return
++        }
++
+         uiState = try {
+             val loaded = repo.load(role)
+             TeamEditorState(
+                 role = role,
+                 ready = true,
+                 trainer = loaded.trainerLabel,
++                trainerName = loaded.trainerName,
+                 party = loaded.party,
+                 messages = loaded.messages
+             )
+@@ -82,16 +115,17 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+     }
+ 
+     private fun importShowdown(text: String) {
++        val trainerName = uiState.trainerName
+         val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+")
+             .find(text.trim())?.value
+         if (pokepaste == null) {
+-            applyImport(repo.importShowdown(text))
++            applyImport(repo.importShowdown(text, trainerName))
+             return
+         }
+         uiState = uiState.copy(messages = listOf("Fetching $pokepaste…"))
+         lifecycleScope.launch(Dispatchers.IO) {
+             val result = try {
+-                repo.importShowdown(URL("$pokepaste/raw").readText())
++                repo.importShowdown(URL("$pokepaste/raw").readText(), trainerName)
+             } catch (e: Exception) {
+                 listOf("Could not fetch paste: ${e.message ?: "network error"}")
+             }
+@@ -108,6 +142,26 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         )
+     }
+ 
++    // True when the file currently behind the editor is the opponent's team. The role check in
++    // reload() covers opening it; this covers an editor that was already open on the guest slot
++    // when the room started, and is reached again from the back stack.
++    private fun guestSlotLocked() =
++        uiState.role == TeamRole.GUEST && NetplayManager.activeSession?.isHosting == true
++
++    private fun saveTeam() {
++        if (guestSlotLocked()) {
++            uiState = uiState.copy(
++                messages = listOf("Not saved — the guest slot is your opponent's while you host")
++            )
++            return
++        }
++        val messages = repo.saveToDisk(uiState.trainerName)
++        // Only a clean write clears the dirty flag; a rejected name must keep
++        // the Save button live so the user can fix it and try again.
++        val failed = messages.any { it.startsWith("NOT saved") }
++        uiState = uiState.copy(dirty = failed, messages = messages)
++    }
++
+     private fun removeSelected() {
+         repo.removeAt(uiState.selected)
+         uiState = uiState.copy(
+@@ -118,12 +172,13 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         )
+     }
+ 
+-    private fun saveTeam() {
+-        val messages = repo.saveToDisk()
+-        uiState = uiState.copy(dirty = false, messages = messages)
+-    }
+-
+     private fun shareSave() {
++        if (guestSlotLocked()) {
++            uiState = uiState.copy(
++                messages = listOf("Not shared — the guest slot is your opponent's while you host")
++            )
++            return
++        }
+         val uri = repo.shareUri() ?: run {
+             uiState = uiState.copy(messages = listOf("Save the team first, then share"))
+             return
+@@ -153,6 +208,8 @@ data class TeamEditorState(
+     val role: TeamRole = TeamRole.HOST,
+     val ready: Boolean = false,
+     val trainer: String = "",
++    /** Editable in-game trainer name; max [EmeraldSave.TRAINER_NAME_LEN] chars. */
++    val trainerName: String = "",
+     val party: List<Gen3Mon> = emptyList(),
+     val selected: Int = 0,
+     val dirty: Boolean = false,
+@@ -161,7 +218,12 @@ data class TeamEditorState(
+ 
+ /** Loads, edits, verifies, and writes the Emerald save Dolphin uses for netplay. */
+ class TeamRepo(private val context: Context) {
+-    data class Loaded(val trainerLabel: String, val party: List<Gen3Mon>, val messages: List<String>)
++    data class Loaded(
++        val trainerLabel: String,
++        val trainerName: String,
++        val party: List<Gen3Mon>,
++        val messages: List<String>
++    )
+ 
+     private val data: Gen3Data by lazy { Gen3Data.load(context) }
+     private val names: DisplayNames by lazy { DisplayNames.load(context) }
+@@ -207,11 +269,45 @@ class TeamRepo(private val context: Context) {
+         }
+         save = parsed
+         party = parsed.readParty().filter { !it.isEmpty() }.toMutableList()
+-        return Loaded("${parsed.trainerName}  ·  ${path.name}", party.toList(), messages)
++        return Loaded(
++            trainerLabel = "ID ${parsed.trainerPublicId}  ·  ${path.name}",
++            trainerName = parsed.trainerName,
++            party = party.toList(),
++            messages = messages
++        )
+     }
+ 
+-    fun importShowdown(text: String): List<String> {
++    /**
++     * Write [name] into the save's trainer block and re-stamp the party's OT
++     * names to match. Throws (leaving the save untouched) if the name is empty,
++     * over-long, or has a character the Gen 3 charset cannot hold.
++     *
++     * Every Pokemon stores its OWN copy of the OT name, so a rename has to
++     * re-stamp the party; otherwise the mons read as traded outsiders in game
++     * (the disobedience rules kick in above the badge cap). The OT *ID* is
++     * untouched, so they remain this save's Pokemon.
++     */
++    fun applyTrainerName(name: String) {
++        val s = save ?: throw IllegalStateException("no save loaded")
++        val typed = name.trim()
++        if (typed == s.trainerName) return  // unchanged: leave the party's OT alone
++
++        s.setTrainerName(typed)
++        val otBytes = Gen3Text.encode(s.trainerName, EmeraldSave.TRAINER_NAME_LEN)
++        party.forEach { it.otNameRaw = otBytes.copyOf() }
++    }
++
++    fun importShowdown(text: String, trainerName: String): List<String> {
+         val s = save ?: return listOf("No save loaded")
++        // Commit the typed trainer name FIRST: MonFactory.build stamps each
++        // mon's OT from the save's trainer block, so importing before the
++        // rename lands would build the whole party under the previous owner.
++        try {
++            applyTrainerName(trainerName)
++        } catch (e: Exception) {
++            return listOf("Nothing imported — trainer name: ${e.message ?: "invalid"}")
++        }
++
+         val messages = mutableListOf<String>()
+         val sets = ShowdownParser.parseTeam(text)
+         if (sets.isEmpty()) return listOf("Nothing recognizable in that paste")
+@@ -239,10 +335,17 @@ class TeamRepo(private val context: Context) {
+         if (index in party.indices) party.removeAt(index)
+     }
+ 
+-    fun saveToDisk(): List<String> {
++    fun saveToDisk(trainerName: String): List<String> {
+         val s = save ?: return listOf("No save loaded")
+         val path = savePath ?: return listOf("No save path")
+         val messages = mutableListOf<String>()
++        // Name before party: writeParty serializes the mons as they stand, and
++        // applyTrainerName is what brings their OT names in line with a rename.
++        try {
++            applyTrainerName(trainerName)
++        } catch (e: Exception) {
++            return listOf("NOT saved — trainer name: ${e.message ?: "invalid"}")
++        }
+         return try {
+             s.writeParty(party)
+             val out = s.toBytes()
+@@ -262,7 +365,7 @@ class TeamRepo(private val context: Context) {
+             val tmp = File(path.path + ".tmp")
+             tmp.writeBytes(out)
+             check(tmp.renameTo(path)) { "could not replace ${path.name}" }
+-            messages.add(0, "Saved ${party.size} Pokémon to ${path.name} ✓ verified")
++            messages.add(0, "Saved ${party.size} Pokémon as ${s.trainerName} to ${path.name} ✓ verified")
+             messages
+         } catch (e: Exception) {
+             listOf("NOT saved — ${e.message ?: "verification failed"}")
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+index 2036903..d6b8232 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -46,6 +46,7 @@ fun TeamEditorScreen(
+     names: DisplayNames?,
+     onRoleChange: (TeamRole) -> Unit,
+     onSelect: (Int) -> Unit,
++    onTrainerNameChange: (String) -> Unit,
+     onImport: (String) -> Unit,
+     onRemoveSelected: () -> Unit,
+     onSave: () -> Unit,
+@@ -106,6 +107,35 @@ fun TeamEditorScreen(
+                 return@Column
+             }
+ 
++            // Trainer name. Keystrokes that the Gen 3 charset cannot hold are
++            // rejected as they are typed (see TeamEditorActivity.setTrainerName),
++            // so the field can only ever show a name the save can really store.
++            SeaPanel(title = "TRAINER") {
++                OutlinedTextField(
++                    value = state.trainerName,
++                    onValueChange = onTrainerNameChange,
++                    singleLine = true,
++                    label = { Text("In-game name (max 7)", color = XDColors.TextDim) },
++                    supportingText = {
++                        Text(
++                            "Shown to your opponent in the link battle. " +
++                                "Renaming also re-stamps the party's OT.",
++                            color = XDColors.TextDim,
++                            fontSize = 11.sp
++                        )
++                    },
++                    isError = state.trainerName.isBlank(),
++                    colors = OutlinedTextFieldDefaults.colors(
++                        focusedTextColor = XDColors.TextPrimary,
++                        unfocusedTextColor = XDColors.TextPrimary,
++                        focusedBorderColor = XDColors.Accent,
++                        unfocusedBorderColor = XDColors.PanelLight
++                    ),
++                    modifier = Modifier.fillMaxWidth()
++                )
++            }
++            Spacer(Modifier.height(14.dp))
++
+             // Party panel
+             SeaPanel(title = "PARTY — ${state.trainer}") {
+                 if (state.party.isEmpty()) {
+@@ -145,7 +175,8 @@ fun TeamEditorScreen(
+                 ) { Text("Import") }
+                 Button(
+                     onClick = onSave,
+-                    enabled = state.dirty,
++                    // A blank name cannot be written at all, so do not offer to.
++                    enabled = state.dirty && state.trainerName.isNotBlank(),
+                     colors = ButtonDefaults.buttonColors(
+                         containerColor = XDColors.PanelLight,
+                         contentColor = XDColors.ChipText
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index fc21af6..b5946d9 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1083,6 +1083,8 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="netplay_network_mode_host_input_authority">Host Input Authority</string>
+     <string name="netplay_network_mode_golf">Golf Mode</string>
+     <string name="netplay_buffer">Buffer</string>
++    <string name="netplay_auto_buffer">Automatic buffer</string>
++    <string name="netplay_auto_buffer_description">Sizes the buffer from the measured ping and keeps it sized. A 200 ms connection needs about 12 frames. Changing the buffer by hand turns this off.</string>
+     <string name="netplay_client_buffer">Max buffer</string>
+     <string name="netplay_connection_lost">Netplay connection lost</string>
+     <string name="netplay_save_transfer_progress_close">Close</string>
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index 167e5b2..2dfe8ae 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -171,14 +171,23 @@ std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
+ {
+   // Host side. Writes the joiner's team into the socket-3 save that netplay
+   // syncs at start; the caller relays the returned line into the room chat.
++  //
++  // The payload may carry an in-game trainer name ahead of the team; a client
++  // that predates that just sends the bare team (TeamInjector.h documents the
++  // grammar and both compatibility directions).
++  const XDNetplay::TeamSubmission submission = XDNetplay::ParseTeamSubmissionPayload(text);
+   std::string status;
+-  if (!XDNetplay::InjectGuestTeam(text, 2, &status))
++  if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+ }
+ 
+ void NetPlayUICallbacks::OnRoomClosed()
+ {
++  // Restores the host's own team AND erases every remaining copy of the
++  // opponent's party (.bak/.tmp beside the save, netplay's NetPlayTemp GBA
++  // saves). May defer itself until emulation has fully stopped -- the mGBA
++  // core rewrites the save at teardown, so anything done sooner is undone.
+   XDNetplay::RestoreHostTeam(2);
+ }
+ 
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index 521b2f7..ea597fe 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -18,6 +18,7 @@
+ #include "Core/NetPlayCommon.h"
+ #include "Core/NetPlayServer.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/TeamInjector.h"
+ 
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+@@ -55,12 +56,19 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSendMessage
+ JNIEXPORT void JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(JNIEnv* env,
+                                                                                 jobject obj,
+-                                                                                jstring jteam)
++                                                                                jstring jteam,
++                                                                                jstring jname)
+ {
+-  // XD Netplay: hand this player's Showdown team to the host, which writes it
+-  // into the GBA save it syncs at start (UICommon/XDNetplay/TeamInjector.h).
++  // XD Netplay: hand this player's Showdown team -- and the in-game trainer
++  // name they want to play under -- to the host, which writes both into the GBA
++  // save it syncs at start. The two travel in ONE TeamData string; the payload
++  // grammar lives in UICommon/XDNetplay/TeamInjector.h. An empty name means
++  // "keep the host save's existing name".
+   if (auto* client = GetClientPointer(env, obj))
+-    client->SendTeamSubmission(GetJString(env, jteam));
++  {
++    client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(GetJString(env, jteam),
++                                                                    GetJString(env, jname)));
++  }
+ }
+ 
+ JNIEXPORT void JNICALL
+@@ -82,9 +90,19 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeAdjustClien
+ JNIEXPORT void JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeAdjustServerPadBufferSize(
+     JNIEnv* env, jobject obj, jint buffer)
++{
++  // This is the host's own buffer control in the room UI, i.e. a manual edit:
++  // it takes the automatic sizer out of the loop so the typed value sticks.
++  if (auto* server = GetServerPointer(env, obj))
++    server->SetPadBufferSizeManual(static_cast<u32>(buffer));
++}
++
++JNIEXPORT void JNICALL
++Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSetAutoPadBuffer(
++    JNIEnv* env, jobject obj, jboolean enable)
+ {
+   if (auto* server = GetServerPointer(env, obj))
+-    server->AdjustPadBufferSize(static_cast<u32>(buffer));
++    server->SetAutoPadBufferEnabled(static_cast<bool>(enable));
+ }
+ 
+ JNIEXPORT jlong JNICALL
+diff --git a/Source/Core/Core/Config/NetplaySettings.cpp b/Source/Core/Core/Config/NetplaySettings.cpp
+index de87229..b591aa8 100644
+--- a/Source/Core/Core/Config/NetplaySettings.cpp
++++ b/Source/Core/Core/Config/NetplaySettings.cpp
+@@ -43,6 +43,11 @@ const Info<u32> NETPLAY_CHUNKED_UPLOAD_LIMIT{{System::Main, "NetPlay", "ChunkedU
+ 
+ const Info<u32> NETPLAY_BUFFER_SIZE{{System::Main, "NetPlay", "BufferSize"}, 5};
+ const Info<u32> NETPLAY_CLIENT_BUFFER_SIZE{{System::Main, "NetPlay", "BufferSizeClient"}, 1};
++// Host-side automatic pad buffer sizing from measured ping. On by default: the
++// fixed default of 5 frames is right for a LAN and badly wrong for the ~200-300
++// ms transatlantic links this fork is actually played on, and most hosts never
++// discovered the setting. See NetPlayServer::UpdateAutoPadBuffer.
++const Info<bool> NETPLAY_AUTO_BUFFER{{System::Main, "NetPlay", "AutoBuffer"}, true};
+ 
+ const Info<bool> NETPLAY_SAVEDATA_LOAD{{System::Main, "NetPlay", "SyncSaves"}, true};
+ const Info<bool> NETPLAY_SAVEDATA_WRITE{{System::Main, "NetPlay", "WriteSaveData"}, true};
+diff --git a/Source/Core/Core/Config/NetplaySettings.h b/Source/Core/Core/Config/NetplaySettings.h
+index db51aaf..f6ccfc7 100644
+--- a/Source/Core/Core/Config/NetplaySettings.h
++++ b/Source/Core/Core/Config/NetplaySettings.h
+@@ -41,6 +41,7 @@ extern const Info<u32> NETPLAY_CHUNKED_UPLOAD_LIMIT;
+ 
+ extern const Info<u32> NETPLAY_BUFFER_SIZE;
+ extern const Info<u32> NETPLAY_CLIENT_BUFFER_SIZE;
++extern const Info<bool> NETPLAY_AUTO_BUFFER;
+ 
+ extern const Info<bool> NETPLAY_SAVEDATA_LOAD;
+ extern const Info<bool> NETPLAY_SAVEDATA_WRITE;
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index e015b5f..3fa2aee 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -158,6 +158,33 @@ void OnDeviceDestroyed()
+   }
+ }
+ 
++void LogPostSession(const std::string& detail)
++{
++  std::lock_guard lock(s_mutex);
++  if (s_path.empty())
++    return;
++
++  const std::string line = fmt::format("t=post {}", detail);
++
++  // A room can close while the session is still live (host closed the window
++  // mid-battle); then the normal sink is still the right one.
++  if (s_file.is_open())
++  {
++    WriteLine(line, true);
++    return;
++  }
++
++  // Session already closed: reopen just long enough to append. Not routed
++  // through WriteLine because the byte cap is accounted against the live
++  // stream, and these lines are few, fixed in number, and the whole point of
++  // the log for this feature.
++  std::ofstream out(s_path, std::ios::out | std::ios::app);
++  if (!out.is_open())
++    return;
++  out << line << '\n';
++  out.flush();
++}
++
+ void LogBios(int channel, bool official, const std::string& path, u64 size, bool netplay,
+              bool load_ok)
+ {
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index 8f5d813..05760d0 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -57,6 +57,19 @@ void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool s
+ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
+                 u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr);
+ 
++// Append one line AFTER the session's log has already been closed.
++//
++// OnDeviceDestroyed() closes the file as soon as the last GBA device is torn
++// down, but the end-of-session save cleanup deliberately runs later than that
++// (it has to: the mGBA core rewrites the .sav from its in-memory copy during
++// that very teardown). This reopens the most recent session's file in append
++// mode, writes one line, and closes it again -- so the cleanup is visible in
++// the same log a user already knows how to hand over. No-op before any
++// session has run. Called from the emulation thread at shutdown or from the
++// UI thread when a room closes with emulation already down; bounded to a
++// handful of lines per session.
++void LogPostSession(const std::string& detail);
++
+ // Shared last-GC-pad-press tick (A/B/Start rising edges), written by the GC
+ // controller tap and read by the GBA devices for the per-roll state lines.
+ // Diagnostic only; never feeds emulation.
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index fd9262c..10de34c 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -86,6 +86,65 @@ static std::mutex crit_netplay_client;
+ static NetPlayClient* netplay_client = nullptr;
+ static bool s_si_poll_batching = false;
+ 
++// XD netplay peer-vanish watchdog -- see WaitOnRemote() for the full story.
++//
++// Every number here is about the CONNECTION, never about emulated state. A
++// timeout in this file can only ever end the session; it can never invent a pad
++// frame, so none of it can desync anybody. They are also all deliberately
++// enormous next to this fork's real traffic: our users play transatlantic at
++// ~200 ms with buffer 10-14 (about 200 ms of cushion) and see 300 ms+ spikes,
++// so the smallest bound below is still ~10x the worst spike we have on record.
++//
++// More important than any of the numbers: none of them ends a session on
++// elapsed time ALONE. Every rule in WaitOnRemote() also needs corroboration
++// that the session is genuinely over, because a peer that is merely paused --
++// which Android does on every backgrounding -- can outlast any threshold
++// anybody would be willing to pick, and must find the session still there when
++// it comes back.
++namespace
++{
++// One slice of a bounded wait. Also the granularity at which a wedged CPU
++// thread notices a stop request, so keep it short; it costs 4 wakeups a second
++// on a thread that would otherwise be asleep anyway.
++constexpr std::chrono::milliseconds PAD_WAIT_SLICE = std::chrono::milliseconds(250);
++// First "we are waiting on somebody" notice. Purely cosmetic -- no action is
++// taken -- so it can afford to be near the edge of plausible jitter.
++constexpr u64 PAD_STALL_NOTICE_MS = 3000;
++// How often to repeat that notice so the window never looks simply dead.
++constexpr u64 PAD_STALL_REPEAT_MS = 5000;
++// ...and how often to repeat it once the stall has gone on for
++// PAD_STALL_SLOW_NOTICE_AFTER_MS. A wait can now legitimately last as long as
++// an opponent's phone call (see rule 3 in WaitOnRemote()), and a banner every
++// five seconds for ten minutes stops being information.
++constexpr u64 PAD_STALL_SLOW_NOTICE_AFTER_MS = 60000;
++constexpr u64 PAD_STALL_REPEAT_SLOW_MS = 30000;
++// Starved of remote frames AND not one netplay packet from the server in this
++// long. The server pings every client at 1 Hz, so this is 20 consecutive missed
++// pings: the peer we actually hold a socket to is gone, not slow. ENet's own
++// verdict (PEER_TIMEOUT, 30 s) still arrives and is still authoritative -- this
++// only stops us from being a frozen window for the last third of that wait.
++constexpr u64 LINK_SILENT_MS = 20000;
++// Backstop for "starved of a pad whose owner has already left the room".
++// Deliberately parked past PEER_TIMEOUT so that in every topology we understand
++// the server's own DisableGame broadcast wins the race and this never fires; it
++// is here for the case where the server told us the player left but never told
++// us to stop. Note what it is NOT: a plain "no pad for 45 s" timer. See rule 3
++// in WaitOnRemote() for why an unconditional one is unsafe in this fork.
++constexpr u64 PAD_OWNER_GONE_ABORT_MS = 45000;
++// How long a locally requested stop may sit unanswered before we stop anyway.
++// RequestStopGame() only mails a packet to the server; if the server IS the
++// machine that vanished, that packet goes nowhere and upstream leaves the CPU
++// thread waiting on remote pads for a game the user already quit.
++constexpr u64 LOCAL_STOP_GRACE_MS = 2000;
++
++u64 SteadyNowMs()
++{
++  return static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
++                              std::chrono::steady_clock::now().time_since_epoch())
++                              .count());
++}
++}  // namespace
++
+ // called from ---GUI--- thread
+ NetPlayClient::~NetPlayClient()
+ {
+@@ -125,6 +184,19 @@ NetPlayClient::~NetPlayClient()
+   {
+     Common::ReleaseTraversalClient();
+   }
++
++  // The session is over for THIS machine, whichever end of it we were.
++  //
++  // ~NetPlayServer makes the same call, but only a host has a server: without
++  // this a joiner never cleaned up, and a joiner is the one left holding
++  // NetPlayTemp2.sav -- a byte-for-byte copy of the HOST's party, EVs, IVs and
++  // natures included. The call is idempotent, so a host simply gets it twice.
++  //
++  // Note this runs BEFORE the emulation shutdown that StopGame() above kicked
++  // off has finished; OnRoomClosed defers the actual work until the GBA cores
++  // have stopped and flushed. See XDNetplay::RestoreHostTeam.
++  if (m_dialog)
++    m_dialog->OnRoomClosed();
+ }
+ 
+ // called from ---GUI--- thread
+@@ -1612,8 +1684,46 @@ void NetPlayClient::ThreadFunc()
+     }
+   }
+ 
++  // XD netplay: set once we have run the teardown DeclareSessionLost() asked
++  // for. Thread-local to this loop, so it needs no synchronisation.
++  bool session_lost_handled = false;
++
+   while (m_do_loop.IsSet())
+   {
++    // XD netplay: the CPU thread concluded the session is unrecoverable and
++    // freed itself, but it cannot run StopGame() from inside GetNetPads (it
++    // holds crit_netplay_client there, and StopGame reaches NetPlay_Disable
++    // which wants the same non-recursive mutex). Finish the job here, on the
++    // thread that is allowed to.
++    const SessionEndKind session_end = m_session_end.load(std::memory_order_acquire);
++    if (session_end == SessionEndKind::None)
++    {
++      // Re-arm. This thread outlives individual games -- a room can start a
++      // second battle after the first one was ended by a drop -- and StartGame()
++      // clears m_session_end, so the latch has to come back with it or the next
++      // drop in the same room would go unhandled.
++      session_lost_handled = false;
++    }
++    else if (!session_lost_handled)
++    {
++      session_lost_handled = true;
++      // Only announce a drop when there actually was one. The other kind is the
++      // local user's own Stop completing without the server's acknowledgement,
++      // which needs the teardown below just the same but must not tell the room
++      // that somebody disconnected.
++      if (session_end == SessionEndKind::PeerLost)
++      {
++        m_dialog->AppendChat(
++            Common::GetStringT("NetPlay session ended: a player disconnected unexpectedly."));
++      }
++      // Deliberately NOT m_dialog->OnConnectionLost(): that one means "our own
++      // socket to the server died", which is only one of the ways we get here,
++      // and on Android it drives a modal. When it IS true, ENet raises its own
++      // disconnect event below and calls it for us. StopGame() is what puts
++      // every platform into a defined, unfrozen state.
++      StopGame();
++    }
++
+     ENetEvent netEvent;
+     int net;
+     if (m_traversal_client)
+@@ -1640,6 +1750,12 @@ void NetPlayClient::ThreadFunc()
+       case ENET_EVENT_TYPE_RECEIVE:
+         INFO_LOG_FMT(NETPLAY, "enet_host_service: receive event");
+ 
++        // Proof of life for the pad-wait watchdog. Any netplay packet counts,
++        // not just pad data -- the point is "the machine we hold a socket to is
++        // still talking", and the server's 1 Hz Ping guarantees this keeps
++        // ticking even when the GAME is fully starved. See WaitOnRemote().
++        m_last_recv_ms.store(SteadyNowMs(), std::memory_order_relaxed);
++
+         rpac.append(netEvent.packet->data, netEvent.packet->dataLength);
+         OnData(rpac);
+ 
+@@ -1706,15 +1822,21 @@ void NetPlayClient::SendChatMessage(const std::string& msg)
+   SendAsync(std::move(packet));
+ }
+ 
+-void NetPlayClient::SendTeamSubmission(const std::string& showdown_text)
++void NetPlayClient::SendTeamSubmission(const std::string& payload)
+ {
+   // Showdown text, not prebuilt party bytes: the host has to construct the
+   // Pokemon against ITS save's trainer name/ID, and it is the single place
+   // that parses untrusted team text. Pokepaste links are resolved by the
+   // submitting client before this call, so the host never fetches a URL.
++  //
++  // The payload MAY carry an in-game trainer name ahead of the team ("Name: x"
++  // then a blank line); it is built and parsed by
++  // UICommon/XDNetplay/TeamInjector.h, which documents the grammar. Core does
++  // not look inside it -- it stays one opaque string on one message ID, so an
++  // older peer at either end still exchanges teams.
+   sf::Packet packet;
+   packet << MessageID::TeamData;
+-  packet << showdown_text;
++  packet << payload;
+ 
+   SendAsync(std::move(packet));
+ }
+@@ -1778,6 +1900,13 @@ bool NetPlayClient::StartGame(const std::string& path)
+   m_current_golfer = 1;
+   m_wait_on_input = false;
+ 
++  // XD netplay: arm the peer-vanish watchdog for this game. m_last_recv_ms must
++  // start non-zero or the very first pad wait would read "silent since forever"
++  // and the link-silence rule would trip on a session that has been fine.
++  m_last_recv_ms.store(SteadyNowMs(), std::memory_order_relaxed);
++  m_stop_requested_ms.store(0, std::memory_order_relaxed);
++  m_session_end.store(SessionEndKind::None, std::memory_order_release);
++
+   m_is_running.Set();
+   NetPlay_Enable(this);
+ 
+@@ -1962,6 +2091,255 @@ void NetPlayClient::OnConnectFailed(Common::TraversalConnectFailedReason reason)
+   }
+ }
+ 
++// called from ---CPU--- thread
++//
++// Name of the player who owns an in-game pad, for the "who are we waiting on?"
++// message. Deliberately does NOT go through NetPlay::GetPadDetails(): that free
++// function locks crit_netplay_client, and every caller of this one is already
++// holding it (NetPlay_GetInput takes it for the whole of GetNetPads), so it
++// would self-deadlock a plain std::mutex. Reading m_players under m_crit.players
++// is fine -- that lock is only ever held for a handful of instructions.
++std::string NetPlayClient::DescribePadOwner(const int pad_nb)
++{
++  if (pad_nb < 0 || static_cast<size_t>(pad_nb) >= m_net_settings.pad_map.size())
++    return {};
++
++  const PlayerId owner = m_net_settings.pad_map[pad_nb];
++  if (owner == 0)
++    return {};
++
++  std::lock_guard lkp(m_crit.players);
++  const auto it = m_players.find(owner);
++  return it == m_players.end() ? std::string{} : it->second.name;
++}
++
++// called from ---CPU--- thread
++//
++// True only when we can PROVE the pad's owner is no longer in the room: we know
++// which player owns the slot, and the server has since told us they left --
++// MessageID::PlayerLeave, which is the only thing that erases anybody from
++// m_players (see OnPlayerLeave). Everything we cannot answer confidently,
++// including "that index is not a pad index" and "the slot is unmapped",
++// answers false.
++//
++// The asymmetry is deliberate, because this gates the backstop in
++// WaitOnRemote(): a wrong "true" ends a session that is alive, while a wrong
++// "false" only means we keep waiting -- which is exactly the situation ENet's
++// PEER_TIMEOUT already exists to resolve. Same locking note as
++// DescribePadOwner(): m_crit.players directly, never NetPlay::GetPadDetails().
++bool NetPlayClient::PadOwnerHasLeftRoom(const int pad_nb)
++{
++  if (pad_nb < 0 || static_cast<size_t>(pad_nb) >= m_net_settings.pad_map.size())
++    return false;
++
++  const PlayerId owner = m_net_settings.pad_map[pad_nb];
++  if (owner == 0)
++    return false;
++
++  std::lock_guard lkp(m_crit.players);
++  return m_players.find(owner) == m_players.end();
++}
++
++// called from ---CPU--- thread (safe from any thread)
++void NetPlayClient::DeclareSessionLost(const SessionEndKind kind, const std::string& reason)
++{
++  // First one in wins; later slices of the same stall must not re-announce.
++  // Kind and "who won" live in the same atomic on purpose: with a separate flag
++  // plus a separate payload, a losing caller could overwrite the winner's kind,
++  // or the netplay thread could see the flag before the kind it belongs to.
++  SessionEndKind expected = SessionEndKind::None;
++  if (!m_session_end.compare_exchange_strong(expected, kind, std::memory_order_acq_rel,
++                                             std::memory_order_relaxed))
++  {
++    return;
++  }
++
++  if (kind == SessionEndKind::LocalStopCompleted)
++  {
++    // NOT an error and NOT worth alarming anybody about. The user asked for this
++    // stop; all that happened is that we finished it ourselves instead of
++    // waiting on an acknowledgement that was slow or was never coming. Both UIs
++    // call RequestStopGame() from the Core state-changed hook, so this path is
++    // reached by ORDINARY shutdowns on a laggy link -- a red "the server never
++    // acknowledged the stop" banner there would be a scary lie about a session
++    // that ended correctly. A log line is the right amount of noise.
++    INFO_LOG_FMT(NETPLAY, "Netplay session ended locally: {}", reason);
++  }
++  else
++  {
++    ERROR_LOG_FMT(NETPLAY, "Ending netplay session: {}", reason);
++
++    // The OSD is the part the player is actually looking at when this fires --
++    // they are staring at a stopped render window, not at the netplay dialog --
++    // so put the explanation there. OSD::AddMessage takes its own lock and is
++    // called from the CPU thread all over Dolphin.
++    OSD::AddMessage(reason, OSD::Duration::VERY_LONG, OSD::Color::RED);
++  }
++
++  // Free the CPU thread immediately: every wait in this class keys off
++  // m_is_running, and InvokeStop() touches nothing but flags and events.
++  InvokeStop();
++
++  // The REST of the teardown has to happen on the NETPLAY thread. StopGame()
++  // reaches NetPlay_Disable(), which locks crit_netplay_client -- and when we
++  // are called from the CPU thread that mutex is already held by us one frame
++  // up in NetPlay_GetInput(). It is a plain std::mutex, so re-entering it here
++  // would be a self-deadlock: the same freeze we are removing, moved one
++  // function over. Poke the netplay thread instead; its loop notices the flag
++  // on the next pass (immediately thanks to the wakeup, and within 250 ms even
++  // if the wakeup datagram is dropped, since that is its enet_host_service
++  // timeout).
++  if (m_client)
++    Common::ENet::WakeupThread(m_client);
++}
++
++// called from ---CPU--- thread
++//
++// One bounded slice of "block until a remote player's frame shows up".
++//
++// Upstream spends these waits in a bare Common::Event::Wait(), which is only
++// correct for as long as SOMETHING is guaranteed to eventually call
++// InvokeStop(). Nothing is, once a peer's process is killed outright. A
++// swiped-away Android task never runs its teardown, so no ENet disconnect is
++// ever put on the wire; the surviving clients' only remaining escape is
++// whoever is hosting noticing the silence after PEER_TIMEOUT (30 s) and
++// broadcasting DisableGame. And if the machine that vanished WAS the host,
++// even that never comes: the local user's own Stop cannot rescue them either,
++// because RequestStopGame() only mails a packet at the dead server. The CPU
++// thread then sits in Wait() forever while holding crit_netplay_client, the
++// render window stops updating, and Core::Stop() can never join the emu
++// thread -- the reported "have to force-quit" freeze.
++//
++// So: wait in slices and look around in between. Nothing here touches pad
++// contents or any emulated state. A timeout can only ever END the session; it
++// never fabricates an input, so it cannot desync anyone. Returns false when the
++// caller must abandon its wait -- by then m_is_running is clear, so the caller
++// bails through exactly the same path a normal stop uses.
++//
++// Note what this deliberately does NOT do: end a session merely because time has
++// passed. Every rule below needs evidence that the session is actually over --
++// the user asked to stop (1), our own socket has gone silent (2), or the server
++// has told us the player we are waiting on left the room (3). Waiting is not a
++// failure state in this fork: an Android peer that got a phone call is paused,
++// not gone, and it must still be here when they come back. See rule 3.
++bool NetPlayClient::WaitOnRemote(Common::Event& wait_event, const int pad_nb,
++                                 RemoteWaitState& state)
++{
++  if (!state.started_valid)
++  {
++    // Stamped once per wait loop, never refreshed. Refreshing it whenever the
++    // event fires would be wrong: the pad events are shared across all pads, so
++    // in a 3+ player room a healthy player's frames would keep resetting the
++    // clock on a dead player's stall and the watchdog would never fire.
++    state.started = std::chrono::steady_clock::now();
++    state.started_valid = true;
++    state.next_notice_ms = PAD_STALL_NOTICE_MS;
++  }
++
++  if (wait_event.WaitFor(PAD_WAIT_SLICE))
++    return true;
++
++  const auto now = std::chrono::steady_clock::now();
++  const u64 now_ms =
++      static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch())
++                           .count());
++  const u64 stalled_ms = static_cast<u64>(
++      std::chrono::duration_cast<std::chrono::milliseconds>(now - state.started).count());
++
++  // 1. The user already asked to quit and no stop has landed yet. Very often the
++  // server IS the machine that vanished, so waiting for its blessing is waiting
++  // forever -- but the ordinary case is just a slow link, so this is a
++  // completely expected outcome and is reported as one. The stamp is cleared by
++  // InvokeStop(), i.e. the moment any real stop lands, so reaching here means no
++  // stop has landed by any route.
++  if (const u64 stop_requested = m_stop_requested_ms.load(std::memory_order_relaxed);
++      stop_requested != 0 && now_ms - stop_requested >= LOCAL_STOP_GRACE_MS)
++  {
++    DeclareSessionLost(SessionEndKind::LocalStopCompleted,
++                       Common::GetStringT("NetPlay: finishing the requested stop locally."));
++    return false;
++  }
++
++  // 2. Dead silence on our own socket. The server pings every client at 1 Hz
++  // while a room is open, so LINK_SILENT_MS is 20 consecutive missed pings on
++  // top of an already-starved game -- that is a gone host, not a slow one.
++  // ENet's own PEER_TIMEOUT verdict is still coming and is still authoritative;
++  // this just stops us from being a dead window for the rest of that wait.
++  if (const u64 last_recv = m_last_recv_ms.load(std::memory_order_relaxed);
++      last_recv != 0 && now_ms - last_recv >= LINK_SILENT_MS)
++  {
++    DeclareSessionLost(
++        SessionEndKind::PeerLost,
++        Common::GetStringT("NetPlay: lost contact with the host. Ending this session."));
++    return false;
++  }
++
++  // 3. The pad we are starved of belongs to a player the server has already told
++  // us left the room. Nobody is ever going to send that slot's frames again, so
++  // waiting is pointless however healthy our own link looks. Parked past
++  // PEER_TIMEOUT so that normally the server's DisableGame broadcast (it sends
++  // one whenever a player with a mapped pad drops) gets here first and this
++  // never fires; it covers the case where PlayerLeave arrived but a stop never
++  // did.
++  //
++  // The membership test is load-bearing, not a refinement. This rule used to be
++  // an unconditional "no pad for 45 s -> end the session", and that was wrong in
++  // the way that matters most to this fork: Android pauses emulation on ANY
++  // backgrounding -- screen lock, incoming call, pulling down the notification
++  // shade -- and a paused peer stops producing pad frames while its socket stays
++  // wide open. The server's 1 Hz ping therefore keeps rule 2 quiet and ENet
++  // never times out, so the unconditional backstop was the only thing that
++  // fired, and it fired on a completely healthy session: it hung up on people
++  // for glancing at a notification, the exact behaviour
++  // NetplayTaskWatcherService documents that we must never ship. A paused
++  // opponent has to be able to come back and find the battle still there, and no
++  // wall-clock number can tell "paused" from "gone" -- a phone call can outlast
++  // any threshold anybody would accept.
++  //
++  // Room membership is the one signal that cannot be confused with a pause: a
++  // paused player is still in m_players and only the server removing them takes
++  // them out. So there is deliberately no unconditional timer left here. The
++  // remaining gap -- a peer that is truly gone but that the server still lists,
++  // or a stall on a wait with no pad owner to check (golf handoff, Wiimote) --
++  // is closed by ENet's own PEER_TIMEOUT at both ends: the server drops the dead
++  // peer at 30 s and broadcasts DisableGame + PlayerLeave, and if the dead
++  // machine WAS the server, rule 2 has already fired at 20 s. And the user's own
++  // Stop now always works within LOCAL_STOP_GRACE_MS via rule 1, which is the
++  // right escape hatch for "my opponent has been paused for ten minutes":
++  // a human decision, not a timer's.
++  if (stalled_ms >= PAD_OWNER_GONE_ABORT_MS && PadOwnerHasLeftRoom(pad_nb))
++  {
++    DeclareSessionLost(SessionEndKind::PeerLost,
++                       Common::GetStringT("NetPlay: the other player left the room. "
++                                          "Ending this session."));
++    return false;
++  }
++
++  // Still plausibly alive: somebody's console is just behind. Say so on screen,
++  // and keep saying it, so the window never simply looks dead. This is the part
++  // that turns a mystery freeze into "oh, they dropped".
++  if (stalled_ms >= state.next_notice_ms)
++  {
++    state.next_notice_ms = stalled_ms + (stalled_ms >= PAD_STALL_SLOW_NOTICE_AFTER_MS ?
++                                             PAD_STALL_REPEAT_SLOW_MS :
++                                             PAD_STALL_REPEAT_MS);
++
++    const std::string who = DescribePadOwner(pad_nb);
++    const u64 stalled_s = stalled_ms / 1000;
++    std::string msg;
++    if (who.empty())
++      msg = Common::FmtFormatT("Waiting for the other player... ({0}s)", stalled_s);
++    else
++      msg = Common::FmtFormatT("Waiting for {0}... ({1}s)", who, stalled_s);
++
++    OSD::AddTypedMessage(OSD::MessageType::NetPlayLatency, msg, OSD::Duration::NORMAL,
++                         OSD::Color::YELLOW);
++    WARN_LOG_FMT(NETPLAY, "Stalled {} ms waiting on in-game pad {}", stalled_ms, pad_nb);
++  }
++
++  return true;
++}
++
+ // called from ---CPU--- thread
+ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatus* pad_status)
+ {
+@@ -1993,6 +2371,7 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
+   // and send it.
+ 
+   // When here when told to so we don't deadlock in certain situations
++  RemoteWaitState golf_wait;
+   while (m_wait_on_input)
+   {
+     if (!m_is_running.IsSet())
+@@ -2010,7 +2389,12 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
+       m_wait_on_input_received = false;
+     }
+ 
+-    m_wait_on_input_event.Wait();
++    // Same watchdog as the pad wait below: the handoff we are waiting for comes
++    // from the host, so it never lands if the host is the machine that died.
++    // pad_nb is meaningless here (this wait is about input control, not one
++    // slot), so -1.
++    if (!WaitOnRemote(m_wait_on_input_event, -1, golf_wait))
++      return false;
+   }
+ 
+   if (IsFirstInGamePad(pad_nb) && batching)
+@@ -2077,6 +2461,7 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
+   // Now, we either use the data pushed earlier, or wait for the
+   // other clients to send it to us
+   const auto lat_t0 = std::chrono::steady_clock::now();
++  RemoteWaitState pad_wait;
+   while (m_pad_buffer[pad_nb].Size() == 0)
+   {
+     if (!m_is_running.IsSet())
+@@ -2084,7 +2469,11 @@ bool NetPlayClient::GetNetPads(const int pad_nb, const bool batching, GCPadStatu
+       return false;
+     }
+ 
+-    m_gc_pad_event.Wait();
++    // THE hang. This used to be an unbounded m_gc_pad_event.Wait(), which is
++    // where a desktop client parks forever when the Android player's process is
++    // killed mid-battle. See WaitOnRemote().
++    if (!WaitOnRemote(m_gc_pad_event, pad_nb, pad_wait))
++      return false;
+   }
+ 
+   // Latency telemetry: how long this pad fetch had to wait for a remote frame,
+@@ -2183,6 +2572,7 @@ bool NetPlayClient::WiimoteUpdate(const std::span<WiimoteDataBatchEntry>& entrie
+ 
+     // Now, we either use the data pushed earlier, or wait for the
+     // other clients to send it to us
++    RemoteWaitState wiimote_wait;
+     while (m_wiimote_buffer[entry.wiimote].Size() == 0)
+     {
+       if (!m_is_running.IsSet())
+@@ -2190,7 +2580,13 @@ bool NetPlayClient::WiimoteUpdate(const std::span<WiimoteDataBatchEntry>& entrie
+         return false;
+       }
+ 
+-      m_wii_pad_event.Wait();
++      // Same watchdog as GetNetPads: this is the identical hang with a Wiimote
++      // instead of a pad. XD never gets here, but leaving one unbounded Wait()
++      // in the class would just relocate the freeze for anyone who does. -1
++      // rather than the slot, because DescribePadOwner reads pad_map and this
++      // index belongs to wiimote_map -- it would name the wrong player.
++      if (!WaitOnRemote(m_wii_pad_event, -1, wiimote_wait))
++        return false;
+     }
+ 
+     m_wiimote_buffer[entry.wiimote].Pop(*entry.state);
+@@ -2304,12 +2700,18 @@ void NetPlayClient::SendPadHostPoll(const PadIndex pad_num)
+       if (m_net_settings.pad_map[i] <= 0)
+         continue;
+ 
++      // Bounded for the same reason as GetNetPads': the first pad status comes
++      // from another player, so a player who dies before sending it would wedge
++      // the golfer here forever.
++      RemoteWaitState first_status_wait;
+       while (!m_first_pad_status_received[i])
+       {
+         if (!m_is_running.IsSet())
+           return;
+ 
+-        m_first_pad_status_received_event.Wait();
++        if (!WaitOnRemote(m_first_pad_status_received_event, static_cast<int>(i),
++                          first_status_wait))
++          return;
+       }
+     }
+ 
+@@ -2325,12 +2727,14 @@ void NetPlayClient::SendPadHostPoll(const PadIndex pad_num)
+   }
+   else if (m_net_settings.pad_map[pad_num] != 0)
+   {
++    RemoteWaitState first_status_wait;
+     while (!m_first_pad_status_received[pad_num])
+     {
+       if (!m_is_running.IsSet())
+         return;
+ 
+-      m_first_pad_status_received_event.Wait();
++      if (!WaitOnRemote(m_first_pad_status_received_event, pad_num, first_status_wait))
++        return;
+     }
+ 
+     if (m_pad_buffer[pad_num].Size() == 0)
+@@ -2348,6 +2752,22 @@ void NetPlayClient::InvokeStop()
+ {
+   m_is_running.Clear();
+ 
++  // XD netplay: a stop has now really landed, so the "our Stop has not been
++  // answered yet" deadline is satisfied and must be disarmed. Every route by
++  // which a game actually stops funnels through here -- StopGame() (which is
++  // what the server's StopGame/DisableGame broadcast runs), Stop(),
++  // OnPowerButton(), DeclareSessionLost() -- which is why the clear belongs
++  // here and not in any one of them.
++  //
++  // Previously only StartGame() cleared it, and that produced a false alarm on
++  // perfectly ordinary shutdowns: both UIs call RequestStopGame() from the Core
++  // state-changed hook (on Stopping, while the CPU thread can still be parked in
++  // a pad wait), and it does not even put a packet on the wire unless we have a
++  // pad mapped. The stamp therefore stayed armed through a normal stop and, on a
++  // slow link, rule 1 in WaitOnRemote() fired and shouted about a server that
++  // had done nothing wrong.
++  m_stop_requested_ms.store(0, std::memory_order_relaxed);
++
+   // stop waiting for input
+   m_gc_pad_event.Set();
+   m_wii_pad_event.Set();
+@@ -2385,6 +2805,21 @@ void NetPlayClient::Stop()
+ 
+ void NetPlayClient::RequestStopGame()
+ {
++  // XD netplay: arm the local-stop deadline BEFORE sending, so the CPU thread's
++  // pad wait can give up on the server's answer. This call is only ever made
++  // when the local core is already on its way down (both UIs hook it to the
++  // Core state-changed callback), so stopping ourselves after the grace period
++  // is not a policy decision -- it is finishing what the user asked for. Without
++  // it, hitting Stop while starved of a dead player's frames does nothing at
++  // all: the packet below goes to a server that is very often the machine that
++  // just vanished, and we would wait on the reply forever.
++  //
++  // Gated on m_is_running so a stale queued EmulationStateChanged(Uninitialized)
++  // from the PREVIOUS game cannot land just after StartGame() cleared this and
++  // arm a stop deadline against a session that is only now booting.
++  if (m_is_running.IsSet())
++    m_stop_requested_ms.store(SteadyNowMs(), std::memory_order_relaxed);
++
+   // Tell the server to stop if we have a pad mapped in game.
+   if (LocalPlayerHasControllerMapped())
+     SendStopGamePacket();
+diff --git a/Source/Core/Core/NetPlayClient.h b/Source/Core/Core/NetPlayClient.h
+index 367ad1a..d8f9093 100644
+--- a/Source/Core/Core/NetPlayClient.h
++++ b/Source/Core/Core/NetPlayClient.h
+@@ -5,6 +5,7 @@
+ 
+ #include <SFML/Network/Packet.hpp>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <map>
+ #include <memory>
+@@ -60,8 +61,15 @@ public:
+   // room chat. Called on the NETPLAY thread; must finish before the ack, so
+   // the file is on disk before any Start can read it.
+   virtual std::string OnTeamSubmission(const std::string& player, const std::string& text) = 0;
+-  // XD Netplay, host side: the room closed. Puts the host's own team back if a
+-  // guest's submission overwrote it (UICommon/XDNetplay/TeamInjector.h).
++  // XD Netplay: this machine's session is over. Puts the host's own team back
++  // if a guest's submission overwrote it, and erases every remaining file that
++  // holds the opponent's party -- including, on a joiner, netplay's own
++  // NetPlayTemp GBA saves (UICommon/XDNetplay/TeamInjector.h).
++  //
++  // Raised from BOTH ~NetPlayServer (host) and ~NetPlayClient (either end), so
++  // hosts see it twice; the implementation is idempotent. It may complete
++  // asynchronously: while a battle is live the mGBA core owns the save files,
++  // so the work waits for emulation to reach Uninitialized.
+   virtual void OnRoomClosed() = 0;
+ 
+   virtual void OnMsgChangeGame(const SyncIdentifier& sync_identifier,
+@@ -138,10 +146,12 @@ public:
+   void Stop();
+   bool ChangeGame(const std::string& game);
+   void SendChatMessage(const std::string& msg);
+-  // XD Netplay: submit this player's own team to the host, which writes it
+-  // into the save it syncs at start. No-op unless the host is running this
+-  // fork's XD flow. See UICommon/XDNetplay/TeamInjector.h.
+-  void SendTeamSubmission(const std::string& showdown_text);
++  // XD Netplay: submit this player's own team -- and, optionally, the in-game
++  // trainer name to play under -- to the host, which writes both into the save
++  // it syncs at start. No-op unless the host is running this fork's XD flow.
++  // The payload is built by XDNetplay::BuildTeamSubmissionPayload and Core
++  // treats it as opaque text. See UICommon/XDNetplay/TeamInjector.h.
++  void SendTeamSubmission(const std::string& payload);
+   void RequestStopGame();
+   void SendPowerButtonEvent();
+   void RequestGolfControl(PlayerId pid);
+@@ -278,6 +288,37 @@ private:
+   bool PollLocalPad(int local_pad, sf::Packet& packet);
+   void SendPadHostPoll(PadIndex pad_num);
+ 
++  // XD netplay peer-vanish watchdog. Per-wait bookkeeping for WaitOnRemote();
++  // one of these lives on the stack of whichever CPU-thread loop is blocked.
++  struct RemoteWaitState
++  {
++    std::chrono::steady_clock::time_point started{};
++    u64 next_notice_ms = 0;
++    bool started_valid = false;
++  };
++
++  // Why a session stopped by the watchdog stopped. It decides how loudly we say
++  // so, which matters because one of these is an ordinary, user-requested event
++  // and the other is a genuine failure.
++  enum class SessionEndKind : u32
++  {
++    // Session is healthy. Also the "nobody has claimed the teardown yet" state.
++    None = 0,
++    // A peer or the host vanished and nothing is going to bring the session
++    // back. The user did not ask for this and needs to be told why their battle
++    // just ended: red OSD, error log, a line in the room chat.
++    PeerLost,
++    // The local user asked to stop and we finished the job ourselves rather than
++    // keep waiting on an acknowledgement. Entirely ordinary -- the session
++    // stopped exactly as requested -- so it gets a log line and nothing else.
++    LocalStopCompleted,
++  };
++
++  bool WaitOnRemote(Common::Event& wait_event, int pad_nb, RemoteWaitState& state);
++  void DeclareSessionLost(SessionEndKind kind, const std::string& reason);
++  std::string DescribePadOwner(int pad_nb);
++  bool PadOwnerHasLeftRoom(int pad_nb);
++
+   bool AddLocalWiimoteToBuffer(int local_wiimote, const WiimoteEmu::SerializedWiimoteState& state,
+                                sf::Packet& packet);
+ 
+@@ -352,6 +393,33 @@ private:
+   Common::Event m_wii_pad_event;
+   Common::Event m_first_pad_status_received_event;
+   Common::Event m_wait_on_input_event;
++
++  // XD netplay peer-vanish watchdog.
++  //
++  // m_last_recv_ms is stamped by the NETPLAY thread every time a netplay packet
++  // lands from the server. The server pings every client once a second while a
++  // room is open, so on a live session this is never more than ~1 s stale no
++  // matter how badly the *game* is starved. That is what lets the CPU thread's
++  // pad-wait loop tell "the other player's console is briefly behind" (server
++  // still pinging -- keep waiting) apart from "the machine we talk to is gone"
++  // (dead silence -- stop pretending this session exists). Steady clock, ms.
++  std::atomic<u64> m_last_recv_ms{0};
++  // Claimed exactly once, by whichever thread first concludes this session is
++  // over, via compare-exchange from None. It carries both facts -- that somebody
++  // won, and what they concluded -- in a single atomic so the winner's reason
++  // can never be overwritten by a loser and can never be read before it is
++  // published. The NETPLAY thread does the actual teardown; see
++  // DeclareSessionLost() for why the CPU thread must not run StopGame() itself.
++  std::atomic<SessionEndKind> m_session_end{SessionEndKind::None};
++  // Stamped when RequestStopGame() mails a stop to the server, and cleared by
++  // InvokeStop(), i.e. the instant any real stop lands by any route. If no stop
++  // lands within LOCAL_STOP_GRACE we stop ourselves rather than leave the CPU
++  // thread wedged behind a Stop the user already asked for -- the server is
++  // quite often the machine that just vanished. Clearing it in InvokeStop() is
++  // what keeps an ordinary shutdown from looking like a failure; see there.
++  // 0 means "no local stop pending".
++  std::atomic<u64> m_stop_requested_ms{0};
++
+   u8 m_sync_save_data_count = 0;
+   u8 m_sync_save_data_success_count = 0;
+   u16 m_sync_gecko_codes_count = 0;
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 3b11f3f..5149618 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -51,6 +51,7 @@
+ #include "Core/HW/EXI/EXI_Device.h"
+ #ifdef HAS_LIBMGBA
+ #include "Core/HW/GBACore.h"
++#include "Core/HW/GBADetectLog.h"
+ #endif
+ #include "Core/HW/GCMemcard/GCMemcard.h"
+ #include "Core/HW/GCMemcard/GCMemcardDirectory.h"
+@@ -91,11 +92,81 @@
+ 
+ namespace NetPlay
+ {
++// XD Netplay -- automatic pad buffer sizing. Tuning constants live here so the
++// whole policy is readable in one place; the decision loop that uses them is
++// NetPlayServer::UpdateAutoPadBuffer, further down.
++//
++// WHY THE HOST OWNS THIS: NetPlayServer::AdjustPadBufferSize is the only writer
++// of the session's buffer and it broadcasts MessageID::PadBuffer to every
++// client, so anything decided here is synced by construction. Never compute it
++// per-client -- two clients picking different numbers is the bug this avoids.
++//
++// THE FORMULA
++//   target = ceil(ping_ms / 16.67) + AUTOBUF_SAFETY_FRAMES, clamped
++//
++// 16.67 ms is one frame at 59.94 Hz. In fixed-delay netplay a client holds its
++// own pad for `buffer` frames before feeding it to the CPU, and puts those same
++// states on the wire in the process, so the buffer buys the network
++// buffer * 16.67 ms to land a remote pad before anybody stalls.
++//
++// It is the full ROUND trip that has to fit, not half of it: both sides stall
++// on each other through the host relay, and Player::ping is already an RTT
++// (host -> client -> host, from the 1 Hz Ping/Pong pair in ThreadFunc/OnData).
++// Measured on the transatlantic sessions this fork exists for, a ~200 ms link
++// needed ~12 frames, and 200 / 16.67 = 12.0. A half-RTT model would have said 6
++// and stuttered continuously -- which is what the fixed default of 5 did.
++// Raising a real 200 ms session from 5 to 10 cut the average per-frame stall
++// from 7.4 ms to 2.3 ms.
++namespace
++{
++// ceil(ping_ms / 16.667) in integer math: 1/16.667 == 3/50.
++constexpr u32 AUTOBUF_FRAME_NUM = 3;
++constexpr u32 AUTOBUF_FRAME_DEN = 50;
++// Headroom for jitter and for the frame a packet just missed. Two frames is
++// ~33 ms, about the peak-to-mean jitter seen on the real 200-300 ms links.
++constexpr u32 AUTOBUF_SAFETY_FRAMES = 2;
++// 3 frames = 50 ms, below which the buffer is not the bottleneck; 20 frames =
++// 333 ms, past which the added input delay is worse than the stutter it cures.
++constexpr u32 AUTOBUF_MIN_FRAMES = 3;
++constexpr u32 AUTOBUF_MAX_FRAMES = 20;
++// Hysteresis, in 1 Hz samples. Raising is quick (a too-small buffer is felt on
++// every single frame); lowering is deliberately 10x lazier and steps down one
++// frame at a time, because a too-large buffer only costs a little input delay.
++constexpr u32 AUTOBUF_RAISE_SAMPLES = 3;   // ~3 s of agreement before raising
++constexpr u32 AUTOBUF_LOWER_SAMPLES = 30;  // ~30 s of agreement before lowering
++// Dead band: never lower unless the measurement says there are at least this
++// many frames of slack, so the resting size is need..need+2 rather than exactly
++// need. Without it a ping sitting on a frame boundary would toggle the buffer
++// forever; widening it from 2 to 3 cut simulated changes on a spiky 1-hour
++// trace by a third (0.85 -> 0.63 per minute) for one frame of extra delay.
++constexpr u32 AUTOBUF_LOWER_SLACK = 3;
++// Floor on the time between two automatic changes, whatever the streaks say.
++constexpr u64 AUTOBUF_COOLDOWN_MS = 5000;
++// Quiet windows. Chunked save/code sync saturates the link, and pings taken
++// during or just after a boot are meaningless; a join/part is a smaller
++// disturbance but still worth one clean sample.
++constexpr u64 AUTOBUF_SETTLE_GAME_MS = 10000;
++constexpr u64 AUTOBUF_SETTLE_ROSTER_MS = 2000;
++
++u32 AutoBufferTargetForPing(u32 ping_ms)
++{
++  const u32 frames = (ping_ms * AUTOBUF_FRAME_NUM + AUTOBUF_FRAME_DEN - 1) / AUTOBUF_FRAME_DEN;
++  return std::clamp(frames + AUTOBUF_SAFETY_FRAMES, AUTOBUF_MIN_FRAMES, AUTOBUF_MAX_FRAMES);
++}
++}  // namespace
++
+ NetPlayServer::~NetPlayServer()
+ {
+   // A guest's submitted team lives in the host's socket-3 save; hand that save
+   // back to its owner now the room is gone, so the next solo boot (or the next
+-  // guest who submits nothing) uses the host's own team again.
++  // guest who submits nothing) uses the host's own team again -- and take the
++  // .bak/.tmp copies of it with it, so nobody can read their opponent's spread
++  // after the fact.
++  //
++  // Note this can land while emulation is still shutting down (NetPlayQuit
++  // resets the client, which stops the game asynchronously, then resets the
++  // server). OnRoomClosed defers the work until the GBA cores have flushed;
++  // doing it inline here would be undone by the mGBA core's own save writeback.
+   if (m_dialog)
+     m_dialog->OnRoomClosed();
+ 
+@@ -178,6 +249,10 @@ NetPlayServer::NetPlayServer(const u16 port, const bool forward_port, NetPlayUI*
+     m_do_loop = true;
+     m_thread = std::thread(&NetPlayServer::ThreadFunc, this);
+     m_target_buffer_size = 5;
++    // Opt-out automatic buffer sizing (UpdateAutoPadBuffer). Snapshot the
++    // config here; the host UI flips it live through SetAutoPadBufferEnabled.
++    m_auto_buffer_enabled.store(Config::Get(Config::NETPLAY_AUTO_BUFFER));
++    m_auto_buffer_was_enabled = m_auto_buffer_enabled.load();
+     m_chunked_data_thread = std::thread(&NetPlayServer::ChunkedDataThreadFunc, this);
+ 
+ #ifdef USE_UPNP
+@@ -282,6 +357,11 @@ void NetPlayServer::ThreadFunc()
+       m_index.SetInGame(m_is_running);
+ 
+       m_update_pings = false;
++
++      // Same 1 Hz tick that refreshes Player::ping is the sampling clock for
++      // the automatic buffer. Uses the pings measured on the PREVIOUS tick,
++      // which is exactly what we want -- fresh ones are still in flight.
++      UpdateAutoPadBuffer();
+     }
+ 
+     ENetEvent netEvent;
+@@ -522,6 +602,13 @@ ConnectionError NetPlayServer::OnConnect(ENetPeer* incoming_connection, sf::Pack
+     UpdateWiimoteMapping();
+   }
+ 
++  // The new player has not answered a ping yet, and the handshake traffic just
++  // skewed everyone else's. Let the automatic buffer take one clean sample
++  // before it believes anything (netplay thread owns these fields).
++  m_auto_buffer_raise_streak = 0;
++  m_auto_buffer_lower_streak = 0;
++  m_auto_buffer_quiet_until_ms = Common::Timer::NowMs() + AUTOBUF_SETTLE_ROSTER_MS;
++
+   return ConnectionError::NoError;
+ }
+ 
+@@ -530,6 +617,11 @@ unsigned int NetPlayServer::OnDisconnect(const Client& player)
+ {
+   const PlayerId pid = player.pid;
+ 
++  // Roster change: same reasoning as in OnConnect.
++  m_auto_buffer_raise_streak = 0;
++  m_auto_buffer_lower_streak = 0;
++  m_auto_buffer_quiet_until_ms = Common::Timer::NowMs() + AUTOBUF_SETTLE_ROSTER_MS;
++
+   if (m_is_running)
+   {
+     for (PlayerId& mapping : m_pad_map)
+@@ -714,6 +806,175 @@ void NetPlayServer::AdjustPadBufferSize(unsigned int size)
+   }
+ }
+ 
++// Automatic pad buffer sizing. Formula, rationale and every tuning constant are
++// documented on the AUTOBUF_* block at the top of this file.
++//
++// called from ---NETPLAY--- thread only (the 1 Hz ping tick in ThreadFunc).
++// m_players and every m_auto_buffer_* field except the atomic flag are owned by
++// this thread, so nothing here locks.
++void NetPlayServer::UpdateAutoPadBuffer()
++{
++  const bool enabled = m_auto_buffer_enabled.load();
++  const u64 now_ms = Common::Timer::NowMs();
++
++  // Re-enabled from the UI: start from a clean slate and take one settled
++  // sample before touching anything.
++  if (enabled && !m_auto_buffer_was_enabled)
++  {
++    m_auto_buffer_raise_streak = 0;
++    m_auto_buffer_lower_streak = 0;
++    m_auto_buffer_quiet_until_ms = now_ms + AUTOBUF_SETTLE_ROSTER_MS;
++  }
++  m_auto_buffer_was_enabled = enabled;
++  if (!enabled)
++    return;
++
++  // Host input authority has no single host-owned buffer to size: each client
++  // sets its own (NETPLAY_CLIENT_BUFFER_SIZE) and AdjustPadBufferSize does not
++  // even broadcast. Leave those modes alone.
++  if (m_host_input_authority)
++    return;
++
++  // Boot/stop is a huge ping disturbance in both directions.
++  if (m_is_running != m_auto_buffer_was_running)
++  {
++    m_auto_buffer_was_running = m_is_running;
++    m_auto_buffer_raise_streak = 0;
++    m_auto_buffer_lower_streak = 0;
++    m_auto_buffer_quiet_until_ms = now_ms + AUTOBUF_SETTLE_GAME_MS;
++    return;
++  }
++
++  // A start is in flight: SyncSaveData/SyncCodes are pushing megabytes and the
++  // pings they produce are pure noise. Hold, and re-settle once it lands.
++  if (m_start_pending)
++  {
++    m_auto_buffer_raise_streak = 0;
++    m_auto_buffer_lower_streak = 0;
++    m_auto_buffer_quiet_until_ms = now_ms + AUTOBUF_SETTLE_GAME_MS;
++    return;
++  }
++
++  if (now_ms < m_auto_buffer_quiet_until_ms)
++    return;
++
++  // Nobody to be late from. (The host's own loopback client always reports ~0.)
++  if (m_players.size() < 2)
++  {
++    m_auto_buffer_raise_streak = 0;
++    m_auto_buffer_lower_streak = 0;
++    return;
++  }
++
++  // Only players whose pads other clients actually block on should drive the
++  // buffer; a spectator's bad link stalls nobody but itself. If no mapping
++  // exists yet (early lobby), fall back to everyone.
++  u32 max_ping = 0;
++  bool any_mapped = false;
++  for (const auto& [pid, client] : m_players)
++  {
++    if (!PlayerHasControllerMapped(pid))
++      continue;
++    any_mapped = true;
++    max_ping = std::max(max_ping, client.ping);
++  }
++  if (!any_mapped)
++  {
++    for (const auto& client : std::views::values(m_players))
++      max_ping = std::max(max_ping, client.ping);
++  }
++
++  // No pong has come back yet -- 0 is "unknown", not "instant".
++  if (max_ping == 0)
++    return;
++
++  const u32 need = AutoBufferTargetForPing(max_ping);
++  const u32 current = m_target_buffer_size;
++
++  if (need > current)
++  {
++    m_auto_buffer_lower_streak = 0;
++    ++m_auto_buffer_raise_streak;
++  }
++  else if (need + AUTOBUF_LOWER_SLACK <= current)
++  {
++    m_auto_buffer_raise_streak = 0;
++    ++m_auto_buffer_lower_streak;
++  }
++  else
++  {
++    // Inside the dead band: the current size is right. Forget both streaks so
++    // a change always needs its full run of *consecutive* samples.
++    m_auto_buffer_raise_streak = 0;
++    m_auto_buffer_lower_streak = 0;
++    return;
++  }
++
++  if (now_ms - m_auto_buffer_last_change_ms < AUTOBUF_COOLDOWN_MS)
++    return;
++
++  u32 next = current;
++  const char* why = nullptr;
++  if (m_auto_buffer_raise_streak >= AUTOBUF_RAISE_SAMPLES)
++  {
++    // Jump straight to what the link needs: starvation hurts every frame until
++    // it is fixed, so there is nothing to gain by creeping upward.
++    next = need;
++    why = "raise";
++  }
++  else if (m_auto_buffer_lower_streak >= AUTOBUF_LOWER_SAMPLES)
++  {
++    // Give back one frame at a time. Shedding delay is never urgent, and a slow
++    // walk down re-measures at each step instead of overshooting into stutter.
++    // (The dead band already makes a lower vote impossible at the floor; the
++    // guard is here so the unsigned subtraction can never wrap regardless.)
++    next = current > AUTOBUF_MIN_FRAMES ? current - 1 : current;
++    why = "lower";
++  }
++
++  if (why == nullptr || next == current)
++    return;
++
++  m_auto_buffer_raise_streak = 0;
++  m_auto_buffer_lower_streak = 0;
++  m_auto_buffer_last_change_ms = now_ms;
++
++  const std::string detail =
++      fmt::format("buf {}->{} ping={}ms need={} why={} players={} running={}", current, next,
++                  max_ping, need, why, m_players.size(), m_is_running ? 1 : 0);
++  NOTICE_LOG_FMT(NETPLAY, "AutoBuffer {}", detail);
++#ifdef HAS_LIBMGBA
++  // Same session log and same sock=0 channel as the NetLat lines, so a user's
++  // shared log shows the buffer decision right next to the stall it answered.
++  // tick=0: this is the netplay thread, which must not read CoreTiming
++  // (CoreTimingManager::GetTicks is documented CPU-thread-only).
++  GBADetectLog::LogEvent(0, 0, "autobuf", detail);
++#endif
++
++  AdjustPadBufferSize(next);
++}
++
++void NetPlayServer::SetPadBufferSizeManual(unsigned int size)
++{
++  // Manual wins, permanently: the host asked for a number, so the sizer stops
++  // rather than overwriting it on the next tick. The host UI mirrors this by
++  // clearing its "Auto" checkbox, so the reason is visible, not mysterious.
++  SetAutoPadBufferEnabled(false);
++  AdjustPadBufferSize(size);
++}
++
++// called from ---GUI--- thread
++void NetPlayServer::SetAutoPadBufferEnabled(const bool enabled)
++{
++  if (m_auto_buffer_enabled.exchange(enabled) == enabled)
++    return;
++
++  Config::SetBaseOrCurrent(Config::NETPLAY_AUTO_BUFFER, enabled);
++  INFO_LOG_FMT(NETPLAY, "Automatic pad buffer {}.", enabled ? "enabled" : "disabled");
++  // The netplay thread picks the change up on its next tick and resets its own
++  // hysteresis state there; nothing else to do from here.
++}
++
+ void NetPlayServer::SetHostInputAuthority(const bool enable)
+ {
+   std::lock_guard lkg(m_crit.game);
+diff --git a/Source/Core/Core/NetPlayServer.h b/Source/Core/Core/NetPlayServer.h
+index ebd2669..f4b5fb9 100644
+--- a/Source/Core/Core/NetPlayServer.h
++++ b/Source/Core/Core/NetPlayServer.h
+@@ -5,6 +5,7 @@
+ 
+ #include <SFML/Network/Packet.hpp>
+ 
++#include <atomic>
+ #include <map>
+ #include <mutex>
+ #include <optional>
+@@ -62,7 +63,21 @@ public:
+   PadMappingArray GetWiimoteMapping() const;
+   void SetWiimoteMapping(const PadMappingArray& mappings);
+ 
++  // Low-level, already-synced setter: stores the value and broadcasts
++  // MessageID::PadBuffer to every client. Used for session setup and by the
++  // automatic sizer. A host UI editing the number by hand must NOT call this
++  // directly -- use SetPadBufferSizeManual so auto stands down.
+   void AdjustPadBufferSize(unsigned int size);
++
++  // The host typed/stepped a buffer value. Manual always wins: this switches
++  // the automatic sizer off (and persists that) before applying the value, so
++  // auto can never overwrite the host's number a second later.
++  void SetPadBufferSizeManual(unsigned int size);
++
++  // Opt-out switch for the automatic sizer (Config::NETPLAY_AUTO_BUFFER).
++  void SetAutoPadBufferEnabled(bool enabled);
++  bool IsAutoPadBufferEnabled() const { return m_auto_buffer_enabled.load(); }
++
+   void SetHostInputAuthority(bool enable);
+ 
+   void KickPlayer(PlayerId player);
+@@ -152,6 +167,9 @@ private:
+   void SetupIndex();
+   bool PlayerHasControllerMapped(PlayerId pid) const;
+ 
++  // ---NETPLAY--- thread only, once per second off the ping tick.
++  void UpdateAutoPadBuffer();
++
+   // pulled from OnConnect()
+   void AssignNewUserAPad(const Client& player);
+   // pulled from OnConnect()
+@@ -179,6 +197,17 @@ private:
+   PlayerId m_current_golfer = 1;
+   PlayerId m_pending_golfer = 0;
+ 
++  // --- automatic pad buffer (host-owned; see UpdateAutoPadBuffer) ---
++  // Toggled from the GUI thread, read from the netplay thread.
++  std::atomic<bool> m_auto_buffer_enabled{true};
++  // Everything below is owned by the ---NETPLAY--- thread and never locked.
++  bool m_auto_buffer_was_enabled = true;
++  bool m_auto_buffer_was_running = false;
++  unsigned int m_auto_buffer_raise_streak = 0;
++  unsigned int m_auto_buffer_lower_streak = 0;
++  u64 m_auto_buffer_quiet_until_ms = 0;
++  u64 m_auto_buffer_last_change_ms = 0;
++
+   std::map<PlayerId, Client> m_players;
+ 
+   std::unordered_map<u32, std::vector<std::pair<PlayerId, u64>>> m_timebase_by_frame;
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 8115f60..92f9f47 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -6,16 +6,19 @@
+ #include <QAction>
+ #include <QActionGroup>
+ #include <QApplication>
++#include <QCheckBox>
+ #include <QClipboard>
+ #include <QComboBox>
++#include <QDialogButtonBox>
+ #include <QFileDialog>
+ #include <QGridLayout>
+ #include <QGroupBox>
++#include <QHBoxLayout>
+ #include <QHeaderView>
+-#include <QInputDialog>
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QMenu>
++#include <QPlainTextEdit>
+ #include <QPointer>
+ #include <QPushButton>
+ #include <QRegularExpression>
+@@ -24,6 +27,7 @@
+ #include <QSplitter>
+ #include <QTableWidget>
+ #include <QTextBrowser>
++#include <QVBoxLayout>
+ 
+ #include <algorithm>
+ #include <thread>
+@@ -68,6 +72,7 @@
+ 
+ #include "UICommon/DiscordPresence.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/UICommon.h"
+ 
+@@ -139,6 +144,12 @@ void NetPlayDialog::CreateMainLayout()
+   m_start_button = new QPushButton(tr("Start"));
+   m_buffer_size_box = new QSpinBox;
+   m_buffer_label = new QLabel(tr("Buffer:"));
++  m_auto_buffer_box = new QCheckBox(tr("Auto"));
++  m_auto_buffer_box->setToolTip(
++      tr("Size the netplay buffer automatically from the measured ping, and keep it sized as the "
++         "connection changes.\nA 200 ms connection needs about 12 frames of buffer; the old fixed "
++         "default of 5 stutters badly on anything transatlantic.\nTyping a buffer value by hand "
++         "turns this off, and your value is kept."));
+   m_quit_button = new QPushButton(tr("Quit"));
+   m_splitter = new QSplitter(Qt::Horizontal);
+   m_menu_bar = new QMenuBar(this);
+@@ -259,8 +270,9 @@ void NetPlayDialog::CreateMainLayout()
+   options_widget->addWidget(m_start_button, 0, 0, Qt::AlignVCenter);
+   options_widget->addWidget(m_buffer_label, 0, 1, Qt::AlignVCenter);
+   options_widget->addWidget(m_buffer_size_box, 0, 2, Qt::AlignVCenter);
+-  options_widget->addWidget(m_quit_button, 0, 3, Qt::AlignVCenter | Qt::AlignRight);
+-  options_widget->setColumnStretch(3, 1000);
++  options_widget->addWidget(m_auto_buffer_box, 0, 3, Qt::AlignVCenter);
++  options_widget->addWidget(m_quit_button, 0, 4, Qt::AlignVCenter | Qt::AlignRight);
++  options_widget->setColumnStretch(4, 1000);
+ 
+   m_main_layout->addLayout(options_widget, 2, 0, 1, -1, Qt::AlignRight);
+   m_main_layout->setRowStretch(1, 1000);
+@@ -377,9 +389,24 @@ void NetPlayDialog::ConnectWidgets()
+     const auto client = Settings::Instance().GetNetPlayClient();
+     const auto server = Settings::Instance().GetNetPlayServer();
+     if (server && !m_host_input_authority)
+-      server->AdjustPadBufferSize(value);
++    {
++      // A hand-typed value always wins over the automatic sizer, which would
++      // otherwise overwrite it within a few seconds. Untick the box first so
++      // the host can SEE why auto stopped -- SetPadBufferSizeManual would turn
++      // it off silently otherwise.
++      if (m_auto_buffer_box->isChecked())
++        m_auto_buffer_box->setChecked(false);
++      server->SetPadBufferSizeManual(value);
++    }
+     else
++    {
+       client->AdjustPadBufferSize(value);
++    }
++  });
++
++  connect(m_auto_buffer_box, &QCheckBox::toggled, this, [this](bool checked) {
++    if (const auto server = Settings::Instance().GetNetPlayServer())
++      server->SetAutoPadBufferEnabled(checked);
+   });
+ 
+   const auto hia_function = [this](bool enable) {
+@@ -431,6 +458,7 @@ void NetPlayDialog::ConnectWidgets()
+   // SaveSettings() - Save Hosting-Dialog Settings
+ 
+   connect(m_buffer_size_box, &QSpinBox::valueChanged, this, &NetPlayDialog::SaveSettings);
++  connect(m_auto_buffer_box, &QCheckBox::toggled, this, &NetPlayDialog::SaveSettings);
+   connect(m_savedata_none_action, &QAction::toggled, this, &NetPlayDialog::SaveSettings);
+   connect(m_savedata_load_only_action, &QAction::toggled, this, &NetPlayDialog::SaveSettings);
+   connect(m_savedata_load_and_write_action, &QAction::toggled, this, &NetPlayDialog::SaveSettings);
+@@ -566,6 +594,9 @@ void NetPlayDialog::show(std::string nickname, bool use_traversal)
+   // Only a joiner submits a team; the host edits its own saves directly.
+   m_submit_team_button->setHidden(is_hosting);
+   m_start_button->setHidden(!is_hosting);
++  // Only the host owns the session buffer, so only the host gets the Auto box.
++  // OnHostInputAuthorityChanged refines this once the mode is known.
++  m_auto_buffer_box->setHidden(!is_hosting);
+   m_kick_button->setHidden(!is_hosting);
+   m_assign_ports_button->setHidden(!is_hosting);
+   m_room_box->setHidden(!is_hosting);
+@@ -843,14 +874,23 @@ std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std
+   // Host side, NETPLAY thread. The write must finish before we return: the
+   // caller acks only afterwards, so the file is on disk before any Start can
+   // read it. Touches no widgets -- the caller relays the text into chat.
++  //
++  // The payload may carry an in-game trainer name ahead of the team; a client
++  // that predates that just sends the bare team (TeamInjector.h documents the
++  // grammar and both compatibility directions).
++  const XDNetplay::TeamSubmission submission = XDNetplay::ParseTeamSubmissionPayload(text);
+   std::string status;
+-  if (!XDNetplay::InjectGuestTeam(text, 2, &status))
++  if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+ }
+ 
+ void NetPlayDialog::OnRoomClosed()
+ {
++  // Restores the host's own team AND erases every remaining copy of the
++  // opponent's party (.bak/.tmp beside the save, netplay's NetPlayTemp GBA
++  // saves). May defer itself until emulation has fully stopped -- the mGBA
++  // core rewrites the save at teardown, so anything done sooner is undone.
+   XDNetplay::RestoreHostTeam(2);
+ }
+ 
+@@ -859,26 +899,68 @@ void NetPlayDialog::OnSubmitTeam()
+   // Joiner side. A pokepast.es link is resolved HERE, on the submitting
+   // client, so the host only ever parses plain text it was handed -- it never
+   // fetches a URL a stranger chose.
+-  QInputDialog dialog(this);
++  QDialog dialog(this);
+   dialog.setWindowTitle(tr("Submit Team"));
+-  dialog.setLabelText(tr("Paste a Showdown team export, or a pokepast.es link.\n"
+-                         "The host writes it into the save you'll play with."));
+-  dialog.setInputMode(QInputDialog::TextInput);
+-  dialog.setOption(QInputDialog::UsePlainTextEditForTextInput);
+-  dialog.resize(500, 400);
++
++  auto* dialog_layout = new QVBoxLayout(&dialog);
++  dialog_layout->addWidget(new QLabel(
++      tr("Paste a Showdown team export, or a pokepast.es link.\n"
++         "The host writes it into the save you'll play with."),
++      &dialog));
++
++  // In-game name, pre-filled with the netplay nickname so the common case is
++  // zero typing. Sanitized to what a Gen 3 save can actually hold (7
++  // characters from its own charset) BEFORE it is shown, so what the field
++  // says is what the opponent will see -- no silent surprise later.
++  auto* name_layout = new QHBoxLayout;
++  auto* name_edit = new QLineEdit(
++      QString::fromStdString(XDNetplay::EmeraldSave::SanitizeTrainerName(
++          Config::Get(Config::NETPLAY_NICKNAME))),
++      &dialog);
++  name_edit->setMaxLength(
++      static_cast<int>(XDNetplay::EmeraldSave::TRAINER_NAME_LEN));
++  name_edit->setPlaceholderText(tr("In-game name"));
++  name_layout->addWidget(new QLabel(tr("In-game name (max 7):"), &dialog));
++  name_layout->addWidget(name_edit, 1);
++  dialog_layout->addLayout(name_layout);
++
++  auto* team_edit = new QPlainTextEdit(&dialog);
++  team_edit->setPlaceholderText(tr("Showdown export or pokepast.es link"));
++  dialog_layout->addWidget(team_edit, 1);
++
++  auto* buttons =
++      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
++  buttons->button(QDialogButtonBox::Ok)->setText(tr("Send"));
++  connect(buttons, &QDialogButtonBox::accepted, &dialog, &QDialog::accept);
++  connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
++  dialog_layout->addWidget(buttons);
++
++  dialog.resize(500, 440);
+   if (dialog.exec() != QDialog::Accepted)
+     return;
+ 
+-  const QString text = dialog.textValue().trimmed();
++  const QString text = team_edit->toPlainText().trimmed();
+   if (text.isEmpty())
+     return;
+ 
++  // Sanitize again on the way out: the field is a QLineEdit, so the user can
++  // still have typed something the Gen 3 charset has no byte for. An empty
++  // result simply means "no rename" -- the host keeps its own save's name.
++  const std::string trainer_name = XDNetplay::EmeraldSave::SanitizeTrainerName(
++      name_edit->text().toStdString());
++  if (trainer_name.empty() && !name_edit->text().trimmed().isEmpty())
++  {
++    DisplayMessage(
++        tr("That in-game name has no Gen 3 equivalent — sending the team without it."), "");
++  }
++
+   const QRegularExpression pokepaste_re(
+       QStringLiteral("^https?://pokepast\\.es/[A-Za-z0-9]+"));
+   const QRegularExpressionMatch match = pokepaste_re.match(text);
+   if (!match.hasMatch())
+   {
+-    Settings::Instance().GetNetPlayClient()->SendTeamSubmission(text.toStdString());
++    Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
++        XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name));
+     DisplayMessage(tr("Team sent to the host."), "");
+     return;
+   }
+@@ -886,13 +968,13 @@ void NetPlayDialog::OnSubmitTeam()
+   const std::string url = match.captured(0).toStdString() + "/raw";
+   DisplayMessage(tr("Fetching %1…").arg(match.captured(0)), "");
+   QPointer<NetPlayDialog> self(this);
+-  std::thread([self, url] {
++  std::thread([self, url, trainer_name] {
+     Common::HttpRequest request;
+     request.FollowRedirects();
+     Common::HttpRequest::Response response = request.Get(url);
+     if (!self)
+       return;
+-    QueueOnObject(self.data(), [self, response = std::move(response)] {
++    QueueOnObject(self.data(), [self, trainer_name, response = std::move(response)] {
+       if (!self)
+         return;
+       if (!response)
+@@ -902,7 +984,8 @@ void NetPlayDialog::OnSubmitTeam()
+       }
+       if (auto client = Settings::Instance().GetNetPlayClient())
+       {
+-        client->SendTeamSubmission(std::string(response->begin(), response->end()));
++        client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(
++            std::string(response->begin(), response->end()), trainer_name));
+         self->DisplayMessage(tr("Team sent to the host."), "");
+       }
+     });
+@@ -1017,10 +1100,23 @@ void NetPlayDialog::OnPadBufferChanged(u32 buffer)
+   QueueOnObject(this, [this, buffer] {
+     const QSignalBlocker blocker(m_buffer_size_box);
+     m_buffer_size_box->setValue(buffer);
++
++    // Say WHY the number moved. A host with Auto on did not touch the spinbox,
++    // so an unexplained jump would read as a glitch. (Ask the server rather
++    // than the checkbox: only the host runs the sizer, and only in fixed
++    // delay, which is exactly what IsAutoPadBufferEnabled reports.)
++    const auto server = Settings::Instance().GetNetPlayServer();
++    if (server && !m_host_input_authority && server->IsAutoPadBufferEnabled())
++    {
++      DisplayMessage(tr("Buffer size changed to %1 (automatic, from ping)").arg(buffer),
++                     "darkcyan");
++      return;
++    }
++
++    DisplayMessage(m_host_input_authority ? tr("Max buffer size changed to %1").arg(buffer) :
++                                            tr("Buffer size changed to %1").arg(buffer),
++                   "darkcyan");
+   });
+-  DisplayMessage(m_host_input_authority ? tr("Max buffer size changed to %1").arg(buffer) :
+-                                          tr("Buffer size changed to %1").arg(buffer),
+-                 "darkcyan");
+ 
+   m_buffer_size = static_cast<int>(buffer);
+ }
+@@ -1050,6 +1146,13 @@ void NetPlayDialog::OnHostInputAuthorityChanged(bool enabled)
+       m_buffer_label->setHidden(!enable_buffer);
+     }
+ 
++    // The automatic sizer is host-side and fixed-delay only: under host input
++    // authority each client owns its own buffer, so there is no single
++    // host-owned value to size and the server deliberately leaves it alone.
++    const bool show_auto_buffer = is_hosting && !enabled;
++    m_auto_buffer_box->setHidden(!show_auto_buffer);
++    m_auto_buffer_box->setEnabled(show_auto_buffer);
++
+     m_buffer_label->setText(enabled ? tr("Max Buffer:") : tr("Buffer:"));
+     if (enabled)
+     {
+@@ -1221,6 +1324,7 @@ std::string NetPlayDialog::FindGBARomPath(const std::array<u8, 20>& hash, std::s
+ void NetPlayDialog::LoadSettings()
+ {
+   const int buffer_size = Config::Get(Config::NETPLAY_BUFFER_SIZE);
++  const bool auto_buffer = Config::Get(Config::NETPLAY_AUTO_BUFFER);
+   const bool savedata_load = Config::Get(Config::NETPLAY_SAVEDATA_LOAD);
+   const bool savedata_write = Config::Get(Config::NETPLAY_SAVEDATA_WRITE);
+   const bool sync_all_wii_saves = Config::Get(Config::NETPLAY_SAVEDATA_SYNC_ALL_WII);
+@@ -1231,6 +1335,7 @@ void NetPlayDialog::LoadSettings()
+   const bool hide_remote_gbas = Config::Get(Config::NETPLAY_HIDE_REMOTE_GBAS);
+ 
+   m_buffer_size_box->setValue(buffer_size);
++  m_auto_buffer_box->setChecked(auto_buffer);
+ 
+   if (!savedata_load)
+     m_savedata_none_action->setChecked(true);
+@@ -1276,6 +1381,8 @@ void NetPlayDialog::SaveSettings()
+   else
+     Config::SetBase(Config::NETPLAY_BUFFER_SIZE, m_buffer_size_box->value());
+ 
++  Config::SetBase(Config::NETPLAY_AUTO_BUFFER, m_auto_buffer_box->isChecked());
++
+   const bool write_savedata = m_savedata_load_and_write_action->isChecked();
+   const bool load_savedata = write_savedata || m_savedata_load_only_action->isChecked();
+   Config::SetBase(Config::NETPLAY_SAVEDATA_LOAD, load_savedata);
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+index bf30b61..3e29294 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+@@ -148,6 +148,7 @@ private:
+   QPushButton* m_start_button;
+   QLabel* m_buffer_label;
+   QSpinBox* m_buffer_size_box;
++  QCheckBox* m_auto_buffer_box;
+ 
+   QActionGroup* m_savedata_style_group;
+   QAction* m_savedata_none_action;
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 7e34449..8b73543 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "DolphinQt/XDNetplay/TeamEditorDialog.h"
+ 
++#include <algorithm>
+ #include <thread>
+ #include <utility>
+ 
+@@ -11,6 +12,7 @@
+ #include <QGridLayout>
+ #include <QGroupBox>
+ #include <QLabel>
++#include <QLineEdit>
+ #include <QListWidget>
+ #include <QPlainTextEdit>
+ #include <QPointer>
+@@ -28,10 +30,13 @@
+ 
+ #include "Core/Config/MainSettings.h"
+ #include "Core/HW/GBACore.h"
++#include "Core/NetPlayProto.h"
+ 
+ #include "DolphinQt/QtUtils/NonDefaultQPushButton.h"
+ #include "DolphinQt/QtUtils/QueueOnObject.h"
++#include "DolphinQt/Settings.h"
+ 
++#include "UICommon/XDNetplay/Gen3Text.h"
+ #include "UICommon/XDNetplay/MonFactory.h"
+ #include "UICommon/XDNetplay/ShowdownParser.h"
+ 
+@@ -66,10 +71,19 @@ void TeamEditorDialog::CreateMainLayout()
+   m_role_combo = new QComboBox;
+   m_role_combo->addItem(tr("Host — GBA port 2"));
+   m_role_combo->addItem(tr("Guest — GBA port 3"));
++
++  // Trainer name: 7 characters is the hard Gen 3 limit, so the field enforces
++  // it rather than letting someone type a name that would be silently cut.
++  m_trainer_name_edit = new QLineEdit;
++  m_trainer_name_edit->setMaxLength(static_cast<int>(EmeraldSave::TRAINER_NAME_LEN));
++  m_trainer_name_edit->setPlaceholderText(tr("Trainer name"));
++
+   m_trainer_label = new QLabel(QString());
+   top_layout->addWidget(new QLabel(tr("Editing team for:")), 0, 0);
+   top_layout->addWidget(m_role_combo, 0, 1);
+-  top_layout->addWidget(m_trainer_label, 1, 0, 1, 2);
++  top_layout->addWidget(new QLabel(tr("Trainer name (max 7):")), 1, 0);
++  top_layout->addWidget(m_trainer_name_edit, 1, 1);
++  top_layout->addWidget(m_trainer_label, 2, 0, 1, 2);
+   top_layout->setColumnStretch(1, 1);
+   layout->addLayout(top_layout);
+ 
+@@ -136,6 +150,7 @@ void TeamEditorDialog::ReloadForRole()
+   m_party.clear();
+   m_save_path.clear();
+   m_trainer_label->setText(QString());
++  m_trainer_name_edit->clear();
+ 
+   QStringList messages;
+ 
+@@ -167,6 +182,25 @@ void TeamEditorDialog::ReloadForRole()
+   // Preferred ROM for the role, falling back to the other port's ROM (both
+   // point at the same imported Emerald dump in a launcher-made setup).
+   const int device = DeviceNumber();
++
++  // Competitive integrity. While this machine is HOSTING a room, the socket-3
++  // save is not "the guest slot" in any abstract sense -- it is the opponent's
++  // submitted party, EVs, IVs and natures included, written there so netplay
++  // can sync it at start. Showing it here would be a scouting tool. The host's
++  // own socket-2 save stays editable, and once the room closes the cleanup has
++  // already put the host's own team back in socket 3, so this unlocks by
++  // itself. (Joiners are unaffected: their local socket-3 save is their own --
++  // netplay runs a joiner from NetPlayTemp copies instead.)
++  // Gated on the ROOM, not on the running game: submissions arrive in the lobby
++  // and between battles, which is exactly when the game is not running.
++  if (device == 2 && Settings::Instance().GetNetPlayServer())
++  {
++    SetMessages({tr("The guest slot is hidden while you are hosting — it holds your opponent's "
++                    "submitted team. Close the room to see your own team here again.")});
++    RefreshPartyList();
++    return;
++  }
++
+   std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
+   if (rom.empty() || !File::Exists(rom))
+     rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
+@@ -225,8 +259,9 @@ void TeamEditorDialog::ReloadForRole()
+ 
+   std::string file_name = m_save_path;
+   SplitPath(m_save_path, nullptr, &file_name, nullptr);
+-  m_trainer_label->setText(tr("Trainer %1  ·  %2.sav")
+-                               .arg(QString::fromStdString(m_save->GetTrainerName()))
++  m_trainer_name_edit->setText(QString::fromStdString(m_save->GetTrainerName()));
++  m_trainer_label->setText(tr("Trainer ID %1  ·  %2.sav")
++                               .arg(m_save->GetTrainerPublicId())
+                                .arg(QString::fromStdString(file_name)));
+ #else
+   messages << tr("GBA support (libmgba) is not compiled into this build.");
+@@ -310,6 +345,43 @@ void TeamEditorDialog::OnImport()
+   }).detach();
+ }
+ 
++bool TeamEditorDialog::ApplyTrainerName(std::string* error)
++{
++  if (!m_save)
++  {
++    if (error)
++      *error = "no save loaded";
++    return false;
++  }
++
++  const std::string typed = m_trainer_name_edit->text().trimmed().toStdString();
++  if (typed.empty())
++  {
++    if (error)
++      *error = "trainer name cannot be empty";
++    return false;
++  }
++  if (typed == m_save->GetTrainerName())
++    return true;  // unchanged: leave the save (and the party's OT) alone
++
++  // A character the Gen 3 charset cannot hold fails here, naming itself, and
++  // nothing is written -- better than storing a '?' the player never chose.
++  if (!m_save->SetTrainerName(typed, error))
++    return false;
++
++  // Every Pokemon stores its OWN copy of the OT name, so a rename has to
++  // re-stamp the party too; otherwise the mons read as traded outsiders in
++  // game (the disobedience rules kick in above the badge cap). The OT *ID* is
++  // untouched, so they remain this save's Pokemon.
++  const auto ot_bytes =
++      Gen3Text::Encode(m_save->GetTrainerName(), EmeraldSave::TRAINER_NAME_LEN, error);
++  if (!ot_bytes)
++    return false;
++  for (Gen3Mon& mon : m_party)
++    std::copy(ot_bytes->begin(), ot_bytes->end(), mon.ot_name_raw.begin());
++  return true;
++}
++
+ void TeamEditorDialog::ApplyImportText(const std::string& text)
+ {
+   if (!m_save || !m_data)
+@@ -318,6 +390,17 @@ void TeamEditorDialog::ApplyImportText(const std::string& text)
+     return;
+   }
+ 
++  // Commit the typed trainer name FIRST: MonFactory::Build stamps each mon's
++  // OT from the save's trainer block, so importing before the rename lands
++  // would build the whole party under the previous owner's name.
++  std::string name_error;
++  if (!ApplyTrainerName(&name_error))
++  {
++    SetMessages({tr("Nothing imported — trainer name: %1")
++                     .arg(QString::fromStdString(name_error))});
++    return;
++  }
++
+   const std::vector<ShowdownSet> sets = ShowdownParser::ParseTeam(text);
+   if (sets.empty())
+   {
+@@ -375,19 +458,37 @@ void TeamEditorDialog::OnSave()
+     SetMessages({tr("No save loaded.")});
+     return;
+   }
++  // The room may have opened after this dialog last loaded (showEvent is the
++  // only reload). Writing the guest slot now would overwrite the opponent's
++  // submitted party with whatever was loaded before they sent it -- and leave
++  // a .bak of their team behind.
++  if (DeviceNumber() == 2 && Settings::Instance().GetNetPlayServer())
++  {
++    SetMessages({tr("NOT saved — the guest slot holds your opponent's team while you are "
++                    "hosting.")});
++    return;
++  }
++  // Name before party: WriteParty serializes the mons as they stand, and
++  // ApplyTrainerName is what brings their OT names in line with a rename.
++  std::string error;
++  if (!ApplyTrainerName(&error))
++  {
++    SetMessages({tr("NOT saved — trainer name: %1").arg(QString::fromStdString(error))});
++    return;
++  }
+   if (!m_save->WriteParty(m_party))
+   {
+     SetMessages({tr("Party is larger than 6.")});
+     return;
+   }
+-  std::string error;
+   if (!VerifiedWriteSaveFile(m_save_path, *m_save, &error))
+   {
+     SetMessages({tr("NOT saved — %1").arg(QString::fromStdString(error))});
+     return;
+   }
+-  SetMessages({tr("Saved %1 Pokémon to %2 (verified; previous save backed up as .bak)")
++  SetMessages({tr("Saved %1 Pokémon as %2 to %3 (verified; previous save backed up as .bak)")
+                    .arg(static_cast<int>(m_party.size()))
++                   .arg(QString::fromStdString(m_save->GetTrainerName()))
+                    .arg(QString::fromStdString(m_save_path))});
+ }
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+index c7deec1..8b0c702 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+@@ -17,6 +17,7 @@
+ 
+ class QComboBox;
+ class QLabel;
++class QLineEdit;
+ class QListWidget;
+ class QPlainTextEdit;
+ class QPushButton;
+@@ -54,6 +55,11 @@ private:
+   void OnSave();
+   void OnShowInFolder();
+ 
++  // Write the trainer-name field into m_save and re-stamp the party's OT names
++  // to match. Returns false with *error set if the typed name is not writable
++  // as Gen 3 text; nothing is modified in that case.
++  bool ApplyTrainerName(std::string* error);
++
+   std::optional<XDNetplay::Gen3Data> m_data;
+   std::optional<XDNetplay::EmeraldSave> m_save;
+   std::vector<XDNetplay::Gen3Mon> m_party;
+@@ -62,6 +68,7 @@ private:
+   bool m_fetching = false;
+ 
+   QComboBox* m_role_combo;
++  QLineEdit* m_trainer_name_edit;
+   QLabel* m_trainer_label;
+   QListWidget* m_party_list;
+   QPlainTextEdit* m_paste_edit;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 2f895f1..4ff2033 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -102,8 +102,14 @@ bool EnsureGbaConfig()
+   // Cheats (the $XD OU Fixes code) are off by default now and governed by the
+   // launcher's "OU rules ($XD OU Fixes)" toggle; don't force them on here.
+ 
+-  // Netplay tuned for the XD link: small fixed-delay buffer, no UPnP noise.
+-  Config::SetBaseOrCurrent(Config::NETPLAY_BUFFER_SIZE, 5);
++  // Netplay tuned for the XD link: fixed delay, no UPnP noise.
++  //
++  // The buffer is only re-seeded while automatic sizing is on, where 5 is just
++  // a starting point the host's sizer raises off the measured ping within a few
++  // seconds of a guest joining. A host who turned Auto off picked their number
++  // deliberately -- re-running this setup must not quietly stomp it back to 5.
++  if (Config::Get(Config::NETPLAY_AUTO_BUFFER))
++    Config::SetBaseOrCurrent(Config::NETPLAY_BUFFER_SIZE, 5);
+   Config::SetBaseOrCurrent(Config::NETPLAY_NETWORK_MODE, "fixeddelay");
+   Config::SetBaseOrCurrent(Config::NETPLAY_USE_UPNP, false);
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+index 5d9d66d..21f0dcb 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+@@ -168,6 +168,63 @@ std::string EmeraldSave::GetTrainerName() const
+                           TRAINER_NAME_LEN);
+ }
+ 
++bool EmeraldSave::SetTrainerName(const std::string& name, std::string* error)
++{
++  if (name.empty())
++  {
++    if (error)
++      *error = "trainer name cannot be empty";
++    return false;
++  }
++  // Length is counted in CODEPOINTS, not bytes: '♀' is three UTF-8 bytes and
++  // one Gen 3 byte. Encode() would silently truncate an over-long name, which
++  // is the wrong answer for a name a human just typed -- say so instead.
++  if (Gen3Text::DecodeUtf8(name).size() > TRAINER_NAME_LEN)
++  {
++    if (error)
++      *error = "trainer name is longer than " + std::to_string(TRAINER_NAME_LEN) + " characters";
++    return false;
++  }
++  // Encode first: it fails (leaving the save untouched) on any character the
++  // Gen 3 charset has no byte for, rather than writing a '?' placeholder.
++  const auto encoded = Gen3Text::Encode(name, TRAINER_NAME_LEN, error);
++  if (!encoded)
++    return false;
++
++  const size_t off = m_section_offsets[0] + TRAINER_NAME_OFFSET;
++  std::memcpy(m_raw.data() + off, encoded->data(), encoded->size());
++  // Encode() already 0xFF-pads the 7 usable bytes; byte 7 is the field's hard
++  // terminator, which the game keeps at 0xFF even for a 7-character name.
++  m_raw[off + TRAINER_NAME_LEN] = Gen3Text::TERMINATOR;
++  static_assert(TRAINER_NAME_OFFSET + TRAINER_NAME_FIELD_SIZE == TRAINER_GENDER_OFFSET,
++                "trainer name field must stop before the gender byte");
++  UpdateSectionChecksum(0);
++  return true;
++}
++
++std::string EmeraldSave::SanitizeTrainerName(const std::string& name)
++{
++  // Trim first: a leading space is an encodable character (0x00) and would
++  // otherwise eat one of the seven slots and render as a blank in-game.
++  const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
++  size_t begin = 0;
++  size_t end = name.size();
++  while (begin < end && is_space(name[begin]))
++    ++begin;
++  while (end > begin && is_space(name[end - 1]))
++    --end;
++
++  // Sanitize (drop unencodable) THEN trim again: dropping an unencodable
++  // character can expose new surrounding whitespace, e.g. "Lo 🐬 gan".
++  std::string trimmed = Gen3Text::Sanitize(name.substr(begin, end - begin), TRAINER_NAME_LEN);
++  while (!trimmed.empty() && is_space(trimmed.back()))
++    trimmed.pop_back();
++  size_t lead = 0;
++  while (lead < trimmed.size() && is_space(trimmed[lead]))
++    ++lead;
++  return trimmed.substr(lead);
++}
++
+ u32 EmeraldSave::GetTrainerId() const
+ {
+   return ReadU32(m_raw.data(), m_section_offsets[0] + TRAINER_ID_OFFSET);
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.h b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+index 2190bba..1396d91 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.h
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+@@ -54,6 +54,10 @@ public:
+   // Section 0 (Trainer Info) offsets - Emerald.
+   static constexpr size_t TRAINER_NAME_OFFSET = 0x0000;  // 7 bytes + 0xFF
+   static constexpr size_t TRAINER_NAME_LEN = 7;
++  // The field the game reserves is 8 bytes (pokeemerald: playerName is
++  // PLAYER_NAME_LENGTH + 1): 7 usable characters plus a byte that is ALWAYS the
++  // 0xFF terminator, even for a full-length name. Byte 8 is the gender.
++  static constexpr size_t TRAINER_NAME_FIELD_SIZE = TRAINER_NAME_LEN + 1;
+   static constexpr size_t TRAINER_GENDER_OFFSET = 0x0008;
+   static constexpr size_t TRAINER_ID_OFFSET = 0x000A;  // u32: low public, high secret
+ 
+@@ -91,6 +95,26 @@ public:
+   // -- trainer info (logical section 0) --------------------------------------
+ 
+   std::string GetTrainerName() const;
++
++  // Overwrite the trainer name in the trainer block and fix section 0's
++  // checksum. name is UTF-8 and must be 1..TRAINER_NAME_LEN (7) codepoints,
++  // every one of them encodable in the Gen 3 charset -- an unencodable
++  // character fails the call (with *error naming it) and leaves the save
++  // completely untouched, rather than writing a '?' or a truncated field.
++  //
++  // NOTE for callers that also rebuild the party: every Pokemon carries its own
++  // OT name copy, so renaming the trainer does NOT rename the mons already in
++  // the party. Set the name FIRST, then build/re-stamp the party from it.
++  bool SetTrainerName(const std::string& name, std::string* error = nullptr);
++
++  // Coerce arbitrary (possibly untrusted, possibly over-long) text into
++  // something SetTrainerName will accept: trim surrounding whitespace, map
++  // straight quotes to the charset's curly forms, DROP anything still
++  // unencodable, clamp to TRAINER_NAME_LEN codepoints. Returns "" when nothing
++  // survives -- callers decide whether that means "keep the existing name" or
++  // "reject the request".
++  static std::string SanitizeTrainerName(const std::string& name);
++
+   // Raw u32: low u16 = public (visible) trainer ID, high u16 = secret ID.
+   u32 GetTrainerId() const;
+   u32 GetTrainerPublicId() const { return GetTrainerId() & 0xFFFF; }
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Text.cpp b/Source/Core/UICommon/XDNetplay/Gen3Text.cpp
+index 6eb44e3..6ec4489 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Text.cpp
++++ b/Source/Core/UICommon/XDNetplay/Gen3Text.cpp
+@@ -167,4 +167,22 @@ std::optional<std::vector<u8>> Encode(const std::string& text, size_t max_len, s
+   }
+   return out;
+ }
++
++std::string Sanitize(const std::string& text, size_t max_len)
++{
++  std::u32string out;
++  for (const char32_t c : DecodeUtf8(text))
++  {
++    if (max_len != 0 && out.size() == max_len)
++      break;
++    char32_t mapped = c;
++    if (c == U'\'')
++      mapped = U'’';
++    else if (c == U'"')
++      mapped = U'”';
++    if (CanEncode(mapped))
++      out.push_back(mapped);
++  }
++  return EncodeUtf8(out);
++}
+ }  // namespace XDNetplay::Gen3Text
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Text.h b/Source/Core/UICommon/XDNetplay/Gen3Text.h
+index b9fa8a0..5dcf40e 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Text.h
++++ b/Source/Core/UICommon/XDNetplay/Gen3Text.h
+@@ -37,6 +37,14 @@ std::string Decode(const u8* buf, size_t max_len);
+ std::optional<std::vector<u8>> Encode(const std::string& text, size_t max_len,
+                                       std::string* error = nullptr);
+ 
++// Make text Gen 3-encodable by force: straight ASCII quotes become the
++// charset's curly forms, anything else unencodable is DROPPED, and the result
++// is clamped to max_len codepoints (0 = no clamp). Use this for input that
++// must degrade rather than fail (nicknames from a Showdown paste, a trainer
++// name that arrived over the wire); use Encode's error path when a human is
++// typing and deserves to be told which character is the problem.
++std::string Sanitize(const std::string& text, size_t max_len = 0);
++
+ // Minimal UTF-8 <-> codepoint helpers shared with MonFactory's sanitizer.
+ std::u32string DecodeUtf8(const std::string& text);
+ std::string EncodeUtf8(const std::u32string& text);
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.cpp b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+index 9295e5d..3d1f8ff 100644
+--- a/Source/Core/UICommon/XDNetplay/MonFactory.cpp
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+@@ -48,21 +48,11 @@ std::optional<int> ResolveMoveId(const std::string& name, const Gen3Data& data)
+ }
+ 
+ // Make text Gen 3-encodable: straight ASCII quotes become the charset's curly
+-// forms, anything else unencodable is dropped.
++// forms, anything else unencodable is dropped. (The implementation moved to
++// Gen3Text so the save's trainer-name setter shares exactly this behaviour.)
+ std::string SanitizeText(const std::string& text)
+ {
+-  std::u32string out;
+-  for (const char32_t c : Gen3Text::DecodeUtf8(text))
+-  {
+-    char32_t mapped = c;
+-    if (c == U'\'')
+-      mapped = U'’';
+-    else if (c == U'"')
+-      mapped = U'”';
+-    if (Gen3Text::CanEncode(mapped))
+-      out.push_back(mapped);
+-  }
+-  return Gen3Text::EncodeUtf8(out);
++  return Gen3Text::Sanitize(text);
+ }
+ 
+ // Gen 3 stat formula, integer division exactly as the game:
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index 938f181..91f0c4b 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -3,17 +3,29 @@
+ 
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ 
++#include <algorithm>
++#include <atomic>
++#include <mutex>
+ #include <optional>
++#include <string>
++#include <string_view>
++#include <utility>
+ #include <vector>
+ 
+ #include <fmt/format.h>
++#include <fmt/ranges.h>
+ 
++#include "Common/CommonPaths.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/Config/Config.h"
+ #include "Common/FileUtil.h"
++#include "Common/HookableEvent.h"
+ #include "Common/IOFile.h"
+ 
+ #include "Core/Config/MainSettings.h"
++#include "Core/Core.h"
++#include "Core/HW/GBADetectLog.h"
++#include "Core/System.h"
+ #ifdef HAS_LIBMGBA
+ #include "Core/HW/GBACore.h"
+ #endif
+@@ -29,6 +41,19 @@ namespace XDNetplay
+ namespace
+ {
+ constexpr const char* HOST_STASH_SUFFIX = ".hostteam";
++// Written next to the save on every successful injection, removed by the
++// end-of-session purge. Its presence means "this socket's save -- and the
++// throwaway files VerifiedWriteSaveFile leaves beside it -- may hold a guest's
++// party". It survives a crash, which is what lets the next room close finish a
++// cleanup that a killed process never got to run.
++constexpr const char* GUEST_MARK_SUFFIX = ".guestteam";
++// One level of undo, created by VerifiedWriteSaveFile (so: by both the team
++// editors and by every injection).
++constexpr const char* BACKUP_SUFFIX = ".bak";
++constexpr const char* TMP_SUFFIX = ".tmp";
++
++// See TeamInjector.h for the payload grammar.
++constexpr std::string_view NAME_HEADER_PREFIX = "Name:";
+ 
+ // The save path netplay will read for this socket, or empty when the setup
+ // isn't complete enough to have one.
+@@ -45,6 +70,159 @@ std::string SavePathForDevice(int device)
+   return {};
+ #endif
+ }
++
++// Zero a file's bytes before unlinking it, so an opponent's spread is not left
++// sitting in freed disk blocks. Best effort: a failed scrub never stops the
++// delete, and the return value reports only whether a file was there to remove.
++bool ScrubAndDelete(const std::string& path)
++{
++  if (!File::Exists(path))
++    return false;
++
++  {
++    File::IOFile file(path, "r+b");
++    if (file)
++    {
++      const u64 size = file.GetSize();
++      const std::vector<u8> zeros(static_cast<size_t>(std::min<u64>(size, 64 * 1024)), 0);
++      u64 done = 0;
++      while (!zeros.empty() && done < size)
++      {
++        const size_t chunk = static_cast<size_t>(std::min<u64>(zeros.size(), size - done));
++        if (!file.WriteBytes(zeros.data(), chunk))
++          break;
++        done += chunk;
++      }
++      file.Flush();
++    }
++  }
++
++  return File::Delete(path);
++}
++
++// Netplay's per-session staging copies of the HOST's GBA saves. On a joiner
++// these are the files the emulated GBAs actually run from, so NetPlayTemp2.sav
++// is a byte-for-byte copy of the HOST's party -- the opponent's team, sitting
++// in the same GBA folder users are told to fetch detect logs from. Netplay only
++// ever deletes them on the way IN to the next session, so without this they
++// outlive the room by however long the user goes without playing again.
++//
++// Format must stay in step with NetPlayClient.cpp (GetGBASavePath and
++// OnSyncSaveDataGBA both build this name).
++std::string NetPlayTempSavePath(int slot)
++{
++  return fmt::format("{}{}{}.sav", File::GetUserPath(D_GBAUSER_IDX), GBA_SAVE_NETPLAY, slot + 1);
++}
++
++std::mutex s_purge_mutex;
++// Device awaiting a purge once emulation is fully down; -1 when none is armed.
++std::atomic<int> s_pending_device{-1};
++// Registered once, kept for the life of the process. Destroying it from inside
++// its own callback would be legal (HookableEvent defers removal), but there is
++// nothing to gain from unregistering and re-registering per room.
++Common::EventHook s_state_hook;
++
++// Every place an opponent's party can live on this machine, cleared in one
++// pass. Idempotent, and a no-op when nothing was ever injected.
++//
++// MUST NOT run while the emulated GBAs are alive: the live mGBA core owns the
++// save file and rewrites it from its in-memory copy when it is torn down, so
++// anything done earlier is simply overwritten. RestoreHostTeam is what enforces
++// that ordering.
++void PurgeNow(int device)
++{
++  std::vector<std::string> notes;
++
++  const std::string save_path = SavePathForDevice(device);
++  if (!save_path.empty())
++  {
++    const std::string stash = save_path + HOST_STASH_SUFFIX;
++    const std::string mark = save_path + GUEST_MARK_SUFFIX;
++    const bool had_guest = File::Exists(mark);
++
++    if (File::Exists(stash))
++    {
++      // The host had a save of their own before the first injection: put it
++      // back. Both images are the same size, so nothing of the guest's is left
++      // past the end of the copy.
++      if (File::CopyRegularFile(stash, save_path))
++      {
++        File::Delete(stash);
++        notes.emplace_back("restored=host");
++      }
++      else
++      {
++        // Keep the stash so a later close can retry, rather than destroying the
++        // host's own team because one copy failed.
++        notes.emplace_back("restore=FAILED");
++      }
++    }
++    else if (had_guest)
++    {
++      // A guest team was injected and there is no stash, which means this
++      // socket had no save at all beforehand: the file was seeded from the
++      // bundled template purely to carry the guest's party. There is no host
++      // team to put back -- the file IS the opponent's data. (The old
++      // RestoreHostTeam returned early in exactly this case, leaving a
++      // stranger's spread as the host's permanent socket save.)
++      //
++      // Put the bundled template back rather than just deleting, so the
++      // launcher's "Team saves installed" check stays satisfied and the user is
++      // left where they started instead of one step behind it.
++      if (ScrubAndDelete(save_path))
++      {
++        const std::string template_path =
++            File::GetSysDirectory() +
++            (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++        if (File::Exists(template_path) && File::CopyRegularFile(template_path, save_path))
++          notes.emplace_back("reset=template");
++        else
++          notes.emplace_back("removed=seeded-save");
++      }
++    }
++
++    if (had_guest)
++    {
++      // .bak is whatever the save held BEFORE the most recent injection. On the
++      // first injection of a room that is the host's own team (harmless; the
++      // stash holds the same bytes). On the second and later injections -- a
++      // guest resubmitting, or a second guest in the same room -- it is a
++      // previous guest's complete party, and nothing ever deleted it.
++      if (ScrubAndDelete(save_path + BACKUP_SUFFIX))
++        notes.emplace_back("removed=bak");
++      // Only survives a failed rename, but when it does it is a full copy of
++      // the injected save.
++      if (ScrubAndDelete(save_path + TMP_SUFFIX))
++        notes.emplace_back("removed=tmp");
++      File::Delete(mark);
++    }
++  }
++
++  // Runs on hosts too: a player who joined someone's room earlier still has
++  // that host's party in NetPlayTemp2.sav.
++  for (int slot = 0; slot < 4; ++slot)
++  {
++    if (ScrubAndDelete(NetPlayTempSavePath(slot)))
++      notes.emplace_back(fmt::format("removed=netplaytemp{}", slot + 1));
++  }
++
++#ifdef HAS_LIBMGBA
++  // GBADetectLog is compiled only when USE_MGBA is on; the purge itself is not,
++  // because the files it removes can outlive an mGBA-less rebuild.
++  GBADetectLog::LogPostSession(fmt::format(
++      "sock={} teamcleanup {}", device,
++      notes.empty() ? std::string{"nothing-to-clean"} : fmt::format("{}", fmt::join(notes, " "))));
++#endif
++}
++
++void RunPendingPurge()
++{
++  const int device = s_pending_device.exchange(-1, std::memory_order_acq_rel);
++  if (device < 0)
++    return;
++  std::lock_guard lock(s_purge_mutex);
++  PurgeNow(device);
++}
+ }  // namespace
+ 
+ #ifdef HAS_LIBMGBA
+@@ -61,7 +239,70 @@ bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
+ }  // namespace
+ #endif
+ 
+-bool InjectGuestTeam(const std::string& showdown_text, int device, std::string* status)
++std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
++                                       const std::string& trainer_name)
++{
++  // A newline in the name would forge a second header/blank line, so flatten
++  // any line break to a space before it goes on the wire. The 7-character Gen 3
++  // clamp is deliberately NOT applied here: the host sanitizes what it receives
++  // and is the only side whose opinion counts.
++  std::string one_line;
++  one_line.reserve(trainer_name.size());
++  for (const char c : trainer_name)
++    one_line.push_back(c == '\n' || c == '\r' ? ' ' : c);
++
++  // Keep the line bounded; the header is framing, not a payload channel.
++  constexpr size_t MAX_NAME_LINE = 64;
++  if (one_line.size() > MAX_NAME_LINE)
++    one_line.resize(MAX_NAME_LINE);
++
++  if (one_line.find_first_not_of(" \t") == std::string::npos)
++    return showdown_text;  // nothing to say -- emit the old bare format
++
++  return std::string(NAME_HEADER_PREFIX) + " " + one_line + "\n\n" + showdown_text;
++}
++
++TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
++{
++  TeamSubmission out;
++
++  // The header only counts at byte 0. Anything else is team text.
++  if (payload.compare(0, NAME_HEADER_PREFIX.size(), NAME_HEADER_PREFIX) != 0)
++  {
++    out.showdown_text = payload;
++    return out;
++  }
++  const size_t eol = payload.find('\n');
++  if (eol == std::string::npos)
++  {
++    out.showdown_text = payload;
++    return out;
++  }
++
++  // The header line must be followed by a blank line. That is what makes a
++  // Showdown export -- whose first line is always followed by more set lines --
++  // impossible to mistake for a header.
++  size_t rest = eol + 1;
++  size_t blank_end = rest;
++  while (blank_end < payload.size() && (payload[blank_end] == ' ' || payload[blank_end] == '\t' ||
++                                        payload[blank_end] == '\r'))
++  {
++    ++blank_end;
++  }
++  if (blank_end >= payload.size() || payload[blank_end] != '\n')
++  {
++    out.showdown_text = payload;
++    return out;
++  }
++
++  std::string name = payload.substr(NAME_HEADER_PREFIX.size(), eol - NAME_HEADER_PREFIX.size());
++  out.trainer_name = std::move(name);  // trimmed/sanitized by the caller
++  out.showdown_text = payload.substr(blank_end + 1);
++  return out;
++}
++
++bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
++                     std::string* status)
+ {
+   const auto fail = [status](std::string message) {
+     if (status)
+@@ -89,6 +330,19 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+   // is guaranteed to be the file the guest receives.
+   const std::string save_path = HW::GBA::Core::GetSavePath(rom, device);
+ 
++  // Self-heal: if a previous session was killed before its cleanup ran, the
++  // save still holds THAT guest's party and .bak/.guestteam are still lying
++  // around. Finish that cleanup now, before this injection stashes anything --
++  // otherwise the stale party would be preserved as if it were the host's own.
++  // Only safe with emulation fully down, which is the case here: the server
++  // refuses team submissions while a battle is running.
++  if (File::Exists(save_path + GUEST_MARK_SUFFIX) &&
++      Core::IsUninitialized(Core::System::GetInstance()))
++  {
++    std::lock_guard lock(s_purge_mutex);
++    PurgeNow(device);
++  }
++
+   std::vector<u8> bytes;
+   if (!(File::Exists(save_path) && ReadFileBytes(save_path, &bytes)))
+   {
+@@ -113,6 +367,40 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+   if (sets.empty())
+     return fail("nothing recognizable in that paste");
+ 
++  // ORDER IS LOAD-BEARING: the trainer name goes in BEFORE the party is built.
++  // MonFactory::Build stamps each Pokemon's OT name from the DESTINATION save
++  // (save->GetTrainerName() below), so building first would give every mon the
++  // host's old OT while the trainer block said something else -- in-game they
++  // would read as traded outsiders (disobedience above the badge cap, "it does
++  // not seem to want to obey"), which is exactly the bug this ordering avoids.
++  //
++  // trainer_name is untrusted remote text, so it is sanitized, never rejected:
++  // a name that survives sanitizing is written, one that does not leaves the
++  // save's existing name in place. Either way the outcome is reported below.
++  std::string applied_name;
++  std::string dropped_name_note;
++  // A name of only spaces (or nothing at all) means "no name was asked for" and
++  // is not worth a line in chat; a name that HAD content but sanitized away to
++  // nothing is, because the guest will otherwise wonder why it did not take.
++  if (trainer_name.find_first_not_of(" \t\r\n") != std::string::npos)
++  {
++    const std::string sanitized = EmeraldSave::SanitizeTrainerName(trainer_name);
++    if (sanitized.empty())
++    {
++      dropped_name_note = "name unusable in-game, kept " + save->GetTrainerName();
++    }
++    else if (!save->SetTrainerName(sanitized, &error))
++    {
++      // Unreachable in practice -- SanitizeTrainerName only emits names
++      // SetTrainerName accepts -- but never silently pretend it worked.
++      dropped_name_note = fmt::format("name not set ({})", error);
++    }
++    else
++    {
++      applied_name = sanitized;
++    }
++  }
++
+   // Any party size is accepted: players run whatever format they like, and the
+   // game itself enforces its own rules at battle setup.
+   std::vector<Gen3Mon> built;
+@@ -125,6 +413,7 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+       continue;
+     }
+     std::string mon_error;
++    // GetTrainerName() here is the name set just above, which is the point.
+     auto mon = MonFactory::Build(set, *data, save->GetTrainerName(), save->GetTrainerId(),
+                                  &mon_error);
+     if (mon)
+@@ -141,12 +430,28 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+   if (!VerifiedWriteSaveFile(save_path, *save, &error))
+     return fail(fmt::format("save NOT written ({})", error));
+ 
++  // From here on this save, its fresh .bak (the pre-injection image) and any
++  // stray .tmp are opponent data. Mark them so the end-of-session purge knows
++  // to take them, even if this process never gets to run it.
++  if (!File::Exists(save_path + GUEST_MARK_SUFFIX))
++  {
++    File::IOFile mark(save_path + GUEST_MARK_SUFFIX, "wb");
++    if (mark)
++      mark.WriteString("A guest's team is in this socket's save. Removed when the room closes.\n");
++  }
++
+   if (status)
+   {
+     *status = skipped == 0 ?
+                   fmt::format("{} Pokemon written to the guest save", count) :
+                   fmt::format("{} Pokemon written to the guest save ({} entries skipped)", count,
+                               skipped);
++    // Always show the name that actually landed -- it is what the opponent
++    // will see across the link, and it may not be what was asked for.
++    if (!applied_name.empty())
++      *status += fmt::format(", playing as {}", applied_name);
++    else if (!dropped_name_note.empty())
++      *status += fmt::format(" ({})", dropped_name_note);
+   }
+   return true;
+ #endif
+@@ -154,13 +459,42 @@ bool InjectGuestTeam(const std::string& showdown_text, int device, std::string*
+ 
+ void RestoreHostTeam(int device)
+ {
+-  const std::string save_path = SavePathForDevice(device);
+-  if (save_path.empty())
+-    return;
+-  const std::string stash = save_path + HOST_STASH_SUFFIX;
+-  if (!File::Exists(stash))
+-    return;  // no guest team was ever written this session
+-  File::CopyRegularFile(stash, save_path);
+-  File::Delete(stash);
++  // THE ORDERING THIS EXISTS TO FIX
++  //
++  // ~NetPlayClient() calls StopGame() when a battle is live, which reaches
++  // Core::Stop() -- and Core::Stop() is ASYNCHRONOUS: it flips the state to
++  // Stopping and stops the CPU, then returns. The emulation thread tears the
++  // hardware down afterwards, and only then does ~CSIDevice_GBAEmu run
++  // Core::Stop() on the mGBA core, whose deinit rewrites the .sav from its
++  // in-memory savedata.
++  //
++  // MainWindow::NetPlayQuit() (and the Android equivalent) then does
++  // ResetNetPlayClient() immediately followed by ResetNetPlayServer(), so
++  // ~NetPlayServer -> OnRoomClosed() -> here lands on the UI thread while that
++  // teardown is still in flight. Doing the restore right now would copy the
++  // host's team back and delete the stash, and moments later the mGBA core
++  // would write the guest's party straight over it -- losing the host's team
++  // AND keeping the opponent's, the exact opposite of the intent.
++  //
++  // So: arm the purge, and run it only once emulation is Uninitialized. That
++  // state is notified from a scope guard at the very end of EmuThread, i.e.
++  // after HW::Shutdown() has destroyed the SI devices and the GBA cores have
++  // flushed. If emulation is already down (the common case -- stop the game,
++  // then close the room) it runs inline and the hook has nothing left to do.
++  static std::once_flag hook_once;
++  std::call_once(hook_once, [] {
++    // Registered outside s_purge_mutex on purpose: Register() takes the event's
++    // own lock, and the callback takes s_purge_mutex while that lock is held,
++    // so acquiring them in the other order here could deadlock.
++    s_state_hook = Core::AddOnStateChangedCallback([](Core::State state) {
++      if (state == Core::State::Uninitialized)
++        RunPendingPurge();
++    });
++  });
++
++  s_pending_device.store(device, std::memory_order_release);
++
++  if (Core::IsUninitialized(Core::System::GetInstance()))
++    RunPendingPurge();
+ }
+ }  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 0f56da2..fd84646 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -7,6 +7,52 @@
+ 
+ namespace XDNetplay
+ {
++// ---------------------------------------------------------------------------
++// MessageID::TeamData payload format
++// ---------------------------------------------------------------------------
++//
++// The payload is still ONE string (no second message type). A submission that
++// carries an in-game trainer name prefixes the Showdown text with a header
++// line and a blank line:
++//
++//     Name: Logan\n
++//     \n
++//     Blaziken @ Life Orb\n
++//     ...
++//
++// Rules, deliberately narrow so a Showdown export can never be mistaken for a
++// header:
++//  - the header is recognized ONLY at byte 0 of the payload, ONLY as the exact
++//    ASCII prefix "Name:" (case-sensitive), and ONLY when the line that
++//    follows it is blank. A Showdown set's first line is a species/nickname
++//    line and is never followed by a blank line, so a plain export cannot trip
++//    this.
++//  - everything after "Name:" up to the newline is the name (trimmed and
++//    sanitized host-side; see EmeraldSave::SanitizeTrainerName).
++//  - anything after the blank line is the Showdown text, byte for byte.
++//
++// Backward compatibility, both directions:
++//  - a payload with no header parses as name = "" and the whole payload as
++//    Showdown text, which is exactly what pre-name clients send;
++//  - a pre-name HOST handed a header payload feeds the two extra lines to
++//    ShowdownParser, which skips them as unrecognized -- the team still lands,
++//    only the rename is lost.
++struct TeamSubmission
++{
++  std::string trainer_name;  // "" when the payload carried no header
++  std::string showdown_text;
++};
++
++// Joiner side: wrap showdown_text with the trainer-name header. An empty (or
++// whitespace-only) name produces a bare payload identical to the old format.
++// Newlines in the name are replaced with spaces so they cannot forge framing.
++std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
++                                       const std::string& trainer_name);
++
++// Host side: split a received payload. Never fails -- an unparseable header is
++// simply treated as part of the team text.
++TeamSubmission ParseTeamSubmissionPayload(const std::string& payload);
++
+ // Writes a Showdown-format team into the GBA save the netplay host syncs to
+ // the guest, so a joiner can bring their own team to someone else's room.
+ //
+@@ -24,15 +70,44 @@ namespace XDNetplay
+ // device is the SI channel of the guest's socket (2 in this fork's 2-player
+ // layout). status, when given, receives a human-readable one-line summary
+ // suitable for relaying into the room chat.
+-bool InjectGuestTeam(const std::string& showdown_text, int device, std::string* status);
++//
++// trainer_name is the in-game name the guest asked for (TeamSubmission above);
++// "" means "leave the save's existing name alone". It is untrusted remote text:
++// it is sanitized down to at most 7 encodable Gen 3 characters, and a name that
++// sanitizes to nothing is dropped (the existing name stays) rather than
++// rejecting the whole team -- the status line always reports the name actually
++// written, so both players can see it before the battle.
++bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
++                     std::string* status);
+ 
+-// Put the host's own team back after a netplay room closes.
+-//
+-// A guest's submitted team overwrites the host's socket-3 save, and without
+-// this it would still be there next time the host played solo (or hosted
+-// someone who submitted nothing, who would then battle with a stranger's
+-// team). The first injection of a session stashes the host's save alongside
+-// it; this restores that stash and removes it. No stash means the host never
+-// had a guest team written this session, so nothing happens.
++// End-of-session cleanup: give the host their own team back AND leave no file
++// on this machine holding the opponent's party. Call it whenever a room ends,
++// from either side of the connection -- it works out for itself what is there.
++//
++// Competitive integrity, not just tidiness: a Gen 3 save carries every EV, IV
++// and nature, so any surviving copy lets a player read their opponent's exact
++// spread after (or during) a battle. What this takes:
++//
++//   <save>            the guest's injected party -- replaced from <save>.hostteam,
++//                     or deleted outright when the file only ever existed to
++//                     carry that party (no stash, template-seeded)
++//   <save>.bak        VerifiedWriteSaveFile's undo copy. After the second and
++//                     later injections of a room this is a PREVIOUS guest's
++//                     party, and nothing else ever deleted it
++//   <save>.tmp        a complete injected image, left behind by a failed rename
++//   <save>.guestteam  the marker that says the above may be dirty
++//   NetPlayTemp{1..4}.sav in <User>/GBA/ -- netplay's staging copies of the
++//                     HOST's saves. On a joiner NetPlayTemp2.sav *is* the
++//                     opponent's team; netplay only clears these on the way in
++//                     to the next session, so they otherwise persist forever
++//
++// The host's own team survives all of this: that is what the .hostteam stash is
++// for, and it is only released once the restore has actually succeeded.
++//
++// TIMING: this does not necessarily do the work now. The live mGBA core owns
++// the GBA save while a battle runs and rewrites it at teardown, so when a room
++// closes mid-battle the work is deferred until emulation reaches Uninitialized
++// and runs then. Callers do not need to care which happened. Every run appends
++// a "teamcleanup" line to the GBA detect log.
+ void RestoreHostTeam(int device);
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
