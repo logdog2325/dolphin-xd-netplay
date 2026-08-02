@@ -78,9 +78,49 @@ jobs:
           rm -rf Source/Android/app/src/main/assets/Sys
           cp -r Data/Sys Source/Android/app/src/main/assets/Sys
           rm -rf Source/Android/app/src/main/assets/Sys/Themes
+      # Every APK users install must carry the SAME signature, or Android refuses to install the
+      # new build over the old app and they have to uninstall -- which deletes their team saves.
+      # Without this the runner's throwaway debug keystore signs each build with a different key.
+      - name: Restore signing key
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "::error::ANDROID_KEYSTORE_B64 is not set; refusing to ship an unsignable APK."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.p12"
+          # Fail here, in seconds, rather than after the native build: an unreadable keystore is
+          # otherwise only discovered at the packaging step at the very end of the job.
+          keytool -list -keystore "$RUNNER_TEMP/release.p12" -storetype PKCS12 \
+            -storepass "$KEYSTORE_PASSWORD" > /dev/null
+          echo "keystore=$RUNNER_TEMP/release.p12" >> "$GITHUB_OUTPUT"
       - name: Build APK
         working-directory: Source/Android
-        run: ./gradlew assembleDebug --no-daemon
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          ./gradlew assembleDebug --no-daemon \
+            -Pkeystore="${{ steps.signing.outputs.keystore }}" \
+            -Pstorepass="$KEYSTORE_PASSWORD" \
+            -Pkeyalias="$KEY_ALIAS" \
+            -Pkeypass="$KEYSTORE_PASSWORD" \
+            -Pstoretype=PKCS12
+      - name: Confirm the APK carries the expected signature
+        run: |
+          set -euo pipefail
+          apk="$(ls Source/Android/app/build/outputs/apk/debug/*.apk | head -1)"
+          signer="$("$ANDROID_HOME"/build-tools/3*/apksigner verify --print-certs "$apk" \
+            | grep -m1 'SHA-256 digest' | awk '{print $NF}')"
+          echo "signer SHA-256: $signer"
+          if [ "$signer" != "${{ vars.ANDROID_SIGNER_SHA256 }}" ] && [ -n "${{ vars.ANDROID_SIGNER_SHA256 }}" ]; then
+            echo "::error::APK signer changed -- users could not update over their existing install."
+            exit 1
+          fi
       - name: Verify APK contents
         run: |
           set -euo pipefail

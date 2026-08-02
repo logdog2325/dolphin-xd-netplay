@@ -1,0 +1,60 @@
+From 4bb7b4e43b4ad57dda88d2ab0b00d57d63432dae Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 2 Aug 2026 10:47:53 -0700
+Subject: [PATCH] Sign the shipped APK with a stable key
+
+Users install the debug build type -- it is JNI-debuggable and unminified,
+which is what the native GBA and netplay work needs -- and Gradle signs that
+with a debug keystore the CI runner generates fresh on every run. Two builds
+therefore never share a signature, and Android refuses to install over an app
+signed by a different key. Every update meant uninstalling first, and uninstall
+takes getExternalFilesDir() with it: team saves, the Emerald copy, the PBR
+save, all of it.
+
+So the debug type now uses the release signing config whenever a key is
+supplied, and the store type is stated rather than inferred, since the CI key
+is a PKCS12 bundle and the default is JKS.
+
+This has to be right before the first release anybody keeps: the key that ships
+first is the key every later update must match.
+---
+ Source/Android/app/build.gradle.kts | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/Source/Android/app/build.gradle.kts b/Source/Android/app/build.gradle.kts
+index 95e55bc..620a27d 100644
+--- a/Source/Android/app/build.gradle.kts
++++ b/Source/Android/app/build.gradle.kts
+@@ -57,6 +57,11 @@ android {
+                 storePassword = project.property("storepass").toString()
+                 keyAlias = project.property("keyalias").toString()
+                 keyPassword = project.property("keypass").toString()
++                // The CI key is a PKCS12 bundle. Left unset this defaults to JKS and the build
++                // fails to read the store at all, so it is stated rather than inferred.
++                if (project.hasProperty("storetype")) {
++                    storeType = project.property("storetype").toString()
++                }
+             }
+         }
+     }
+@@ -81,6 +86,17 @@ android {
+         // Signed by debug key disallowing distribution on Play Store.
+         // Attaches "debug" suffix to version and package name, allowing installation alongside the release build.
+         debug {
++            // This fork ships the debug type -- it is JNI-debuggable and unminified, which is what
++            // the native GBA/netplay work needs -- so it is what users actually install. Without a
++            // supplied key Gradle signs it with a debug keystore that CI regenerates on every run,
++            // and Android refuses to install a new build over an app signed by a different key:
++            // every update would mean uninstall first, which deletes getExternalFilesDir() and with
++            // it the user's team saves, ROM copy and PBR save. Signing with the release key when
++            // one is available is what makes updating in place possible at all.
++            if (project.hasProperty("keystore")) {
++                signingConfig = signingConfigs.getByName("release")
++            }
++
+             resValue("string", "app_name_suffixed", "XD Netplay")
+             applicationIdSuffix = ".debug"
+             versionNameSuffix = "-debug"
+-- 
+2.39.5 (Apple Git-154)
+
