@@ -52,7 +52,16 @@ jobs:
           git am ../ci/patches/*.patch
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
           git remote add mine "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git push -f mine xd-netplay
+          # Retry: a cancelled or overlapping run leaves refs/heads/xd-netplay at a value this
+          # push did not expect, and the server rejects it as a stale lock. The branch is rebuilt
+          # from scratch every run, so re-fetching and overwriting is always the right answer.
+          for attempt in 1 2 3; do
+            if git push -f mine xd-netplay; then break; fi
+            if [ "$attempt" = 3 ]; then echo "::error::Could not publish xd-netplay."; exit 1; fi
+            echo "push rejected (attempt $attempt), refetching"
+            git fetch mine xd-netplay || true
+            sleep 5
+          done
           if [ -n "$TAG" ]; then git push -f mine "refs/tags/$TAG"; fi
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
