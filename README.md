@@ -59,6 +59,49 @@ wrong file is caught immediately instead of failing mysteriously.
 6. On XD's GBA Connection screen, **touch nothing** — both GBAs link themselves
    in about 10–20 seconds. Each player sees and controls only their own GBA.
 
+## Importing teams
+
+**The host's saves are the ones that get played.** At Start, netplay copies the
+host's GBA saves to everyone in the room. That single fact explains both flows
+below, and it is why a guest who builds a team in their own Team Editor and then
+joins a room finds their team was not used — their local save was replaced by
+the host's. Guests hand their team over instead. It takes one button.
+
+### As the host
+
+Do this **before you open the room.**
+
+1. Open the **Team Editor**.
+2. Set the dropdown at the top to **Host — GBA port 2**. That is your slot.
+3. **Import** a Showdown export or a pokepast.es link, set your in-game name,
+   and **Save**.
+4. *Optional:* switch to **Guest — GBA port 3** and put a team there too. That
+   is the team your opponent plays with if they never submit one — useful for
+   testing alone, or for handing a friend a team. Leave it alone and a guest who
+   submits will simply overwrite it.
+5. Now open the room. From here on the **Guest — GBA port 3** slot is locked,
+   because it may already hold your opponent's submitted team.
+
+You will not see a **Submit Team** button while hosting. That is expected — the
+host's team comes from the editor, not from a submission.
+
+### As the guest
+
+Do **not** use your own Team Editor for this; it edits a save that netplay is
+about to replace.
+
+1. Join the room.
+2. Press **Submit Team** — on desktop it is in the room window, on Android it is
+   the button in the bottom-right where the host sees **Start**.
+3. Fill in **In-game name (max 7)** and paste a **Showdown export or a
+   pokepast.es link**, then press **Send**.
+4. A message appears in the room chat confirming the host received it. If you do
+   not see that message, it did not arrive — send it again before Start.
+
+You can submit any time before the host presses Start, and re-submitting
+replaces what you sent. A name with no Gen 3 equivalent is dropped and the team
+still goes through, so check the chat line if the name matters to you.
+
 ### If a GBA doesn't get detected
 
 Rare, but it happens: one socket links and the other just sits there. It is not
