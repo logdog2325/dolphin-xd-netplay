@@ -42,6 +42,14 @@ wrong file is caught immediately instead of failing mysteriously.
    and work the checklist green.
 3. Build a team in the **Team Editor** (paste a Showdown export or a
    pokepast.es link). You can set your in-game trainer name there too.
+
+   **Hosts: do this before you open the room.** Netplay sends *your* saves to
+   everyone at Start, so whatever is in your team slot when you press Start is
+   what you play with — there is no fixing it once the battle begins. The guest
+   slot is also locked for as long as your room is open, because by then it may
+   already hold your opponent's submitted team, and editing it would overwrite
+   what they sent and leave a copy of their spread on your disk. Set your team
+   first and the whole problem disappears.
 4. **Host** and share your code, or paste a code and **Join**. The host presses
    **Start**.
 5. Joining someone else's room? Press **Submit Team** before the host starts.
