@@ -68,7 +68,11 @@ locks, and at Start your saves are already on their way to everyone.
    when their team arrives — if you never see it, they have not sent one and the
    battle will use whatever is in your guest slot.
 7. Press **Start**.
-8. On XD's GBA Connection screen, **touch nothing.** Both GBAs link themselves
+8. In XD, go to **VS Mode → GBA vs GBA**, then set the rules for the battle —
+   battle type, level, clauses, whatever format you are playing — and start it.
+   You drive this part: the GameCube controller belongs to the host, so your
+   opponent cannot move the cursor even though they are in the session with you.
+9. On XD's GBA Connection screen, **touch nothing.** Both GBAs link themselves
    in about 10–20 seconds. Each player sees and controls only their own GBA.
 
 You will not see a **Submit Team** button while hosting. That is expected — the
@@ -87,8 +91,10 @@ about to replace with the host's, which is the single most common source of
    pokepast.es link**, then press **Send**.
 4. Check the room chat for the confirmation line. If it is not there, it did not
    arrive — send it again before the host starts.
-5. Wait for the host to press **Start**, then leave XD's GBA Connection screen
-   alone while both GBAs link.
+5. Wait for the host to press **Start**. The host then drives XD's menus to
+   **VS Mode → GBA vs GBA** and sets the rules — the GameCube controller is
+   theirs, so your buttons do nothing here and that is not a bug. Once you reach
+   the GBA Connection screen, leave it alone while both GBAs link.
 
 You can submit any time before Start, and re-submitting replaces what you sent.
 A name with no Gen 3 equivalent is dropped and the team still goes through, so
