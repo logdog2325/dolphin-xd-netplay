@@ -102,14 +102,19 @@ check the chat line if the name matters to you.
 
 ### If a GBA doesn't get detected
 
-Rare, but it happens: one socket links and the other just sits there. It is not
-stuck for good, and the timing is the whole trick:
+Sometimes a socket does not get picked up — one of them, or both. Nothing is
+broken and nothing is stuck for good. The timing is the whole trick:
 
 - **While a socket is still connecting, do not press B.** It backs you out of VS
   mode mid-handshake and the link can never complete. Let it work.
-- **Once a socket has clearly stalled** — the other one linked and this one has
-  shown nothing for 15–20 seconds — press **B** to back out of VS mode, go back
-  in, and try again. It has connected on the retry every time we have hit it.
+- **Once it has clearly stalled — 15–20 seconds with no progress — press B**,
+  back out of VS mode, go in again, and let it retry. This is the fix whether
+  one socket linked and the other is sitting there, or neither has connected at
+  all. It has come up on the retry every time we have hit it.
+
+Going back in re-arms the handshake and re-rolls its timing, which is why the
+second attempt succeeds. Retrying is the normal thing to do here, not a sign
+something is wrong with your setup.
 
 ## Good to know
 
