@@ -40,26 +40,9 @@ wrong file is caught immediately instead of failing mysteriously.
    folder. Open the app — the **XD Netplay Launcher** appears on startup and
    configures itself from that folder. **Android:** open the app → **XD Netplay**
    and work the checklist green.
-3. Build a team in the **Team Editor** (paste a Showdown export or a
-   pokepast.es link). You can set your in-game trainer name there too.
+3. Then follow [Playing a match](#playing-a-match) below.
 
-   **Hosts: do this before you open the room.** Netplay sends *your* saves to
-   everyone at Start, so whatever is in your team slot when you press Start is
-   what you play with — there is no fixing it once the battle begins. The guest
-   slot is also locked for as long as your room is open, because by then it may
-   already hold your opponent's submitted team, and editing it would overwrite
-   what they sent and leave a copy of their spread on your disk. Set your team
-   first and the whole problem disappears.
-4. **Host** and share your code, or paste a code and **Join**. The host presses
-   **Start**.
-5. Joining someone else's room? Press **Submit Team** before the host starts.
-   Your team and trainer name are sent over and used for the battle, so you do
-   not need the host to build anything for you and you never send them a save
-   file. Skip it and you play whatever team the host has in their guest slot.
-6. On XD's GBA Connection screen, **touch nothing** — both GBAs link themselves
-   in about 10–20 seconds. Each player sees and controls only their own GBA.
-
-## Importing teams
+## Playing a match
 
 **The host's saves are the ones that get played.** At Start, netplay copies the
 host's GBA saves to everyone in the room. That single fact explains both flows
@@ -67,9 +50,10 @@ below, and it is why a guest who builds a team in their own Team Editor and then
 joins a room finds their team was not used — their local save was replaced by
 the host's. Guests hand their team over instead. It takes one button.
 
-### As the host
+### Hosting a room
 
-Do this **before you open the room.**
+**Set your team before you open the room.** Once it is open your guest slot
+locks, and at Start your saves are already on their way to everyone.
 
 1. Open the **Team Editor**.
 2. Set the dropdown at the top to **Host — GBA port 2**. That is your slot.
@@ -77,30 +61,38 @@ Do this **before you open the room.**
    and **Save**.
 4. *Optional:* switch to **Guest — GBA port 3** and put a team there too. That
    is the team your opponent plays with if they never submit one — useful for
-   testing alone, or for handing a friend a team. Leave it alone and a guest who
-   submits will simply overwrite it.
-5. Now open the room. From here on the **Guest — GBA port 3** slot is locked,
-   because it may already hold your opponent's submitted team.
+   testing alone, or for handing a friend a team. A guest who submits simply
+   overwrites it.
+5. Go to **Netplay** and **Host**. Share the code it gives you.
+6. Wait for your opponent to join and submit. A line appears in the room chat
+   when their team arrives — if you never see it, they have not sent one and the
+   battle will use whatever is in your guest slot.
+7. Press **Start**.
+8. On XD's GBA Connection screen, **touch nothing.** Both GBAs link themselves
+   in about 10–20 seconds. Each player sees and controls only their own GBA.
 
 You will not see a **Submit Team** button while hosting. That is expected — the
 host's team comes from the editor, not from a submission.
 
-### As the guest
+### Joining a room
 
-Do **not** use your own Team Editor for this; it edits a save that netplay is
-about to replace.
+**Do not use your own Team Editor for this.** It edits a save that netplay is
+about to replace with the host's, which is the single most common source of
+"where did my team go".
 
-1. Join the room.
+1. Go to **Netplay**, paste the host's code, and **Join**.
 2. Press **Submit Team** — on desktop it is in the room window, on Android it is
    the button in the bottom-right where the host sees **Start**.
 3. Fill in **In-game name (max 7)** and paste a **Showdown export or a
    pokepast.es link**, then press **Send**.
-4. A message appears in the room chat confirming the host received it. If you do
-   not see that message, it did not arrive — send it again before Start.
+4. Check the room chat for the confirmation line. If it is not there, it did not
+   arrive — send it again before the host starts.
+5. Wait for the host to press **Start**, then leave XD's GBA Connection screen
+   alone while both GBAs link.
 
-You can submit any time before the host presses Start, and re-submitting
-replaces what you sent. A name with no Gen 3 equivalent is dropped and the team
-still goes through, so check the chat line if the name matters to you.
+You can submit any time before Start, and re-submitting replaces what you sent.
+A name with no Gen 3 equivalent is dropped and the team still goes through, so
+check the chat line if the name matters to you.
 
 ### If a GBA doesn't get detected
 
