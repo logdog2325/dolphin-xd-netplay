@@ -1,0 +1,173 @@
+From 3919c26d68f8c9e25d74584ea7a8a9c366964322 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 3 Aug 2026 18:15:41 -0700
+Subject: [PATCH] Traversal joins: say which failure this actually was
+
+Every way a traversal join can die used to end in the same words at the same
+five-second mark: "Could not communicate with host." The wifi blocking UDP to
+the traversal server, the server being down, a mistyped host code, and a hole
+punch failing at a NAT all rendered identically, which made every field report
+unattributable -- including the one that prompted this patch.
+
+The distinctions were always computed; they were just discarded. Now:
+
+- a join that never got an answer from the traversal server says so, and points
+  at the README's blocked-network section, since that is nearly always what it
+  means;
+- a code the server does not know says so in a real dialog. It used to be a
+  3.5-second toast on Android, and the generic message would then bury it;
+- reaching the server but failing the punch -- the one case the old message was
+  actually about -- keeps a message of its own, naming the likely NAT/firewall;
+- the host-never-answered and rejected cases get their own words too.
+
+The host-code field also now normalizes what chat apps do to codes -- trims,
+lowercases, strips non-hex, caps at eight -- and turns IME autocorrect off,
+because a "corrected" hex code is a wrong code, and until this patch a wrong
+code was indistinguishable from a broken network.
+
+Version 1.1.1.
+---
+ .../netplay/model/NetplaySetupViewModel.kt    |  9 +++-
+ .../features/netplay/ui/NetplaySetupScreen.kt |  6 +++
+ Source/Core/Core/NetPlayClient.cpp            | 46 +++++++++++++++++--
+ Source/Core/Core/NetPlayClient.h              |  2 +
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 5 files changed, 57 insertions(+), 8 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
+index 5da258a..0b10966 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
+@@ -106,8 +106,13 @@ class NetplaySetupViewModel(
+     }
+ 
+     fun setHostCode(hostCode: String) {
+-        _hostCode.value = hostCode
+-        StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, hostCode)
++        // Codes are exactly 8 lowercase hex characters and the server matches them byte-for-byte,
++        // but codes travel through chat apps that auto-capitalize and pad. A case-mangled or
++        // whitespace-wrapped paste used to become a "no such host" with no hint why -- normalize
++        // here so what the server sees is what the host's screen showed.
++        val cleaned = hostCode.trim().lowercase().filter { it.isDigit() || it in 'a'..'f' }.take(8)
++        _hostCode.value = cleaned
++        StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, cleaned)
+     }
+ 
+     fun setConnectPort(port: String) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
+index e2c7f72..8fa5eca 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
+@@ -324,6 +324,12 @@ fun ConnectMenu(
+             value = hostCode,
+             onValueChange = onHostCodeChanged,
+             label = { Text(stringResource(R.string.netplay_host_code_label)) },
++            keyboardOptions = KeyboardOptions(
++                // Ascii with autocorrect off: IME "corrections" to an 8-char hex code make it a
++                // wrong code, and the server's answer to a wrong code used to be easy to miss.
++                keyboardType = KeyboardType.Ascii,
++                autoCorrectEnabled = false,
++            ),
+             singleLine = true,
+             modifier = Modifier
+                 .fillMaxWidth()
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index 997a509..ba382e7 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -324,7 +324,34 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
+       if (connect_timer.ElapsedMs() > 5000)
+         break;
+     }
+-    m_dialog->OnConnectionError(_trans("Could not communicate with host."));
++    // Say which of the very different failures this actually was. The connection state is no use
++    // here -- Disconnect() has already collapsed it to Failure -- but the traversal client still
++    // knows why IT failed, and "the server never answered" vs "the server answered and the punch
++    // died" point at completely different problems on the user's side.
++    if (m_specific_connect_error)
++      return;  // OnConnectFailed already told the user something better than the generic line.
++    if (m_traversal_client && m_traversal_client->HasFailed())
++    {
++      switch (m_traversal_client->GetFailureReason())
++      {
++      case Common::TraversalClient::FailureReason::BadHost:
++      case Common::TraversalClient::FailureReason::SocketSendError:
++      case Common::TraversalClient::FailureReason::ResendTimeout:
++      case Common::TraversalClient::FailureReason::ServerForgotAboutUs:
++        m_dialog->OnConnectionError(
++            _trans("Could not reach the traversal server at all. This network may be blocking the "
++                   "connection -- see the README's section on networks that block peer-to-peer."));
++        return;
++      case Common::TraversalClient::FailureReason::VersionTooOld:
++        m_dialog->OnConnectionError(_trans("The traversal server no longer supports this build."));
++        return;
++      default:
++        break;
++      }
++    }
++    m_dialog->OnConnectionError(
++        _trans("Reached the traversal server, but no connection to the host could be made. This "
++               "usually means a firewall or NAT blocked it on one side."));
+   }
+ }
+ 
+@@ -2087,19 +2114,28 @@ void NetPlayClient::OnConnectFailed(Common::TraversalConnectFailedReason reason)
+ {
+   m_connecting = false;
+   m_connection_state = ConnectionState::Failure;
++  // Through the dialog, not PanicAlert: on Android a PanicAlert with no emulation activity
++  // degrades to a 3.5-second toast, after which the ctor's generic "Could not communicate with
++  // host." dialog buried the real answer -- a WRONG CODE was indistinguishable from a NAT
++  // failure. The flag suppresses that generic follow-up on every platform.
++  m_specific_connect_error = true;
+   switch (reason)
+   {
+   case Common::TraversalConnectFailedReason::ClientDidntRespond:
+-    PanicAlertFmtT("Traversal server timed out connecting to the host");
++    m_dialog->OnConnectionError(
++        _trans("The traversal server reached the host, but the host never answered. The host's "
++               "network may be blocking the connection."));
+     break;
+   case Common::TraversalConnectFailedReason::ClientFailure:
+-    PanicAlertFmtT("Server rejected traversal attempt");
++    m_dialog->OnConnectionError(_trans("The traversal server rejected the connection attempt."));
+     break;
+   case Common::TraversalConnectFailedReason::NoSuchClient:
+-    PanicAlertFmtT("Invalid host");
++    m_dialog->OnConnectionError(
++        _trans("No host with that code exists right now. Check the code with the host -- and have "
++               "them check their room still shows it, since codes die when the room closes."));
+     break;
+   default:
+-    PanicAlertFmtT("Unknown error {0:x}", static_cast<int>(reason));
++    m_dialog->OnConnectionError(_trans("The traversal server reported an unknown error."));
+     break;
+   }
+ }
+diff --git a/Source/Core/Core/NetPlayClient.h b/Source/Core/Core/NetPlayClient.h
+index d8f9093..29cd175 100644
+--- a/Source/Core/Core/NetPlayClient.h
++++ b/Source/Core/Core/NetPlayClient.h
+@@ -386,6 +386,8 @@ private:
+   std::string m_host_spec;
+   std::string m_player_name;
+   bool m_connecting = false;
++  // OnConnectFailed showed a reason-specific error; the ctor's generic fallback must stay quiet.
++  bool m_specific_connect_error = false;
+   Common::TraversalClient* m_traversal_client = nullptr;
+   std::thread m_game_digest_thread;
+   bool m_should_compute_game_digest = false;
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index f1668d3..5311897 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.1.0";
++constexpr char VERSION[] = "1.1.1";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
