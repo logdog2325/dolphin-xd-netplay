@@ -1,0 +1,203 @@
+From 25f75450a356a88b6c1e083d92bfe7629d7b1f52 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 3 Aug 2026 17:16:23 -0700
+Subject: [PATCH] Direct connection: dial what the room screen displays, and
+ say what failed
+
+A same-network direct join failed in the field with the generic "Could not
+communicate with host.", and the trace found the app arguing with itself.
+
+The host's room screen displays its address as one string, "192.168.1.5:2626".
+The join screen's IP field rejected any value containing a colon -- silently.
+Pasting that string did nothing at all; typing it ate the ':' and merged the
+port digits into the address, dialing 192.168.1.52626. The field now accepts
+host:port exactly as displayed, splits it into address and port for the config,
+and uses an ASCII keyboard, since many numeric IMEs do not even have a colon
+key. The room screen also leads with the Local address for a direct host --
+the external one is only useful with a port forward.
+
+The dial itself then compounded the mangling: enet_address_set_host's result
+was ignored and the ENetAddress was uninitialized, so an unresolvable string
+sent ENet to stack garbage and the user got the same five-second timeout a real
+network failure produces. A typo and a firewall were indistinguishable. The
+resolve is now checked and fails immediately with an error that says what to
+type instead.
+
+Three more found on the same trace: a traversal join whose traversal client
+failed to start reported nothing at all; matchmaking persisted a lobby row's
+port verbatim, so one malformed row poisoned every later manual direct
+connection; and an unrecognized persisted TraversalChoice value crashed the
+setup screen on open, where it now just means the default.
+---
+ .../features/netplay/model/ConnectionType.kt  |  6 ++++-
+ .../netplay/model/NetplaySetupViewModel.kt    | 22 +++++++++++++++----
+ .../netplay/model/NetplayViewModel.kt         | 11 +++++++++-
+ .../features/netplay/ui/NetplaySetupScreen.kt |  4 +++-
+ .../features/xdnetplay/XdMatchmaker.kt        |  7 +++++-
+ Source/Core/Core/NetPlayClient.cpp            | 17 ++++++++++++--
+ Source/Core/Core/NetPlayServer.cpp            |  7 ++++--
+ 7 files changed, 62 insertions(+), 12 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/ConnectionType.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/ConnectionType.kt
+index f82018e..2345ee1 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/ConnectionType.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/ConnectionType.kt
+@@ -23,7 +23,11 @@ sealed class ConnectionType(
+         val all: List<ConnectionType>
+             get() = listOf(DirectConnection, TraversalServer)
+ 
++        // Never throw: this parses a PERSISTED config value, and other writers (upstream desktop
++        // code, older builds, hand-edited INIs) are not bound by this enum. Throwing here crashed
++        // the whole netplay setup screen on open -- an unrecognized string just means traversal,
++        // the app's default.
+         fun fromString(value: String): ConnectionType =
+-            all.find { it.configValue == value } ?: throw IllegalArgumentException("Invalid connection type: $value")
++            all.find { it.configValue == value } ?: TraversalServer
+     }
+ }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
+index 9c66724..5da258a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplaySetupViewModel.kt
+@@ -85,10 +85,24 @@ class NetplaySetupViewModel(
+     }
+ 
+     fun setIpAddress(ipAddress: String) {
+-        if (ipAddress.all { it.isDigit() || it == '.' }) {
+-            _ipAddress.value = ipAddress
+-            StringSetting.NETPLAY_ADDRESS.setString(NativeConfig.LAYER_BASE, ipAddress)
+-        }
++        // The host's room screen displays its address as ONE string, "192.168.1.5:2626", and
++        // people type or paste exactly that. The old digit/dot-only filter silently ate the
++        // colon: a paste was discarded wholesale and typing merged the port digits into the IP
++        // ("192.168.1.52626"), which then dialed garbage and produced the same generic timeout a
++        // real network failure does. So the FIELD keeps the colon exactly as typed, and only the
++        // stored address is split: host part to NetPlay/Address, port part (when complete) to the
++        // connect port. The port field is never cleared by a trailing bare ":" -- that state just
++        // means the user is mid-typing.
++        if (ipAddress.count { it == ':' } > 1)
++            return
++        if (!ipAddress.all { it.isDigit() || it == '.' || it == ':' })
++            return
++        _ipAddress.value = ipAddress
++        val host = ipAddress.substringBefore(':')
++        StringSetting.NETPLAY_ADDRESS.setString(NativeConfig.LAYER_BASE, host)
++        val port = ipAddress.substringAfter(':', "")
++        if (port.isNotEmpty())
++            setConnectPort(port)
+     }
+ 
+     fun setHostCode(hostCode: String) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index 55bd744..bc2bec6 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -47,8 +47,17 @@ class NetplayViewModel(
+                 if (isTraversal) {
+                     put(JoinInfoType.ROOM_ID, JoinAddress.Loading)
+                 }
++                else {
++                    // Map order is the chip order, and the first entry is the default selection.
++                    // A DIRECT host's useful address is almost always the LAN one -- the external
++                    // address only works with a port forward -- so Local leads. Traversal keeps
++                    // the room code first for the same reason.
++                    put(JoinInfoType.LOCAL, getLocalIp())
++                }
+                 put(JoinInfoType.EXTERNAL, JoinAddress.Loading)
+-                put(JoinInfoType.LOCAL, getLocalIp())
++                if (isTraversal) {
++                    put(JoinInfoType.LOCAL, getLocalIp())
++                }
+             }
+         }
+     )
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
+index ae222e8..e2c7f72 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplaySetupScreen.kt
+@@ -296,7 +296,9 @@ fun ConnectMenu(
+                 onValueChange = onIpAddressChanged,
+                 label = { Text(stringResource(R.string.netplay_ip_address_label)) },
+                 keyboardOptions = KeyboardOptions(
+-                    keyboardType = KeyboardType.Number,
++                    // Ascii, not Number: the field accepts "ip:port" as displayed on the host's
++                    // room screen, and many numeric IMEs have no ':' key at all.
++                    keyboardType = KeyboardType.Ascii,
+                 ),
+                 singleLine = true,
+                 modifier = Modifier
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+index dab6ab0..96dd7cd 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+@@ -86,7 +86,12 @@ object XdMatchmaker {
+      */
+     fun applyJoinConfig(session: LobbySession, serverId: String = session.serverId) {
+         StringSetting.NETPLAY_TRAVERSAL_CHOICE.setString(NativeConfig.LAYER_BASE, session.method)
+-        IntSetting.NETPLAY_CONNECT_PORT.setInt(NativeConfig.LAYER_BASE, session.port)
++        // These writes are PERSISTENT, and a malformed lobby row can carry port 0 -- which would
++        // sit in the config poisoning every later manual Direct connection with a dial to a port
++        // nothing listens on, five seconds of silence at a time. A row with no usable port keeps
++        // whatever the user had.
++        if (session.port in 1..65535)
++            IntSetting.NETPLAY_CONNECT_PORT.setInt(NativeConfig.LAYER_BASE, session.port)
+         if (session.isTraversal) {
+             StringSetting.NETPLAY_HOST_CODE.setString(NativeConfig.LAYER_BASE, serverId)
+         } else {
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index 10de34c..997a509 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -219,8 +219,18 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
+ 
+     m_client->mtu = std::min(m_client->mtu, NetPlay::MAX_ENET_MTU);
+ 
+-    ENetAddress addr;
+-    enet_address_set_host(&addr, address.c_str());
++    // Zero-init and CHECK the resolve. On failure enet leaves addr.host unwritten, so the old
++    // code dialed stack garbage and spent the full 5-second connect timeout producing the same
++    // "Could not communicate with host." a genuine network failure does -- a typo and a firewall
++    // were indistinguishable. Fail fast and say what is actually wrong.
++    ENetAddress addr{};
++    if (enet_address_set_host(&addr, address.c_str()) != 0)
++    {
++      m_dialog->OnConnectionError(
++          _trans("Not a usable address. Enter the host's IP like 192.168.1.5, or IP:port like "
++                 "192.168.1.5:2626."));
++      return;
++    }
+     addr.port = port;
+ 
+     m_server = enet_host_connect(m_client, &addr, CHANNEL_COUNT, 0);
+@@ -262,6 +272,9 @@ NetPlayClient::NetPlayClient(const std::string& address, const u16 port, NetPlay
+     if (!Common::EnsureTraversalClient(traversal_config.traversal_host,
+                                        traversal_config.traversal_port))
+     {
++      // Without this the join fails in perfect silence -- the spinner stops and nothing is said.
++      m_dialog->OnConnectionError(
++          _trans("Could not reach the traversal server. Check your connection and try again."));
+       return;
+     }
+     m_client = Common::g_MainNetHost.get();
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 5149618..02343f1 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -239,9 +239,12 @@ NetPlayServer::NetPlayServer(const u16 port, const bool forward_port, NetPlayUI*
+     {
+       m_server->mtu = std::min(m_server->mtu, NetPlay::MAX_ENET_MTU);
+       m_server->intercept = Common::ENet::InterceptCallback;
+-    }
+ 
+-    SetupIndex();
++      // Inside the null check: SetupIndex publishes GetPort(), which dereferences m_server, so
++      // with lobby publishing enabled a failed bind (port already in use) was a crash instead of
++      // the "is_connected stays false" failure the caller handles.
++      SetupIndex();
++    }
+   }
+   if (m_server != nullptr)
+   {
+-- 
+2.39.5 (Apple Git-154)
+
