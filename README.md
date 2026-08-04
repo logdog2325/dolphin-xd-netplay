@@ -130,7 +130,9 @@ something is wrong with your setup.
   where it is genuinely faster because traffic never leaves the router, and when
   hole-punching fails outright, which some carrier-grade NATs and mobile
   hotspots do. There is no relay fallback, so if traversal cannot punch through,
-  direct with UDP **2626** forwarded on the host is the way in.
+  direct with UDP **2626** forwarded on the host is the way in — and when the
+  network allows neither, see [When the network won't let you
+  connect](#when-the-network-wont-let-you-connect).
 - **Your GBA is "GBA 1"** in the desktop Controllers window, even when you are
   the joiner on socket 3. Default keys: `A`=X, `B`=Z, Start=Enter,
   Select=Backspace, D-pad=T/G/F/H, L/R=Q/W. The launcher's *GBA controls* row
@@ -147,6 +149,37 @@ something is wrong with your setup.
   what you don't when you were only curious.
 - Once a GBA has linked it is never auto-reset again for that session, so team
   preview can take as long as you like.
+
+## When the network won't let you connect
+
+Some networks block peer-to-peer traffic no matter which connection type you
+pick: apartment-complex and campus wifi, hotel wifi, guest networks, and phone
+hotspots trying to host. The tell is **"Could not communicate with host" on
+both traversal and direct**, even when both devices are on the same wifi —
+managed networks usually run *client isolation*, which stops devices on the
+network from talking to each other at all, and they sit behind NAT you cannot
+port-forward through. None of that is fixable from inside this app.
+
+**The fix is [Tailscale](https://tailscale.com/download)** — free for personal
+use, with apps for Android, macOS, Windows, iOS and Linux, so every platform
+OrreLink runs on is covered.
+
+1. Both players install Tailscale and sign into the **same tailnet** (one of
+   you invites the other; the app walks you through it).
+2. Host in OrreLink: **Battle — Host or Join → Host → Direct connection**.
+3. The joiner enters the host's **Tailscale address** — the `100.x.y.z` IP shown
+   in the Tailscale app — with port **2626** in the Direct connection fields.
+
+That's the whole trick: OrreLink just dials an IP, and Tailscale carries it
+past the building NAT, the missing static IP and the client isolation in one
+move. When a network blocks peer-to-peer entirely, Tailscale falls back to its
+relay servers and still connects — a little more latency, which the automatic
+buffer absorbs.
+
+Two devices in the same room that cannot see each other on the house wifi have
+a simpler option too: put both on one phone's hotspot. The phone becomes the
+network, no isolation involved, and Direct connection with the **Local**
+address from the host's room screen works as-is.
 
 ## Reporting problems
 
