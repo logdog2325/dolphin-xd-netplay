@@ -1,0 +1,190 @@
+From 1bbc9d4f4a04cb5feb0ab21912ced43e0ad5d42c Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 9 Aug 2026 12:15:07 -0700
+Subject: [PATCH] Battle Style: record picks, generated codes and flag changes
+ in the session log
+
+---
+ Source/Core/Core/HW/GBADetectLog.cpp          | 24 ++++++++
+ Source/Core/Core/HW/GBADetectLog.h            |  7 +++
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 56 +++++++++++++++++--
+ 3 files changed, 82 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index 22c1c90..17f68d2 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -33,6 +33,11 @@ std::ofstream s_file;    // held open for the session; never fopen'd per line
+ std::string s_path;
+ u64 s_bytes = 0;         // running size, enforces the cap
+ int s_live_devices = 0;  // ref-count -> session begin/end
++// Pre-boot context lines (NoteBoot) waiting for the next session's file.
++// Bounded: a user flipping dropdowns for an hour without booting must not
++// grow this without limit -- older notes fall off, the freshest state wins.
++std::vector<std::string> s_boot_notes;
++constexpr size_t MAX_BOOT_NOTES = 32;
+ // Atomic so every Log* can early-out lock-free and stop FORMATTING once capped
+ // (Review #1 I5: the byte cap must bound CPU/lock cost, not just disk).
+ std::atomic<bool> s_capped{false};
+@@ -141,6 +146,12 @@ void OnDeviceCreated()
+   WriteLine("note: a per-socket 'role' line prints once under netplay; rd=/wr= in sum lines are "
+             "ungated data-command counts",
+             true);
++  // Pre-boot context recorded before this file existed (Battle Style picks,
++  // forced flags): flushed here so the log that describes a battle also says
++  // what was configured into it.
++  for (const std::string& note : s_boot_notes)
++    WriteLine(fmt::format("t=boot {}", note), true);
++  s_boot_notes.clear();
+   // The path is deliberately not announced on screen. FilePath() is what the UI's share/reveal
+   // action uses, and the release notes give the folder per platform -- neither needs a banner
+   // across the game at every boot.
+@@ -157,6 +168,19 @@ void OnDeviceDestroyed()
+   }
+ }
+ 
++void NoteBoot(const std::string& line)
++{
++  std::lock_guard lock(s_mutex);
++  if (s_file.is_open())
++  {
++    WriteLine(fmt::format("t=boot {}", line), true);
++    return;
++  }
++  if (s_boot_notes.size() >= MAX_BOOT_NOTES)
++    s_boot_notes.erase(s_boot_notes.begin());
++  s_boot_notes.push_back(line);
++}
++
+ void LogPostSession(const std::string& detail)
+ {
+   std::lock_guard lock(s_mutex);
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index 05760d0..fec8967 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -57,6 +57,13 @@ void LogJoybus(int channel, u64 tick, char dir, const u8* bytes, int len, bool s
+ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u32 win, u32 rst,
+                 u32 prb, bool est, bool lck, u8 cmd, u32 rd, u32 wr);
+ 
++// One line of pre-boot context (Battle Style selections, forced flags...).
++// These events happen BEFORE emulation starts, when no session file exists
++// yet: the line is queued (bounded) and flushed right under the banner of the
++// NEXT session's log, so the log that describes a battle also says what was
++// configured into it. With a session already open it is written immediately.
++void NoteBoot(const std::string& line);
++
+ // Append one line AFTER the session's log has already been closed.
+ //
+ // OnDeviceDestroyed() closes the file as soon as the last GBA device is torn
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 8c34d7a..a2dd273 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -21,6 +21,10 @@
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
+ 
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBADetectLog.h"
++#endif
++
+ namespace XDNetplay::BattleCustomizer
+ {
+ namespace
+@@ -361,6 +365,18 @@ bool s_block_active = false;
+ // (in netplay the game stopping does not mean the session is over).
+ bool s_netplay_session = false;
+ 
++// Into the per-session GBA detect log -- the file testers already know how to
++// hand over. GBADetectLog only exists in mGBA builds (same guard TeamInjector's
++// cleanup line uses; an unguarded call here is a link error with USE_MGBA=OFF).
++void LogNote(const std::string& line)
++{
++#ifdef HAS_LIBMGBA
++  GBADetectLog::NoteBoot(line);
++#else
++  (void)line;
++#endif
++}
++
+ std::string LocalIniPath()
+ {
+   return File::GetUserPath(D_GAMESETTINGS_IDX) + std::string(GAME_INI_NAME);
+@@ -543,11 +559,16 @@ void BeginSession()
+ 
+ void SetGuestModel(std::optional<int> id)
+ {
+-  std::lock_guard lock(s_mutex);
+-  if (id && IsValidModelId(*id))
+-    s_guest_model = *id;
+-  else
+-    s_guest_model.reset();  // no/invalid preference: the host fallback wins
++  {
++    std::lock_guard lock(s_mutex);
++    if (id && IsValidModelId(*id))
++      s_guest_model = *id;
++    else
++      s_guest_model.reset();  // no/invalid preference: the host fallback wins
++  }
++  LogNote(id && IsValidModelId(*id) ?
++              fmt::format("battlestyle guest submitted model={:#x}", *id) :
++              std::string{"battlestyle guest submitted no model preference"});
+ }
+ 
+ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
+@@ -573,6 +594,23 @@ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
+       sel.venue > 0 ? std::optional<int>(sel.venue) : std::nullopt);
+   const bool active = !block.empty();
+ 
++  // One line per regeneration so a tester's log says exactly what was picked
++  // and what it became -- "picked a venue, battle looked stock" is unanswerable
++  // without this. The AR lines themselves follow when a block exists.
++  {
++    const auto id_or = [](std::optional<int> v) { return v ? fmt::format("{:#x}", *v) : std::string{"default"}; };
++    LogNote(fmt::format(
++        "battlestyle sel host_model={} guest_model={}{} music={} venue={} -> block={} ou_disable={}",
++        id_or(sel.host_model > 0 ? std::optional<int>(sel.host_model) : std::nullopt),
++        id_or(guest_model), guest_submitted ? " (guest pick)" : "",
++        sel.music > 0 ? fmt::format("{}", sel.music) : std::string{"default"},
++        sel.venue > 0 ? fmt::format("{}", sel.venue) : std::string{"default"},
++        active ? "active" : "empty", active && !ou_enabled ? 1 : 0));
++    if (active)
++      for (const std::string& op : SplitString(block, '\n'))
++        LogNote(fmt::format("battlestyle ar {}", op));
++  }
++
+   const std::string path = LocalIniPath();
+   Common::IniFile ini;
+   ini.Load(path);
+@@ -736,6 +774,7 @@ void PrepareForStart()
+     // RegenerateFromConfig above already saw the pre-force value (OU off) and
+     // wrote the "$XD OU Fixes" local disable, so forcing afterwards is safe.
+     Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
++    LogNote("battlestyle cheats forced on for this session (OU stays disabled)");
+   }
+   else if (!active && forced)
+   {
+@@ -750,6 +789,7 @@ void PrepareForStart()
+       s_cheats_forced = false;
+     }
+     Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
++    LogNote("battlestyle block emptied; forced cheats handed back");
+   }
+ }
+ 
+@@ -775,5 +815,11 @@ void EndSession()
+     Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
+     Config::Save();
+   }
++#ifdef HAS_LIBMGBA
++  // The session's log is closed by the time cleanup runs; append like the team
++  // purge does, so the same file also records that the block was taken out.
++  GBADetectLog::LogPostSession(
++      fmt::format("battlestyle cleanup done cheats_restored={}", forced ? 1 : 0));
++#endif
+ }
+ }  // namespace XDNetplay::BattleCustomizer
+-- 
+2.39.5 (Apple Git-154)
+
