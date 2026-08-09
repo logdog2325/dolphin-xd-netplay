@@ -1,0 +1,182 @@
+From 462ea067cd66ee4b97ed2f65b30ad76a7377e7f5 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 9 Aug 2026 12:08:35 -0700
+Subject: [PATCH] Battle Style: apply to solo boots too
+
+The generator was wired only into the netplay host path, so a solo boot never
+wrote the code block at all -- the first field test picked a model and a venue
+solo, got a stock battle, and reasonably concluded the feature was broken. The
+codes were fine; they were never in the file.
+
+Both launchers' solo boot buttons now run the same PrepareForStart the host
+path uses. Cleanup for a solo session rides the core state: when emulation
+reaches Uninitialized outside a netplay session, the session is over by
+definition, so the block is stripped and a forced cheats flag handed back.
+The hook stands down while a room is open -- in netplay the game stopping
+does not mean the session ended, and the room-closed path owns cleanup there.
+
+Also verified since the last build, by reading a clean main.dol directly: the
+VS-mode BGM table at 0x802EAF0C is real -- three identical u32 slots holding
+0x4F3, stm_bgm_tool_minnade, the multiplayer BGM family -- so the music
+writes' address, width and semantics are confirmed against the game binary.
+
+Version 1.2.1.
+---
+ .../features/xdnetplay/BattleStyleBridge.kt   | 10 +++++++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  3 ++
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        | 11 +++++++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  4 +++
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 29 +++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 6 files changed, 58 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+index 6100859..51c4007 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+@@ -71,4 +71,14 @@ object BattleStyleBridge {
+     private external fun nativeGetSelection(which: Int): Int
+ 
+     private external fun nativeSetSelection(which: Int, id: Int)
++
++    /**
++     * Writes the Battle Style code block for a SOLO boot. Netplay hosting does
++     * this on its own inside nativeStartGame; the solo path bypasses that, so
++     * the launcher calls this right before launching emulation. With every
++     * selector on "Game default" it is a no-op.
++     */
++    fun prepareForBoot() = nativePrepareForBoot()
++
++    private external fun nativePrepareForBoot()
+ }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 584e062..81af96e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -290,6 +290,9 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+             statusMessage =
+                 "Tip: a GBA links within seconds of entering the connect screen. " +
+                 "If ~20s pass with nothing, press B and re-enter - each entry is a fresh try."
++            // Netplay hosting writes the Battle Style block in nativeStartGame;
++            // a solo boot has to do it here or picks silently apply to nothing.
++            BattleStyleBridge.prepareForBoot()
+             EmulationActivity.launch(this, xd.getPath(), false)
+         } else {
+             statusMessage = "Pokémon XD not found — choose the folder with your ISO first."
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index dd92850..44f34ba 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -359,4 +359,15 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeSetSel
+   Config::Save();
+ }
+ 
++JNIEXPORT void JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativePrepareForBoot(JNIEnv*,
++                                                                                         jobject)
++{
++  // Solo boot path: netplay hosting runs this from nativeStartGame, but a solo
++  // boot bypasses that entirely -- without this call a solo session never gets
++  // the Battle Style block at all (the first field test found exactly that).
++  // Cleanup rides the core-state hook PrepareForStart registers.
++  XDNetplay::BattleCustomizer::PrepareForStart();
++}
++
+ }  // extern "C"
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 2cdb0c6..58587b7 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -716,6 +716,10 @@ void XDLauncherDialog::OnBootSolo()
+   }
+ 
+   XDNetplay::EnsureGbaConfig();
++  // Battle Style applies to solo boots too -- the generator was originally
++  // wired only into the netplay host path, and the first field test ran solo,
++  // picked a model and a venue, and correctly concluded nothing worked.
++  XDNetplay::BattleCustomizer::PrepareForStart();
+   emit BootXD(QString::fromStdString(game->GetFilePath()));
+ }
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index f91358c..8c34d7a 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -19,6 +19,7 @@
+ #include "Common/StringUtil.h"
+ 
+ #include "Core/Config/MainSettings.h"
++#include "Core/Core.h"
+ 
+ namespace XDNetplay::BattleCustomizer
+ {
+@@ -354,6 +355,11 @@ std::optional<int> s_guest_model;
+ bool s_cheats_forced = false;
+ // Whether the most recent RegenerateIni left a non-empty block in the file.
+ bool s_block_active = false;
++// True between BeginSession and EndSession -- i.e. a netplay room owns the
++// lifecycle. A solo boot has no room, so its cleanup rides the emulation
++// state hook instead, and that hook must stand down while a room is open
++// (in netplay the game stopping does not mean the session is over).
++bool s_netplay_session = false;
+ 
+ std::string LocalIniPath()
+ {
+@@ -529,6 +535,7 @@ void BeginSession()
+     s_guest_model.reset();
+     s_cheats_forced = false;
+     s_block_active = false;
++    s_netplay_session = true;
+   }
+   // All-default = pure removal of anything a crashed session left behind.
+   RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
+@@ -685,6 +692,27 @@ bool RegenerateFromConfig(std::string* status)
+ 
+ void PrepareForStart()
+ {
++  // Solo boots have no room-closed event, so their cleanup rides the emulation
++  // state instead: when the core reaches Uninitialized outside a netplay
++  // session, the session is over by definition. Registered once, stands down
++  // while a room is open (there, stopping the game does not end the session --
++  // the room-closed path owns cleanup). Same once-flag idiom as TeamInjector's
++  // deferred purge, and EndSession is idempotent and only writes the INI when
++  // something of ours is actually in it.
++  static std::once_flag hook_once;
++  std::call_once(hook_once, [] {
++    Core::AddOnStateChangedCallback([](Core::State state) {
++      if (state != Core::State::Uninitialized)
++        return;
++      {
++        std::lock_guard lock(s_mutex);
++        if (s_netplay_session)
++          return;
++      }
++      EndSession();
++    });
++  });
++
+   RegenerateFromConfig(nullptr);
+ 
+   bool active;
+@@ -733,6 +761,7 @@ void EndSession()
+     s_guest_model.reset();
+     forced = s_cheats_forced;
+     s_cheats_forced = false;
++    s_netplay_session = false;
+   }
+   // Pure removal: with the stash cleared and an all-default selection this
+   // strips the block, its enabled line and the OU-Fixes disable, leaving the
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 36f7ae0..a9c7747 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.2.0";
++constexpr char VERSION[] = "1.2.1";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
