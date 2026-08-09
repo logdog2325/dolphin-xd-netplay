@@ -1,0 +1,2702 @@
+From 14a81cabbc53f1462e5f41812766218184083c2a Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 9 Aug 2026 11:08:53 -0700
+Subject: [PATCH] Battle Style: pick your trainer model, the music, and the
+ venue
+
+Three cosmetic selectors for VS-mode battles, all riding the machinery that
+already ships "$XD OU Fixes": the host assembles one Action Replay block from
+the choices and SyncCodes delivers it to everyone, so both clients always run
+identical codes and nothing new crosses the wire.
+
+Each player picks their own trainer model. The guest's choice travels in the
+team submission as a "Model:" header beside the existing "Name:" one; the
+host's "Guest model" dropdown is only the fallback when a guest never picks --
+the same precedence the slot-3 team fallback uses. Music and venue belong to
+the host, like the battle rules screen does.
+
+"Game default" everywhere means the code is ABSENT, not a write of the vanilla
+value: an untouched launcher produces a byte-identical session to the previous
+build. The block lives in the local GXXE01.ini for exactly the session's
+duration, and the writer only touches the file when it actually has something
+to add or remove, because IniFile's round trip normalizes hand-kept comments
+away and this path runs on every room close for every game.
+
+When cosmetics are picked with the OU toggle off, cheats are forced on for the
+session (the AR engine is gated on them) while a local disable keeps OU Fixes
+itself off; that force is re-decided at every start, not latched, so a block
+that empties between battles in the same room gives the flag straight back --
+otherwise game two would silently run OU rules the host's toggle refuses.
+
+The addresses: trainer models patch the li-r3 sites of Ralf's NTSC-U model
+modifiers (ids 0x01..0x43); music pins the three-slot staBGM table at
+0x802EAF0C, verified against a clean main.dol (u32 stride, vanilla 0x4F3 =
+stm_bgm_tool_minnade); venues write the battlefield index at +0x06 of the four
+GBA-link battle records in the resident common.rel image, with the indirection
+proven by disassembly of the record accessors. Entries whose terrain changes
+Nature Power, Camouflage or Secret Power say so in their labels.
+---
+ .../features/netplay/NetplaySession.kt        |  10 +-
+ .../netplay/model/NetplayViewModel.kt         |  12 +-
+ .../features/netplay/ui/NetplayActivity.kt    |   7 +
+ .../features/netplay/ui/NetplayScreen.kt      |  24 +-
+ .../features/xdnetplay/BattleStyleBridge.kt   |  74 ++
+ .../xdnetplay/ui/BattleStyleDropdown.kt       | 109 +++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  50 ++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 100 +++
+ .../app/src/main/res/values/strings.xml       |  13 +
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        | 130 ++-
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |  16 +
+ Source/Android/jni/NetPlay/Netplay.cpp        |  37 +-
+ Source/Core/Core/Config/MainSettings.cpp      |   7 +
+ Source/Core/Core/Config/MainSettings.h        |  12 +
+ Source/Core/Core/NetPlayServer.cpp            |  10 +-
+ Source/Core/DolphinLib.props                  |   2 +
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  63 +-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 122 +++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  11 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  17 +
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 750 ++++++++++++++++++
+ .../UICommon/XDNetplay/BattleCustomizer.h     | 178 +++++
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 142 +++-
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  72 +-
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 26 files changed, 1885 insertions(+), 87 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
+ create mode 100644 Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+index f8e6ab4..ef0276b 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+@@ -177,9 +177,13 @@ class NetplaySession(
+      * save's existing name alone. It rides along in the same message as the
+      * team (see UICommon/XDNetplay/TeamInjector.h) and is clamped to seven
+      * Gen 3 characters host-side.
++     *
++     * [modelId] is this player's cosmetic trainer-model pick, riding along as
++     * a "Model:" header in the same message; <= 0 means "no preference" (no
++     * header at all -- the host's fallback dropdown decides).
+      */
+-    fun submitTeam(showdownText: String, trainerName: String) =
+-        nativeSubmitTeam(showdownText, trainerName)
++    fun submitTeam(showdownText: String, trainerName: String, modelId: Int) =
++        nativeSubmitTeam(showdownText, trainerName, modelId)
+ 
+     /** Show a line in this player's own chat log; nothing is sent over the wire. */
+     fun showLocalMessage(message: String) {
+@@ -279,7 +283,7 @@ class NetplaySession(
+ 
+     private external fun nativeSendMessage(message: String)
+ 
+-    private external fun nativeSubmitTeam(showdownText: String, trainerName: String)
++    private external fun nativeSubmitTeam(showdownText: String, trainerName: String, modelId: Int)
+ 
+     private external fun nativeSetHostInputAuthority(enable: Boolean)
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index bc2bec6..5aac2b4 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -154,8 +154,14 @@ class NetplayViewModel(
+      * most seven Gen 3 characters; anything that survives nothing (an all-emoji
+      * name, say) is sent as "", which the host reads as "keep your own name"
+      * rather than as a reason to reject the team.
++     *
++     * [modelId] is this player's cosmetic trainer-model pick for the battle;
++     * 0 (or anything non-positive) means "no preference" — no Model: header is
++     * sent and the host's Guest-model fallback dropdown decides. The host
++     * validates the id against its own table, so a stale pick can never be
++     * applied, and it can never reject the team.
+      */
+-    fun submitTeam(text: String, trainerName: String) {
++    fun submitTeam(text: String, trainerName: String, modelId: Int) {
+         val trimmed = text.trim()
+         if (trimmed.isEmpty()) {
+             return
+@@ -168,7 +174,7 @@ class NetplayViewModel(
+         }
+         val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+").find(trimmed)?.value
+         if (pokepaste == null) {
+-            netplaySession.submitTeam(trimmed, name)
++            netplaySession.submitTeam(trimmed, name, modelId)
+             return
+         }
+         viewModelScope.launch(Dispatchers.IO) {
+@@ -183,7 +189,7 @@ class NetplayViewModel(
+                         "Could not fetch that paste (network error)."
+                     )
+                 } else {
+-                    netplaySession.submitTeam(body, name)
++                    netplaySession.submitTeam(body, name, modelId)
+                 }
+             }
+         }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index a196aa0..e086046 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.onEach
+ import org.dolphinemu.dolphinemu.activities.EmulationActivity
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.model.NetplayViewModel
++import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+ import org.dolphinemu.dolphinemu.utils.NetworkHelper
+@@ -44,6 +45,11 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+             .onEach { EmulationActivity.launch(this, it, false) }
+             .launchIn(lifecycleScope)
+ 
++        // Static native table for the joiner's cosmetic model picker in the
++        // Submit Team sheet; fetched once, outside composition. The pick
++        // travels with the team submission, so no extra session state exists.
++        val modelOptions = BattleStyleBridge.modelTable()
++
+         setContent {
+             DolphinTheme {
+                 NetplayScreen(
+@@ -55,6 +61,7 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     onSendMessage = viewModel::sendMessage,
+                     onSubmitTeam = viewModel::submitTeam,
+                     defaultTrainerName = viewModel.defaultTrainerName,
++                    modelOptions = modelOptions,
+                     game = viewModel.game.collectAsState().value,
+                     onStartGame = viewModel::startGame,
+                     onGameSelected = viewModel::changeGame,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index e953c07..1aa44b6 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -104,8 +104,10 @@ import org.dolphinemu.dolphinemu.features.netplay.model.NetworkMode
+ import org.dolphinemu.dolphinemu.features.netplay.model.Player
+ import org.dolphinemu.dolphinemu.features.netplay.model.SaveTransferProgress
+ import org.dolphinemu.dolphinemu.features.netplay.model.TraversalState
++import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Text
++import org.dolphinemu.dolphinemu.features.xdnetplay.ui.BattleStyleDropdown
+ import org.dolphinemu.dolphinemu.model.GameFile
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinScaffold
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+@@ -146,8 +148,9 @@ fun NetplayScreen(
+     saveTransferProgress: SaveTransferProgress?,
+     gameDigestProgress: GameDigestProgress?,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+-    onSubmitTeam: (String, String) -> Unit,
++    onSubmitTeam: (String, String, Int) -> Unit,
+     defaultTrainerName: String,
++    modelOptions: List<BattleStyleBridge.StyleOption>,
+ ) {
+     val scrollState = rememberScrollState()
+     // XD Netplay: joiner's "Submit Team" paste sheet.
+@@ -156,6 +159,10 @@ fun NetplayScreen(
+     // In-game name, pre-filled with the netplay nickname (already cut down to
+     // what a Gen 3 save can hold) so the common case is zero typing.
+     var nameDraft by rememberSaveable { mutableStateOf(defaultTrainerName) }
++    // Cosmetic trainer-model pick, travelling as a "Model:" header in the same
++    // TeamData payload as the team. 0 = "No preference": no header is sent and
++    // the host's Guest-model fallback dropdown decides.
++    var modelDraft by rememberSaveable { mutableIntStateOf(0) }
+     if (showSubmitTeam) {
+         AlertDialog(
+             title = { Text("Submit Team") },
+@@ -179,6 +186,16 @@ fun NetplayScreen(
+                         modifier = Modifier.fillMaxWidth()
+                     )
+                     Spacer(Modifier.height(12.dp))
++                    BattleStyleDropdown(
++                        label = stringResource(R.string.xd_style_submit_model_label),
++                        options = modelOptions,
++                        selectedId = modelDraft,
++                        defaultLabel = stringResource(R.string.xd_style_no_preference),
++                        onSelected = { modelDraft = it },
++                        modifier = Modifier.fillMaxWidth(),
++                        supportingText = stringResource(R.string.xd_style_submit_model_hint)
++                    )
++                    Spacer(Modifier.height(12.dp))
+                     OutlinedTextField(
+                         value = teamDraft,
+                         onValueChange = { teamDraft = it },
+@@ -189,7 +206,7 @@ fun NetplayScreen(
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+-                        onSubmitTeam(teamDraft.trim(), nameDraft.trim())
++                        onSubmitTeam(teamDraft.trim(), nameDraft.trim(), modelDraft)
+                         showSubmitTeam = false
+                     },
+                     enabled = teamDraft.isNotBlank()
+@@ -1480,8 +1497,9 @@ private fun PreviewNetplayScreen() {
+             JoinInfoType.EXTERNAL to JoinAddress.Loaded("203.0.113.1:2626"),
+             JoinInfoType.LOCAL to JoinAddress.Loaded("192.168.1.5:2626"),
+         ),
+-        onSubmitTeam = { _, _ -> },
++        onSubmitTeam = { _, _, _ -> },
+         defaultTrainerName = "PLAYER",
++        modelOptions = emptyList(),
+ //        saveTransferProgress = SaveTransferProgress(
+ //            title = "Title",
+ //            totalSize = 1024L,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+new file mode 100644
+index 0000000..6100859
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+@@ -0,0 +1,74 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++/**
++ * Kotlin side of the battle-style group in
++ * Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp — the cosmetic selectors
++ * (trainer models, battle music, battle location) for XD GBA-vs-GBA netplay.
++ *
++ * This is a thin accessor, deliberately: the option tables live ONLY in
++ * UICommon/XDNetplay/BattleCustomizer.cpp and are fetched from native code, and
++ * the actual AR-code assembly happens in shared core on the host at start time
++ * (never here). The four host selections are stored in the native
++ * MAIN_XD_STYLE_* config keys, which is exactly where the host-side assembly
++ * reads them from — so a value set here is already "applied".
++ *
++ * An id of 0 always means "Game default" / "No preference": the corresponding
++ * AR section is genuinely absent, never a write of the vanilla value.
++ */
++object BattleStyleBridge {
++    /** One selectable option. Tables come tested-safe first, then
++     *  [experimental] entries, so a dropdown can insert its divider at the
++     *  first tier change. */
++    data class StyleOption(
++        val id: Int,
++        val name: String,
++        val experimental: Boolean
++    )
++
++    /** "which" indices shared with the C++ side of the bridge. */
++    const val SELECTION_HOST_MODEL = 0
++    const val SELECTION_GUEST_MODEL_FALLBACK = 1
++    const val SELECTION_MUSIC = 2
++    const val SELECTION_VENUE = 3
++
++    /** Trainer models the host/guest can appear as. */
++    fun modelTable(): List<StyleOption> = parseTable(nativeGetModelTable())
++
++    /** Battle background music streams. */
++    fun musicTable(): List<StyleOption> = parseTable(nativeGetMusicTable())
++
++    /** Battle locations (battlefield-table indices). */
++    fun venueTable(): List<StyleOption> = parseTable(nativeGetVenueTable())
++
++    /** Current selection for one of the SELECTION_* slots; 0 = game default. */
++    fun getSelection(which: Int): Int = nativeGetSelection(which)
++
++    /**
++     * Persist a selection (0 = game default). Validated native-side against the
++     * same tables the host's code assembly validates against; an unknown id is
++     * stored as 0, never clamped.
++     */
++    fun setSelection(which: Int, id: Int) = nativeSetSelection(which, id)
++
++    /** Flat [id, name, tier, ...] triples from the C++ tables. */
++    private fun parseTable(flat: Array<String>): List<StyleOption> =
++        (flat.indices step 3).map {
++            StyleOption(
++                id = flat[it].toIntOrNull() ?: 0,
++                name = flat[it + 1],
++                experimental = flat[it + 2] == "experimental"
++            )
++        }
++
++    private external fun nativeGetModelTable(): Array<String>
++
++    private external fun nativeGetMusicTable(): Array<String>
++
++    private external fun nativeGetVenueTable(): Array<String>
++
++    private external fun nativeGetSelection(which: Int): Int
++
++    private external fun nativeSetSelection(which: Int, id: Int)
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
+new file mode 100644
+index 0000000..4f46395
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
+@@ -0,0 +1,109 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.ui
++
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.material3.DropdownMenuItem
++import androidx.compose.material3.ExperimentalMaterial3Api
++import androidx.compose.material3.ExposedDropdownMenuAnchorType
++import androidx.compose.material3.ExposedDropdownMenuBox
++import androidx.compose.material3.ExposedDropdownMenuDefaults
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
++import org.dolphinemu.dolphinemu.R
++import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
++
++/**
++ * One cosmetic battle-style selector: a dropdown over a BattleStyleBridge
++ * table with a default entry (id 0 — "Game default" / "No preference") first,
++ * then the tested-safe options, then an "Experimental" divider and the
++ * experimental ones. The tables arrive tested-safe-first from native code, so
++ * the divider goes at the first tier change.
++ *
++ * Purely cosmetic choices, so the picker never blocks anything: an id that is
++ * no longer in the table (say, after an update) just renders as the default
++ * label until the user picks again.
++ */
++@OptIn(ExperimentalMaterial3Api::class)
++@Composable
++fun BattleStyleDropdown(
++    label: String,
++    options: List<BattleStyleBridge.StyleOption>,
++    selectedId: Int,
++    defaultLabel: String,
++    onSelected: (Int) -> Unit,
++    modifier: Modifier = Modifier,
++    supportingText: String? = null,
++) {
++    var expanded by remember { mutableStateOf(false) }
++    val selectedName = options.firstOrNull { it.id == selectedId }?.name ?: defaultLabel
++
++    ExposedDropdownMenuBox(
++        expanded = expanded,
++        onExpandedChange = { expanded = it },
++        modifier = modifier,
++    ) {
++        OutlinedTextField(
++            value = selectedName,
++            onValueChange = {},
++            readOnly = true,
++            singleLine = true,
++            label = { Text(label) },
++            supportingText = supportingText?.let { { Text(it) } },
++            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
++            modifier = Modifier
++                .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
++                .fillMaxWidth()
++        )
++
++        ExposedDropdownMenu(
++            expanded = expanded,
++            onDismissRequest = { expanded = false },
++        ) {
++            DropdownMenuItem(
++                text = { Text(defaultLabel) },
++                onClick = {
++                    onSelected(0)
++                    expanded = false
++                },
++                contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
++            )
++            var dividerShown = false
++            options.forEach { option ->
++                if (option.experimental && !dividerShown) {
++                    dividerShown = true
++                    HorizontalDivider()
++                    DropdownMenuItem(
++                        text = {
++                            Text(
++                                text = stringResource(R.string.xd_style_experimental),
++                                style = MaterialTheme.typography.labelMedium,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant
++                            )
++                        },
++                        onClick = {},
++                        enabled = false,
++                        contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
++                    )
++                }
++                DropdownMenuItem(
++                    text = { Text(option.name) },
++                    onClick = {
++                        onSelected(option.id)
++                        expanded = false
++                    },
++                    contentPadding = ExposedDropdownMenuDefaults.ItemContentPadding,
++                )
++            }
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index ea34b99..584e062 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -25,6 +25,7 @@ import kotlinx.coroutines.withContext
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
++import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
+ import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.XdMatchmaker
+@@ -60,6 +61,18 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var statusMessage by mutableStateOf<String?>(null)
+     private var cheatsEnabled by mutableStateOf(false)
+ 
++    // Cosmetic battle-style selectors (host side). The option tables live in
++    // native code (BattleCustomizer) and are fetched once directories are
++    // ready; the four selections mirror the native MAIN_XD_STYLE_* config
++    // keys, which is where the host's code assembly reads them at Start.
++    private var modelOptions by mutableStateOf<List<BattleStyleBridge.StyleOption>>(emptyList())
++    private var musicOptions by mutableStateOf<List<BattleStyleBridge.StyleOption>>(emptyList())
++    private var venueOptions by mutableStateOf<List<BattleStyleBridge.StyleOption>>(emptyList())
++    private var hostModelId by mutableStateOf(0)
++    private var guestModelId by mutableStateOf(0)
++    private var musicId by mutableStateOf(0)
++    private var venueId by mutableStateOf(0)
++
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+     private var searching by mutableStateOf(false)
+ 
+@@ -196,6 +209,31 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                         BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, on)
+                         NativeConfig.save(NativeConfig.LAYER_BASE)
+                     },
++                    modelOptions = modelOptions,
++                    musicOptions = musicOptions,
++                    venueOptions = venueOptions,
++                    hostModelId = hostModelId,
++                    guestModelId = guestModelId,
++                    musicId = musicId,
++                    venueId = venueId,
++                    onHostModelChanged = { id ->
++                        hostModelId = id
++                        BattleStyleBridge.setSelection(BattleStyleBridge.SELECTION_HOST_MODEL, id)
++                    },
++                    onGuestModelChanged = { id ->
++                        guestModelId = id
++                        BattleStyleBridge.setSelection(
++                            BattleStyleBridge.SELECTION_GUEST_MODEL_FALLBACK, id
++                        )
++                    },
++                    onMusicChanged = { id ->
++                        musicId = id
++                        BattleStyleBridge.setSelection(BattleStyleBridge.SELECTION_MUSIC, id)
++                    },
++                    onVenueChanged = { id ->
++                        venueId = id
++                        BattleStyleBridge.setSelection(BattleStyleBridge.SELECTION_VENUE, id)
++                    },
+                     onBattle = { NetplaySetupActivity.launch(this) },
+                     onSearchForMatch = { searchForMatch() },
+                     searching = searching,
+@@ -388,6 +426,18 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+ 
+     private fun refreshChecks() {
+         cheatsEnabled = BooleanSetting.MAIN_ENABLE_CHEATS.boolean
++        // Battle-style tables are static native data — fetch once; selections
++        // re-read every refresh so an external config change is reflected.
++        if (modelOptions.isEmpty()) {
++            modelOptions = BattleStyleBridge.modelTable()
++            musicOptions = BattleStyleBridge.musicTable()
++            venueOptions = BattleStyleBridge.venueTable()
++        }
++        hostModelId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_HOST_MODEL)
++        guestModelId =
++            BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_GUEST_MODEL_FALLBACK)
++        musicId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_MUSIC)
++        venueId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_VENUE)
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index bb6684d..0833667 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -31,8 +31,11 @@ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
++import androidx.compose.ui.res.stringResource
+ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
++import org.dolphinemu.dolphinemu.R
++import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ 
+ @Composable
+ fun XDLauncherScreen(
+@@ -51,6 +54,17 @@ fun XDLauncherScreen(
+     onBattle: () -> Unit,
+     cheatsEnabled: Boolean,
+     onCheatsChanged: (Boolean) -> Unit,
++    modelOptions: List<BattleStyleBridge.StyleOption>,
++    musicOptions: List<BattleStyleBridge.StyleOption>,
++    venueOptions: List<BattleStyleBridge.StyleOption>,
++    hostModelId: Int,
++    guestModelId: Int,
++    musicId: Int,
++    venueId: Int,
++    onHostModelChanged: (Int) -> Unit,
++    onGuestModelChanged: (Int) -> Unit,
++    onMusicChanged: (Int) -> Unit,
++    onVenueChanged: (Int) -> Unit,
+     onSearchForMatch: () -> Unit,
+     searching: Boolean,
+     onFindBattles: () -> Unit,
+@@ -136,6 +150,26 @@ fun XDLauncherScreen(
+                     Switch(checked = cheatsEnabled, onCheckedChange = onCheatsChanged)
+                 }
+                 Spacer(Modifier.height(12.dp))
++                // Cosmetic battle-style selectors, host-side. The guest picks
++                // its OWN model in the room's Submit Team sheet; the "Guest
++                // model" dropdown here is only the fallback when they never do
++                // (mirroring the socket-3 team fallback). All of it is
++                // assembled into one synced AR code by shared core at Start —
++                // "Game default" means the code is genuinely absent.
++                BattleStyleCard(
++                    modelOptions = modelOptions,
++                    musicOptions = musicOptions,
++                    venueOptions = venueOptions,
++                    hostModelId = hostModelId,
++                    guestModelId = guestModelId,
++                    musicId = musicId,
++                    venueId = venueId,
++                    onHostModelChanged = onHostModelChanged,
++                    onGuestModelChanged = onGuestModelChanged,
++                    onMusicChanged = onMusicChanged,
++                    onVenueChanged = onVenueChanged
++                )
++                Spacer(Modifier.height(12.dp))
+                 // The headline action: no codes to trade, no lobby to read.
+                 // Joins whoever is already waiting, or becomes the room that
+                 // the next person's search finds.
+@@ -185,6 +219,72 @@ fun XDLauncherScreen(
+     }
+ }
+ 
++@Composable
++private fun BattleStyleCard(
++    modelOptions: List<BattleStyleBridge.StyleOption>,
++    musicOptions: List<BattleStyleBridge.StyleOption>,
++    venueOptions: List<BattleStyleBridge.StyleOption>,
++    hostModelId: Int,
++    guestModelId: Int,
++    musicId: Int,
++    venueId: Int,
++    onHostModelChanged: (Int) -> Unit,
++    onGuestModelChanged: (Int) -> Unit,
++    onMusicChanged: (Int) -> Unit,
++    onVenueChanged: (Int) -> Unit
++) {
++    Card(modifier = Modifier.fillMaxWidth()) {
++        Column(
++            modifier = Modifier.padding(16.dp),
++            verticalArrangement = Arrangement.spacedBy(10.dp)
++        ) {
++            Text(
++                text = stringResource(R.string.xd_style_section_title),
++                style = MaterialTheme.typography.titleMedium,
++                fontWeight = FontWeight.SemiBold
++            )
++            Text(
++                text = stringResource(R.string.xd_style_section_hint),
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++            BattleStyleDropdown(
++                label = stringResource(R.string.xd_style_your_model),
++                options = modelOptions,
++                selectedId = hostModelId,
++                defaultLabel = stringResource(R.string.xd_style_game_default),
++                onSelected = onHostModelChanged,
++                modifier = Modifier.fillMaxWidth()
++            )
++            BattleStyleDropdown(
++                label = stringResource(R.string.xd_style_guest_model),
++                options = modelOptions,
++                selectedId = guestModelId,
++                defaultLabel = stringResource(R.string.xd_style_game_default),
++                onSelected = onGuestModelChanged,
++                modifier = Modifier.fillMaxWidth(),
++                supportingText = stringResource(R.string.xd_style_guest_model_hint)
++            )
++            BattleStyleDropdown(
++                label = stringResource(R.string.xd_style_music),
++                options = musicOptions,
++                selectedId = musicId,
++                defaultLabel = stringResource(R.string.xd_style_game_default),
++                onSelected = onMusicChanged,
++                modifier = Modifier.fillMaxWidth()
++            )
++            BattleStyleDropdown(
++                label = stringResource(R.string.xd_style_venue),
++                options = venueOptions,
++                selectedId = venueId,
++                defaultLabel = stringResource(R.string.xd_style_game_default),
++                onSelected = onVenueChanged,
++                modifier = Modifier.fillMaxWidth()
++            )
++        }
++    }
++}
++
+ @Composable
+ private fun ReadinessCard(
+     xdGameFound: Boolean,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 7cd19a0..3e0972a 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1114,4 +1114,17 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_update_close">Close</string>
+     <string name="xd_update_current_version">OrreLink %1$s</string>
+     <string name="xd_update_no_browser">No app on this device can open the release page.</string>
++
++    <string name="xd_style_section_title">Battle Style</string>
++    <string name="xd_style_section_hint">Cosmetic only. When you host, these apply to both players.</string>
++    <string name="xd_style_your_model">Your model</string>
++    <string name="xd_style_guest_model">Guest model</string>
++    <string name="xd_style_guest_model_hint">Used only if they don\'t pick one themselves</string>
++    <string name="xd_style_music">Battle music</string>
++    <string name="xd_style_venue">Battle location</string>
++    <string name="xd_style_game_default">Game default</string>
++    <string name="xd_style_no_preference">No preference</string>
++    <string name="xd_style_experimental">Experimental</string>
++    <string name="xd_style_submit_model_label">Trainer model</string>
++    <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
+ </resources>
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index adcf535..dd92850 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -2,9 +2,10 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ // Android bridge for the NetPlay session index ("lobby server", NETPLAY_INDEX_URL,
+-// default https://lobby.dolphin-emu.org), plus the XD Netplay release check that shares this
+-// file because it is the other stateless xdnetplay-package bridge (see the second extern "C"
+-// group at the bottom; Kotlin counterpart features/xdnetplay/UpdateCheckBridge).
++// default https://lobby.dolphin-emu.org), plus the two other small xdnetplay-package bridges
++// that share this file: the XD Netplay release check (second extern "C" group; Kotlin
++// counterpart features/xdnetplay/UpdateCheckBridge) and the cosmetic battle-style selectors
++// (third group; Kotlin counterpart features/xdnetplay/BattleStyleBridge).
+ //
+ // Listing only. Publishing is deliberately NOT exposed here: Core's NetPlayServer
+ // already owns a NetPlayIndex (NetPlayServer::m_index) and publishes automatically
+@@ -36,11 +37,15 @@
+ #include <map>
+ #include <mutex>
+ #include <optional>
++#include <span>
+ #include <string>
+ #include <vector>
+ 
++#include "Common/Config/Config.h"
+ #include "Common/Version.h"
++#include "Core/Config/MainSettings.h"
+ #include "UICommon/NetPlayIndex.h"
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/UpdateCheck.h"
+ #include "UICommon/XDNetplay/Version.h"
+ 
+@@ -62,6 +67,26 @@ std::string GetLastError()
+   std::lock_guard lock(s_last_error_mutex);
+   return s_last_error;
+ }
++
++// Battle-style helper: flatten a BattleCustomizer option table for the Kotlin
++// side as [id, name, tier, ...] triples (id decimal, tier "safe"/
++// "experimental"). Tables are ordered tested-safe first, so a dropdown can
++// insert its "Experimental" divider at the first tier change.
++jobjectArray StyleTableToJava(JNIEnv* env,
++                              std::span<const XDNetplay::BattleCustomizer::StyleOption> table)
++{
++  std::vector<std::string> flat;
++  flat.reserve(table.size() * 3);
++  for (const auto& option : table)
++  {
++    flat.push_back(std::to_string(option.id));
++    flat.push_back(option.name);
++    flat.push_back(option.tier == XDNetplay::BattleCustomizer::Tier::Experimental ?
++                       "experimental" :
++                       "safe");
++  }
++  return SpanToJStringArray(env, flat);
++}
+ }  // namespace
+ 
+ extern "C" {
+@@ -235,4 +260,103 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_UpdateCheckBridge_nativeCheckF
+   return SpanToJStringArray(env, fields);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Battle-style bridge (Kotlin counterpart: features/xdnetplay/BattleStyleBridge)
++// ---------------------------------------------------------------------------
++//
++// The cosmetic battle-style selectors: the option tables live ONLY in
++// UICommon/XDNetplay/BattleCustomizer (Kotlin never duplicates them), and the
++// four host selections live in the MAIN_XD_STYLE_* config keys that
++// BattleCustomizer::ConfigSelection reads when the host assembles the
++// "$OrreLink Battle Style" AR code. Nothing here touches AR codes -- the code
++// block is assembled in shared core at host time (nativeStartGame ->
++// BattleCustomizer::PrepareForStart and the TeamData arrival hook).
++//
++// Table encoding: flat [id, name, tier, id, name, tier, ...] with id decimal
++// and tier "safe" or "experimental". Tables are ordered tested-safe first, so
++// a dropdown can insert its "Experimental" divider at the first tier change.
++//
++// Selection encoding ("which", shared with BattleStyleBridge.kt):
++//   0 = host's own model   1 = guest-model fallback   2 = music   3 = venue
++// A selection of 0 is "Game default" (the AR section is absent, never a write
++// of the vanilla value). Setters validate against the same tables the host
++// assembly validates against: an unknown id is stored as 0, never clamped.
++
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetModelTable(JNIEnv* env,
++                                                                                        jobject)
++{
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::ModelTable());
++}
++
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetMusicTable(JNIEnv* env,
++                                                                                        jobject)
++{
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::MusicTable());
++}
++
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetVenueTable(JNIEnv* env,
++                                                                                        jobject)
++{
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::VenueTable());
++}
++
++JNIEXPORT jint JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetSelection(JNIEnv*,
++                                                                                       jobject,
++                                                                                       jint which)
++{
++  switch (which)
++  {
++  case 0:
++    return Config::Get(Config::MAIN_XD_STYLE_HOST_MODEL);
++  case 1:
++    return Config::Get(Config::MAIN_XD_STYLE_GUEST_MODEL);
++  case 2:
++    return Config::Get(Config::MAIN_XD_STYLE_MUSIC);
++  case 3:
++    return Config::Get(Config::MAIN_XD_STYLE_VENUE);
++  default:
++    return 0;
++  }
++}
++
++JNIEXPORT void JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeSetSelection(JNIEnv*,
++                                                                                       jobject,
++                                                                                       jint which,
++                                                                                       jint id)
++{
++  // The dropdowns only offer table entries, but validate anyway so a bad value
++  // can never reach the config keys the host assembles codes from: anything
++  // not in the matching table becomes 0 ("Game default"), never a clamp.
++  const Config::Info<int>* key = nullptr;
++  bool valid = false;
++  switch (which)
++  {
++  case 0:
++    key = &Config::MAIN_XD_STYLE_HOST_MODEL;
++    valid = XDNetplay::BattleCustomizer::IsValidModelId(id);
++    break;
++  case 1:
++    key = &Config::MAIN_XD_STYLE_GUEST_MODEL;
++    valid = XDNetplay::BattleCustomizer::IsValidModelId(id);
++    break;
++  case 2:
++    key = &Config::MAIN_XD_STYLE_MUSIC;
++    valid = XDNetplay::BattleCustomizer::IsValidMusicId(id);
++    break;
++  case 3:
++    key = &Config::MAIN_XD_STYLE_VENUE;
++    valid = XDNetplay::BattleCustomizer::IsValidVenueId(id);
++    break;
++  default:
++    return;
++  }
++  Config::SetBaseOrCurrent(*key, valid ? id : 0);
++  Config::Save();
++}
++
+ }  // extern "C"
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index 2dfe8ae..4750b93 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -14,6 +14,7 @@
+ #include "NetPlayUICallbacks.h"
+ #include "UICommon/GameFile.h"
+ #include "UICommon/UICommon.h"
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+@@ -176,6 +177,16 @@ std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
+   // that predates that just sends the bare team (TeamInjector.h documents the
+   // grammar and both compatibility directions).
+   const XDNetplay::TeamSubmission submission = XDNetplay::ParseTeamSubmissionPayload(text);
++
++  // The submission may also carry the guest's cosmetic "Model:" pick. Stash it
++  // (every submission overwrites the stash; absent or invalid means "no
++  // preference" and the host's Guest-model fallback wins) and rebuild the
++  // "$OrreLink Battle Style" block right away, so a model submitted any time
++  // before Start is already in the file SyncCodes reads. The server rejects
++  // TeamData while a battle runs, so this cannot race a synced set.
++  XDNetplay::BattleCustomizer::SetGuestModel(submission.model);
++  XDNetplay::BattleCustomizer::RegenerateFromConfig(nullptr);
++
+   std::string status;
+   if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+@@ -189,6 +200,11 @@ void NetPlayUICallbacks::OnRoomClosed()
+   // saves). May defer itself until emulation has fully stopped -- the mGBA
+   // core rewrites the save at teardown, so anything done sooner is undone.
+   XDNetplay::RestoreHostTeam(2);
++  // And retire the session's cosmetic battle-style state: drop the guest's
++  // stashed model, strip the generated "$OrreLink Battle Style" block from the
++  // local GXXE01.ini, and give the cheats flag back if the pre-start hook
++  // forced it on for a cosmetics-only session.
++  XDNetplay::BattleCustomizer::EndSession();
+ }
+ 
+ void NetPlayUICallbacks::OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index ea597fe..f81392d 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <memory>
++#include <optional>
+ #include <string>
+ #include <vector>
+ 
+@@ -18,6 +19,7 @@
+ #include "Core/NetPlayCommon.h"
+ #include "Core/NetPlayServer.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ 
+ #include "jni/AndroidCommon/AndroidCommon.h"
+@@ -57,17 +59,22 @@ JNIEXPORT void JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(JNIEnv* env,
+                                                                                 jobject obj,
+                                                                                 jstring jteam,
+-                                                                                jstring jname)
++                                                                                jstring jname,
++                                                                                jint jmodel)
+ {
+-  // XD Netplay: hand this player's Showdown team -- and the in-game trainer
+-  // name they want to play under -- to the host, which writes both into the GBA
+-  // save it syncs at start. The two travel in ONE TeamData string; the payload
+-  // grammar lives in UICommon/XDNetplay/TeamInjector.h. An empty name means
+-  // "keep the host save's existing name".
++  // XD Netplay: hand this player's Showdown team -- plus the in-game trainer
++  // name they want to play under and their cosmetic trainer-model pick -- to
++  // the host, which writes the team into the GBA save it syncs at start and
++  // folds the model into the "$OrreLink Battle Style" AR block. All three
++  // travel in ONE TeamData string; the payload grammar lives in
++  // UICommon/XDNetplay/TeamInjector.h. An empty name means "keep the host
++  // save's existing name"; model <= 0 means "no preference" (no Model: header
++  // at all -- the host's Guest-model fallback dropdown wins).
+   if (auto* client = GetClientPointer(env, obj))
+   {
+-    client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(GetJString(env, jteam),
+-                                                                    GetJString(env, jname)));
++    client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(
++        GetJString(env, jteam), GetJString(env, jname),
++        jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt));
+   }
+ }
+ 
+@@ -192,6 +199,12 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeHost(JNIEnv
+   server->SetHostInputAuthority(host_input_authority);
+   server->AdjustPadBufferSize(Config::Get(Config::NETPLAY_BUFFER_SIZE));
+ 
++  // Session-boundary scrub for the cosmetic battle-style feature (mirrors the
++  // desktop EnsureGbaConfig hook): remove any "$OrreLink Battle Style" block a
++  // crashed session left orphaned in the local GXXE01.ini, and start with a
++  // clean guest-model stash for the room this server is about to run.
++  XDNetplay::BattleCustomizer::BeginSession();
++
+   return reinterpret_cast<jlong>(server.release());
+ }
+ 
+@@ -283,6 +296,14 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeStartGame(J
+   server->SetPadMapping(pad_map);
+   server->SetGBAConfig(gba_config, /*update_rom=*/true);
+ 
++  // Rebuild the "$OrreLink Battle Style" cosmetic AR block from the host's
++  // launcher selections plus the guest's submitted model, and force cheats on
++  // when (and only when) the block is non-empty so it actually loads and
++  // ships (mirrors the desktop ApplyStartForcing hook). Must precede
++  // RequestStartGame: that is what snapshots MAIN_ENABLE_CHEATS
++  // (SetupNetSettings) and re-reads the local GXXE01.ini off disk (SyncCodes).
++  XDNetplay::BattleCustomizer::PrepareForStart();
++
+   server->RequestStartGame();
+ }
+ 
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index e1afd0b..470ded6 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -421,6 +421,13 @@ const Info<bool> MAIN_GBA_EDGE_RESET{{System::Main, "GBA", "EdgeReset"}, true};
+ const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE{{System::Main, "GBA", "FullBootPresence"}, false};
+ #endif
+ 
++// Main.XDNetplay
++
++const Info<int> MAIN_XD_STYLE_HOST_MODEL{{System::Main, "XDNetplay", "StyleHostModel"}, 0};
++const Info<int> MAIN_XD_STYLE_GUEST_MODEL{{System::Main, "XDNetplay", "StyleGuestModel"}, 0};
++const Info<int> MAIN_XD_STYLE_MUSIC{{System::Main, "XDNetplay", "StyleMusic"}, 0};
++const Info<int> MAIN_XD_STYLE_VENUE{{System::Main, "XDNetplay", "StyleVenue"}, 0};
++
+ // Main.Network
+ 
+ const Info<bool> MAIN_NETWORK_SSL_DUMP_READ{{System::Main, "Network", "SSLDumpRead"}, false};
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index f16298a..f6d759f 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -235,6 +235,18 @@ extern const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE;
+ static constexpr std::size_t GBPLAYER_GBA_INDEX = 4;
+ #endif
+ 
++// Main.XDNetplay
++
++// The XD netplay launcher's cosmetic battle-style selections, assembled into
++// the "$OrreLink Battle Style" AR code by UICommon/XDNetplay/BattleCustomizer.
++// 0 = "Game default" = that selector contributes nothing. The values are the
++// ids of BattleCustomizer's Model/Music/Venue tables; anything not in the
++// tables is treated as default, never clamped.
++extern const Info<int> MAIN_XD_STYLE_HOST_MODEL;
++extern const Info<int> MAIN_XD_STYLE_GUEST_MODEL;  // fallback only; the guest's pick wins
++extern const Info<int> MAIN_XD_STYLE_MUSIC;
++extern const Info<int> MAIN_XD_STYLE_VENUE;
++
+ // Main.Network
+ 
+ extern const Info<bool> MAIN_NETWORK_SSL_DUMP_READ;
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 02343f1..0d362c5 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -1079,12 +1079,20 @@ unsigned int NetPlayServer::OnData(sf::Packet& packet, Client& player)
+     {
+       result = "team rejected (too large)";
+     }
+-    else if (m_is_running)
++    else if (m_is_running || m_start_pending)
+     {
+       // Saves were read and synced when this battle started, and the host's
+       // save file is now owned by the live mGBA core (which rewrites it from
+       // its in-memory copy at shutdown), so a write here would be silently
+       // discarded. Reject honestly instead of claiming a queue we don't have.
++      //
++      // m_start_pending closes the launch window too: RequestStartGame has
++      // already read the save AND the enabled-codes INIs (SyncSaveData /
++      // SyncCodes) but the game is not yet marked running while the chunks
++      // upload. A submission landing there would rewrite files the host boots
++      // from AFTER the guest's copies were taken -- the two machines would
++      // hold a different party and a different cosmetic AR block, the one way
++      // this message could ever cause a desync.
+       result = "not applied - a battle is already running. Back out, then submit "
+                "before the host starts the next one.";
+     }
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 6fffc93..a30e73c 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -596,6 +596,7 @@
+     <ClInclude Include="UICommon\ResourcePack\Manifest.h" />
+     <ClInclude Include="UICommon\ResourcePack\ResourcePack.h" />
+     <ClInclude Include="UICommon\UICommon.h" />
++    <ClInclude Include="UICommon\XDNetplay\BattleCustomizer.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Data.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Mon.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
+@@ -1308,6 +1309,7 @@
+     <ClCompile Include="UICommon\ResourcePack\Manifest.cpp" />
+     <ClCompile Include="UICommon\ResourcePack\ResourcePack.cpp" />
+     <ClCompile Include="UICommon\UICommon.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\BattleCustomizer.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Data.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Mon.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 92f9f47..0727db4 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -30,6 +30,7 @@
+ #include <QVBoxLayout>
+ 
+ #include <algorithm>
++#include <optional>
+ #include <thread>
+ #include <utility>
+ 
+@@ -72,6 +73,7 @@
+ 
+ #include "UICommon/DiscordPresence.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/UICommon.h"
+@@ -879,6 +881,16 @@ std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std
+   // that predates that just sends the bare team (TeamInjector.h documents the
+   // grammar and both compatibility directions).
+   const XDNetplay::TeamSubmission submission = XDNetplay::ParseTeamSubmissionPayload(text);
++
++  // The submission may also carry the guest's cosmetic "Model:" pick. Stash it
++  // (every submission overwrites the stash; absent or invalid means "no
++  // preference" and the host's Guest-model fallback dropdown wins) and rebuild
++  // the "$OrreLink Battle Style" block right away, so a model submitted any
++  // time before Start is already in the file SyncCodes reads. The server
++  // rejects TeamData while a battle runs, so this cannot race a synced set.
++  XDNetplay::BattleCustomizer::SetGuestModel(submission.model);
++  XDNetplay::BattleCustomizer::RegenerateFromConfig(nullptr);
++
+   std::string status;
+   if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+@@ -892,6 +904,11 @@ void NetPlayDialog::OnRoomClosed()
+   // saves). May defer itself until emulation has fully stopped -- the mGBA
+   // core rewrites the save at teardown, so anything done sooner is undone.
+   XDNetplay::RestoreHostTeam(2);
++  // And retire the session's cosmetic battle-style state: drop the guest's
++  // stashed model, strip the generated "$OrreLink Battle Style" block from the
++  // local GXXE01.ini, and give the cheats flag back if the pre-start hook
++  // forced it on for a cosmetics-only session.
++  XDNetplay::BattleCustomizer::EndSession();
+ }
+ 
+ void NetPlayDialog::OnSubmitTeam()
+@@ -924,6 +941,35 @@ void NetPlayDialog::OnSubmitTeam()
+   name_layout->addWidget(name_edit, 1);
+   dialog_layout->addLayout(name_layout);
+ 
++  // Cosmetic trainer-model pick (battle style feature). It rides the same
++  // payload as the team, as a "Model:" header line, and the HOST validates it
++  // against its own copy of this table before assembling the synced AR block.
++  // "No preference" sends no header at all -- the host's "Guest model"
++  // fallback dropdown then decides. Entries past the separator are valid but
++  // untested in battle, and their labels say so.
++  auto* model_layout = new QHBoxLayout;
++  auto* model_combo = new QComboBox(&dialog);
++  model_combo->addItem(tr("No preference"), 0);
++  {
++    using XDNetplay::BattleCustomizer::Tier;
++    bool past_tested = false;
++    for (const XDNetplay::BattleCustomizer::StyleOption& option :
++         XDNetplay::BattleCustomizer::ModelTable())
++    {
++      if (!past_tested && option.tier == Tier::Experimental)
++      {
++        model_combo->insertSeparator(model_combo->count());
++        past_tested = true;
++      }
++      const QString name = QString::fromUtf8(option.name);
++      model_combo->addItem(
++          option.tier == Tier::Experimental ? tr("%1 (untested)").arg(name) : name, option.id);
++    }
++  }
++  model_layout->addWidget(new QLabel(tr("Trainer model:"), &dialog));
++  model_layout->addWidget(model_combo, 1);
++  dialog_layout->addLayout(model_layout);
++
+   auto* team_edit = new QPlainTextEdit(&dialog);
+   team_edit->setPlaceholderText(tr("Showdown export or pokepast.es link"));
+   dialog_layout->addWidget(team_edit, 1);
+@@ -954,13 +1000,22 @@ void NetPlayDialog::OnSubmitTeam()
+         tr("That in-game name has no Gen 3 equivalent — sending the team without it."), "");
+   }
+ 
++  // 0 is the "No preference" entry: BuildTeamSubmissionPayload emits no
++  // "Model:" header for nullopt, which is byte-identical to the pre-feature
++  // payload. Snapshot the value now -- the pokepaste path's deferred lambdas
++  // below run after this function (and the stack dialog) are gone, so they
++  // must capture the plain int, never the combo.
++  const int model_id = model_combo->currentData().toInt();
++  const std::optional<int> model =
++      model_id > 0 ? std::optional<int>(model_id) : std::nullopt;
++
+   const QRegularExpression pokepaste_re(
+       QStringLiteral("^https?://pokepast\\.es/[A-Za-z0-9]+"));
+   const QRegularExpressionMatch match = pokepaste_re.match(text);
+   if (!match.hasMatch())
+   {
+     Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
+-        XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name));
++        XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name, model));
+     DisplayMessage(tr("Team sent to the host."), "");
+     return;
+   }
+@@ -968,13 +1023,13 @@ void NetPlayDialog::OnSubmitTeam()
+   const std::string url = match.captured(0).toStdString() + "/raw";
+   DisplayMessage(tr("Fetching %1…").arg(match.captured(0)), "");
+   QPointer<NetPlayDialog> self(this);
+-  std::thread([self, url, trainer_name] {
++  std::thread([self, url, trainer_name, model] {
+     Common::HttpRequest request;
+     request.FollowRedirects();
+     Common::HttpRequest::Response response = request.Get(url);
+     if (!self)
+       return;
+-    QueueOnObject(self.data(), [self, trainer_name, response = std::move(response)] {
++    QueueOnObject(self.data(), [self, trainer_name, model, response = std::move(response)] {
+       if (!self)
+         return;
+       if (!response)
+@@ -985,7 +1040,7 @@ void NetPlayDialog::OnSubmitTeam()
+       if (auto client = Settings::Instance().GetNetPlayClient())
+       {
+         client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(
+-            std::string(response->begin(), response->end()), trainer_name));
++            std::string(response->begin(), response->end()), trainer_name, model));
+         self->DisplayMessage(tr("Team sent to the host."), "");
+       }
+     });
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 874d6be..2cdb0c6 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -7,6 +7,7 @@
+ #include <initializer_list>
+ #include <map>
+ #include <optional>
++#include <span>
+ #include <string>
+ #include <string_view>
+ #include <thread>
+@@ -15,6 +16,7 @@
+ 
+ #include <QAbstractItemModel>
+ #include <QCheckBox>
++#include <QComboBox>
+ #include <QFileDialog>
+ #include <QGridLayout>
+ #include <QGroupBox>
+@@ -45,6 +47,7 @@
+ 
+ #include "UICommon/GameFile.h"
+ #include "UICommon/NetPlayIndex.h"
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ 
+ namespace
+ {
+@@ -212,6 +215,25 @@ std::optional<NetPlaySession> PickMatch(const std::vector<NetPlaySession>& sessi
+   }
+   return std::nullopt;
+ }
++
++// Battlefield indices whose rooms are outdoor / cave / water rather than a
++// colosseum floor. Terrain is the one way the location pick is not purely
++// cosmetic: Nature Power's move, Camouflage's type and Secret Power's side
++// effect all resolve from it (and Secret Power is a common Gen 3 TM). Per the
++// venue research these entries get a suffix in their dropdown label -- no
++// separate warning dialog. Keep in sync with BattleCustomizer's VenueTable.
++constexpr int TERRAIN_VENUES[] = {5,  7,  10, 12, 14, 15, 16, 17, 19, 21, 22, 23, 39,
++                                  42, 44, 45, 49, 50, 53, 54, 55, 56, 57, 58, 59};
++
++bool VenueAltersTerrain(int id)
++{
++  for (const int terrain_id : TERRAIN_VENUES)
++  {
++    if (terrain_id == id)
++      return true;
++  }
++  return false;
++}
+ }  // namespace
+ 
+ XDLauncherDialog::XDLauncherDialog(const GameListModel& game_list_model, QWidget* parent)
+@@ -285,6 +307,77 @@ void XDLauncherDialog::CreateMainLayout()
+   battle_box->setLayout(battle_layout);
+   layout->addWidget(battle_box);
+ 
++  // Battle Style: purely cosmetic picks the HOST makes. BattleCustomizer turns
++  // them into one synced AR code at Start, so both players always see the same
++  // thing; "Game default" genuinely emits nothing and an all-default session
++  // stays byte-for-byte stock. Entries after each list's separator are valid
++  // but untested in battle -- their labels say so; venues whose terrain
++  // changes a few moves carry that in the label too, no extra dialogs.
++  auto* style_box = new QGroupBox(tr("Battle Style"));
++  auto* style_layout = new QGridLayout;
++  int style_row = 0;
++  const auto add_style_combo = [&](const QString& label, const QString& tooltip) {
++    auto* description = new QLabel(label);
++    auto* combo = new QComboBox;
++    if (!tooltip.isEmpty())
++    {
++      description->setToolTip(tooltip);
++      combo->setToolTip(tooltip);
++    }
++    style_layout->addWidget(description, style_row, 0);
++    style_layout->addWidget(combo, style_row, 1);
++    style_row++;
++    return combo;
++  };
++  const auto populate_style_combo =
++      [this](QComboBox* combo, std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
++             bool terrain_suffix) {
++        using XDNetplay::BattleCustomizer::Tier;
++        combo->addItem(tr("Game default"), 0);
++        bool past_tested = false;
++        for (const XDNetplay::BattleCustomizer::StyleOption& option : table)
++        {
++          // The tables list tested-safe entries first; the tier change is
++          // where the "here be dragons" separator goes.
++          if (!past_tested && option.tier == Tier::Experimental)
++          {
++            combo->insertSeparator(combo->count());
++            past_tested = true;
++          }
++          const QString name = QString::fromUtf8(option.name);
++          const bool untested = option.tier == Tier::Experimental;
++          const bool terrain = terrain_suffix && VenueAltersTerrain(option.id);
++          QString item;
++          if (untested && terrain)
++            item = tr("%1 (untested, alters Nature Power etc.)").arg(name);
++          else if (untested)
++            item = tr("%1 (untested)").arg(name);
++          else if (terrain)
++            item = tr("%1 (alters Nature Power etc.)").arg(name);
++          else
++            item = name;
++          combo->addItem(item, option.id);
++        }
++      };
++  m_style_host_model_combo = add_style_combo(
++      tr("Your model:"), tr("The trainer model you appear as. Applies when you host;\n"
++                            "both players see the same battle."));
++  m_style_guest_model_combo = add_style_combo(
++      tr("Guest model (used only if they don't pick):"),
++      tr("Fallback only: a model the guest picks when submitting\n"
++         "their team always wins over this."));
++  m_style_music_combo = add_style_combo(tr("Battle music:"), QString());
++  m_style_venue_combo = add_style_combo(
++      tr("Battle location:"), tr("Locations that alter Nature Power, Camouflage or Secret Power\n"
++                                 "say so in their name -- everything else is purely cosmetic."));
++  populate_style_combo(m_style_host_model_combo, XDNetplay::BattleCustomizer::ModelTable(), false);
++  populate_style_combo(m_style_guest_model_combo, XDNetplay::BattleCustomizer::ModelTable(), false);
++  populate_style_combo(m_style_music_combo, XDNetplay::BattleCustomizer::MusicTable(), false);
++  populate_style_combo(m_style_venue_combo, XDNetplay::BattleCustomizer::VenueTable(), true);
++  style_layout->setColumnStretch(1, 1);
++  style_box->setLayout(style_layout);
++  layout->addWidget(style_box);
++
+   m_cheats_check = new QCheckBox(tr("Enable $XD OU Fixes cheat (OU format)"));
+   m_cheats_check->setToolTip(
+       tr("Off by default. When you HOST, this choice applies to both players.\n"
+@@ -333,11 +426,27 @@ void XDLauncherDialog::ConnectWidgets()
+     Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, checked);
+     Config::Save();
+   });
++
+   connect(m_practice_dummy_check, &QCheckBox::toggled, this, [](bool checked) {
+     Config::SetBaseOrCurrent(Config::MAIN_GBA_PRACTICE_DUMMY, checked);
+     Config::Save();
+   });
+ 
++  // Persist a Battle Style pick the moment it is made -- same idiom as the
++  // checkboxes above. Only the config key is written here: the AR block is
++  // assembled from these keys by BattleCustomizer's lifecycle hooks (start
++  // forcing / team submission), never from the launcher directly.
++  const auto connect_style_combo = [this](QComboBox* combo, const Config::Info<int>& setting) {
++    connect(combo, &QComboBox::currentIndexChanged, this, [combo, &setting](int index) {
++      Config::SetBaseOrCurrent(setting, combo->itemData(index).toInt());
++      Config::Save();
++    });
++  };
++  connect_style_combo(m_style_host_model_combo, Config::MAIN_XD_STYLE_HOST_MODEL);
++  connect_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
++  connect_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
++  connect_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
++
+   connect(m_show_on_startup_check, &QCheckBox::toggled, this, [](bool checked) {
+     Settings::GetQSettings().setValue(QStringLiteral("xdnetplay/showlauncheronstartup"), checked);
+   });
+@@ -363,6 +472,19 @@ void XDLauncherDialog::showEvent(QShowEvent* event)
+     const QSignalBlocker blocker(m_show_on_startup_check);
+     m_show_on_startup_check->setChecked(ShowOnStartup());
+   }
++  // Battle Style combos re-read their keys on every show. An id the tables no
++  // longer carry displays as "Game default" -- which is also exactly what
++  // BattleCustomizer will generate for it (invalid ids are treated as absent,
++  // never clamped), so the UI and the code block cannot disagree.
++  const auto refresh_style_combo = [](QComboBox* combo, const Config::Info<int>& setting) {
++    const QSignalBlocker blocker(combo);
++    const int index = combo->findData(Config::Get(setting));
++    combo->setCurrentIndex(index >= 0 ? index : 0);
++  };
++  refresh_style_combo(m_style_host_model_combo, Config::MAIN_XD_STYLE_HOST_MODEL);
++  refresh_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
++  refresh_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
++  refresh_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
+   RefreshChecklist();
+ }
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 9bcde76..3d5acba 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -12,6 +12,7 @@
+ #include "UICommon/NetPlayIndex.h"
+ 
+ class QCheckBox;
++class QComboBox;
+ class QLabel;
+ class QLineEdit;
+ class QPushButton;
+@@ -96,6 +97,16 @@ private:
+   ChecklistRow m_vs_save_row;
+   ChecklistRow m_gba_input_row;
+ 
++  // Battle Style: the host's cosmetic picks (own trainer model, guest-model
++  // fallback, music, location), persisted in the MAIN_XD_STYLE_* keys and
++  // assembled into the synced "$OrreLink Battle Style" AR block by
++  // BattleCustomizer when a session starts. Every combo's first entry is
++  // "Game default", which genuinely emits nothing.
++  QComboBox* m_style_host_model_combo;
++  QComboBox* m_style_guest_model_combo;
++  QComboBox* m_style_music_combo;
++  QComboBox* m_style_venue_combo;
++
+   QCheckBox* m_practice_dummy_check;
+   QCheckBox* m_cheats_check;
+   QCheckBox* m_show_on_startup_check;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 4ff2033..0f8d027 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -29,6 +29,8 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/NetPlayServer.h"
+ 
++#include "UICommon/XDNetplay/BattleCustomizer.h"
++
+ namespace XDNetplay
+ {
+ namespace
+@@ -102,6 +104,13 @@ bool EnsureGbaConfig()
+   // Cheats (the $XD OU Fixes code) are off by default now and governed by the
+   // launcher's "OU rules ($XD OU Fixes)" toggle; don't force them on here.
+ 
++  // Session-boundary scrub for the cosmetic battle-style feature: remove any
++  // "$OrreLink Battle Style" block a crashed session left orphaned in the
++  // local GXXE01.ini, so stale cosmetics cannot leak into a solo boot or the
++  // next session. EnsureGbaConfig only runs from the launcher (never while a
++  // room is open), which is exactly the boundary BeginSession wants.
++  BattleCustomizer::BeginSession();
++
+   // Netplay tuned for the XD link: fixed delay, no UPnP noise.
+   //
+   // The buffer is only re-seeded while automatic sizing is on, where 5 is just
+@@ -152,6 +161,14 @@ void ApplyStartForcing(NetPlay::NetPlayServer* server)
+   Config::SetBaseOrCurrent(Config::NETPLAY_HIDE_REMOTE_GBAS, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_SYNC_CODES, true);
+ 
++  // Rebuild the "$OrreLink Battle Style" cosmetic AR block from the host's
++  // launcher selections plus the guest's submitted model, and force cheats on
++  // when (and only when) the block is non-empty so it actually loads and
++  // ships. Must run before the caller's RequestStartGame: that is what
++  // snapshots MAIN_ENABLE_CHEATS (SetupNetSettings) and re-reads the local
++  // GXXE01.ini off disk (SyncCodes).
++  BattleCustomizer::PrepareForStart();
++
+   // SetGBAConfig(update_rom=true) reads MAIN_GBA_ROM_PATHS[1]/[2] to fill each
+   // enabled slot's hash/title, which the guest hash-matches against its local
+   // copy. Both must precede RequestStartGame; the caller issues that.
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index b6a67a7..bbdd8e3 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -19,6 +19,8 @@ add_library(uicommon
+   ResourcePack/ResourcePack.h
+   UICommon.cpp
+   UICommon.h
++  XDNetplay/BattleCustomizer.cpp
++  XDNetplay/BattleCustomizer.h
+   XDNetplay/Gen3Data.cpp
+   XDNetplay/Gen3Data.h
+   XDNetplay/Gen3Mon.cpp
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+new file mode 100644
+index 0000000..f91358c
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -0,0 +1,750 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/BattleCustomizer.h"
++
++#include <mutex>
++#include <optional>
++#include <span>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/CommonTypes.h"
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Common/IniFile.h"
++#include "Common/StringUtil.h"
++
++#include "Core/Config/MainSettings.h"
++
++namespace XDNetplay::BattleCustomizer
++{
++namespace
++{
++// The one code this module owns in User/GameSettings/GXXE01.ini. The leading
++// '$' is how ActionReplay::LoadCodes and ReadEnabledOrDisabled spell a code
++// name inside the three sections.
++constexpr std::string_view STYLE_CODE_LINE = "$OrreLink Battle Style";
++// The Sys-bundled code (Data/Sys/GameSettings/GXXE01.ini) that must be locally
++// disabled while cheats are forced on for a cosmetics-only session.
++constexpr std::string_view OU_FIXES_LINE = "$XD OU Fixes";
++// The feature is pinned to Pokemon XD (USA). Every address below is NTSC-U;
++// writing only this file is what keeps a future PAL/JP experiment from
++// inheriting wrong patches.
++constexpr std::string_view GAME_INI_NAME = "GXXE01.ini";
++
++// ---------------------------------------------------------------------------
++// AR line constants (all NTSC-U GXXE01; MEM1 addresses in the comments)
++// ---------------------------------------------------------------------------
++
++// Trainer model modifier. Source: Ralf's community-circulated XD trainer
++// modifier codes, gc-forever.com thread t=2150 page 3 (post p=55782; AR twin
++// thread t=2069) -- reconstructed from search-engine snippets, consistent
++// across three retrievals; eyeball the thread once before shipping. The model
++// id indexes the 0x44-entry trainer_pkx_data table at 0x8040CE88.
++//
++// Player side: two NOPs take the game's own model selection out, then three
++// "li r3, <id>" sites pin the id at every fetch.
++constexpr u32 MODEL_P1_LINES[] = {
++    0x041FFEF4,  // 32-bit write: nop @ 0x801FFEF4
++    0x041FFEFC,  // 32-bit write: nop @ 0x801FFEFC
++    0x041FFF00,  // 32-bit write: li r3, id @ 0x801FFF00
++    0x041FD4FC,  // 32-bit write: li r3, id @ 0x801FD4FC
++    0x042262CC,  // 32-bit write: li r3, id @ 0x802262CC
++};
++// Opponent side surfaced as a single li site in the thread. If testing shows
++// the opponent model flickering or reverting mid-battle, the thread may hold
++// adjacent opponent-side NOPs the snippets omitted -- check near 0x801FFF84.
++constexpr u32 MODEL_P2_LINE = 0x041FFF84;  // 32-bit write: li r3, id @ 0x801FFF84
++constexpr u32 PPC_NOP = 0x60000000;        // nop
++constexpr u32 PPC_LI_R3 = 0x38600000;      // li r3, 0 -- the id occupies the low byte
++
++// VS-mode battle music: pin the static staBGM_tunaide table in start.dol data
++// (three identical consecutive slots). VERIFIED against a clean GXXE01
++// main.dol: the DOL data section loading at 0x802EA020 holds, at file offset
++// 0x2E7F0C = 0x802EAF0C, the u32 BE sequence 000004F3 000004F3 000004F3 --
++// three identical stride-4 slots, vanilla value 0x4F3 = 1267 =
++// stm_bgm_tool_minnade.fsys, the multiplayer-mode BGM family. That confirms
++// the address, the u32 encoding below, and that the third write ends before
++// the neighbouring data at +0x0C. (The old prediction of 0x5DB for the
++// vanilla value was wrong; irrelevant, since "game default" never writes it.)
++// Story battles carry their own BGM id in their common.rel record and never
++// read this table, so the pick cannot bleed into a story save.
++constexpr u32 MUSIC_LINES[] = {
++    0x042EAF0C,  // 32-bit write: staBGM_tunaide[0] @ 0x802EAF0C
++    0x042EAF10,  // 32-bit write: staBGM_tunaide[1] @ 0x802EAF10
++    0x042EAF14,  // 32-bit write: staBGM_tunaide[2] @ 0x802EAF14
++};
++
++// Battle location: the four GBA-link battle records in the resident common_rel
++// image (base 0x80B18DC0; record i = 0x80B1CDE0 + i*0x3C, battlefield index at
++// +0x06, u16). Records 5-8 are only consumed by the type-11 GBA-link flow --
++// story mode never reads them -- and the AR engine re-applies these every
++// frame, which kills any ordering race against the game's own one-shot writes.
++// All four are written so the venue holds for every battle style. Derived in
++// this repo (scratchpad/dump_battles.py); engine path GetBattleRecord
++// (0x801F19CC) -> lhz+6 -> GetBattleField (0x801F5E64).
++// The record's own BGM field lives at +0x10 -- deliberately untouched here, so
++// venue and music choices stay independent.
++constexpr u32 VENUE_LINES[] = {
++    0x02B1CF12,  // 16-bit write: link_battle record 5 (+0x06) -- single 6v6, the OU record
++    0x02B1CF4E,  // 16-bit write: link_battle record 6 (+0x06) -- double, 2 mons
++    0x02B1CF8A,  // 16-bit write: link_battle record 7 (+0x06) -- double 6v6
++    0x02B1CFC6,  // 16-bit write: link_battle record 8 (+0x06) -- tag 2v2
++};
++
++// ---------------------------------------------------------------------------
++// ID tables (see the tier note in BattleCustomizer.h)
++// ---------------------------------------------------------------------------
++
++// Trainer models: every valid id in 0x01..0x43 except 0x0A. 0x00 ("none") and
++// 0x0A ("noTrainer") have no model file (expect invisible trainer or hang) and
++// ids >= 0x44 read past the model table -- all excluded by omission.
++// tested-safe = vanilla battling trainer, covered by Ralf's field-used
++// modifier codes; experimental = valid entry but a non-battling NPC (or
++// abnormal scale) in vanilla, battle animation set unverified.
++constexpr StyleOption MODELS[] = {
++    {0x01, "Michael (variant 1)", Tier::TestedSafe},
++    {0x02, "Michael (variant 2, Snag Machine)", Tier::TestedSafe},
++    {0x03, "Michael (variant 2)", Tier::TestedSafe},
++    {0x04, "May (Emerald)", Tier::TestedSafe},
++    {0x05, "Brendan (Emerald)", Tier::TestedSafe},
++    {0x06, "Leaf (FireRed/LeafGreen)", Tier::TestedSafe},
++    {0x07, "Red (FireRed/LeafGreen)", Tier::TestedSafe},
++    {0x08, "May (Ruby/Sapphire)", Tier::TestedSafe},
++    {0x09, "Brendan (Ruby/Sapphire)", Tier::TestedSafe},
++    {0x0B, "Cipher Peon (female)", Tier::TestedSafe},
++    {0x0C, "Cipher Peon (male A)", Tier::TestedSafe},
++    {0x0D, "Cipher Peon (male B)", Tier::TestedSafe},
++    {0x0E, "Cipher Peon (male C)", Tier::TestedSafe},
++    {0x0F, "Resix (Hexagon Bros, red)", Tier::TestedSafe},
++    {0x10, "Blusix (Hexagon Bros, blue)", Tier::TestedSafe},
++    {0x11, "Browsix (Hexagon Bros, brown)", Tier::TestedSafe},
++    {0x12, "Yellosix (Hexagon Bros, yellow)", Tier::TestedSafe},
++    {0x13, "Purpsix (Hexagon Bros, purple)", Tier::TestedSafe},
++    {0x14, "Greesix (Hexagon Bros, green)", Tier::TestedSafe},
++    {0x15, "Cipher Admin Lovrina", Tier::TestedSafe},
++    {0x16, "Sailor", Tier::TestedSafe},
++    {0x17, "Thug Zook", Tier::TestedSafe},
++    {0x18, "Cipher Admin Ardos", Tier::TestedSafe},
++    {0x19, "Matron", Tier::TestedSafe},
++    {0x1A, "Grand Master Greevil", Tier::TestedSafe},
++    {0x1C, "Cipher Admin Eldes", Tier::TestedSafe},
++    {0x1D, "Cipher Admin Gorigan", Tier::TestedSafe},
++    {0x1E, "Snagem Head Gonzap", Tier::TestedSafe},
++    {0x1F, "Super Trainer (female A)", Tier::TestedSafe},
++    {0x20, "Super Trainer (female B)", Tier::TestedSafe},
++    {0x21, "Vander", Tier::TestedSafe},
++    {0x22, "Super Trainer (male B)", Tier::TestedSafe},
++    {0x23, "Super Trainer (male C)", Tier::TestedSafe},
++    {0x24, "Hunter", Tier::TestedSafe},
++    {0x25, "Beauty", Tier::TestedSafe},
++    {0x26, "Casual Dude", Tier::TestedSafe},
++    {0x27, "Fun Old Man", Tier::TestedSafe},
++    {0x28, "Curmudgeon", Tier::TestedSafe},
++    {0x2B, "Miror B.", Tier::TestedSafe},
++    {0x2C, "Bodybuilder (female)", Tier::TestedSafe},
++    {0x2D, "Bodybuilder (male)", Tier::TestedSafe},
++    {0x2E, "Mt. Battle Master Battlus", Tier::TestedSafe},
++    {0x2F, "Casual Guy", Tier::TestedSafe},
++    {0x30, "Researcher", Tier::TestedSafe},
++    {0x31, "Rider", Tier::TestedSafe},
++    {0x32, "Navigator", Tier::TestedSafe},
++    {0x33, "Pre Gym Leader Justy", Tier::TestedSafe},
++    {0x34, "Team Snagem Grunt (A)", Tier::TestedSafe},
++    {0x35, "Team Snagem Grunt (B)", Tier::TestedSafe},
++    {0x36, "Chobin", Tier::TestedSafe},
++    {0x37, "Chaser (female A)", Tier::TestedSafe},
++    {0x38, "Chaser (female B)", Tier::TestedSafe},
++    {0x39, "Chaser (male)", Tier::TestedSafe},
++    {0x3A, "Cail", Tier::TestedSafe},
++    {0x3B, "Cooltrainer (female)", Tier::TestedSafe},
++    {0x3C, "Cooltrainer (male)", Tier::TestedSafe},
++    {0x3D, "Cipher Admin Snattle", Tier::TestedSafe},
++    {0x3E, "Willie", Tier::TestedSafe},
++    {0x3F, "Worker", Tier::TestedSafe},
++    {0x42, "Michael (variant 3, Snag Machine)", Tier::TestedSafe},
++    {0x43, "Michael (variant 3)", Tier::TestedSafe},
++    // Non-battling NPCs in vanilla XD (battle animation set unverified), plus
++    // the giant-mech-scale Robo Groudon and the robed Greevil variant.
++    {0x1B, "Newscaster", Tier::Experimental},
++    {0x29, "Eagun", Tier::Experimental},
++    {0x2A, "Robo Groudon (Chobin)", Tier::Experimental},
++    {0x40, "Professor Krane", Tier::Experimental},
++    {0x41, "Grand Master Greevil (robed)", Tier::Experimental},
++};
++
++// Battle music. tested-safe = looping battle-context streams the game itself
++// plays in battles; experimental = looping non-battle BGM, should loop fine in
++// battle but unverified in the VS context. Non-looping jingles/stingers, cry
++// SFX and archive containers are excluded by omission -- a non-looping pick
++// would leave the battle permanently silent. 1499 (stm_bgm_tool_battle, the
++// predicted stock VS theme) is deliberately NOT listed: it is what "Game
++// default" already plays, and the vanilla value must never be written.
++// Display names are best-effort stem translations; finalize EVERY label with a
++// listening pass through the selector before release.
++constexpr StyleOption MUSICS[] = {
++    {1313, "XD Battle 1 (wild battle)", Tier::TestedSafe},
++    {1314, "XD Battle 1b (wild variant)", Tier::TestedSafe},
++    {1315, "XD Battle 6 (trainer)", Tier::TestedSafe},
++    {1316, "XD Battle 8 (Cipher)", Tier::TestedSafe},
++    {1413, "XD Battle 0", Tier::TestedSafe},
++    {1127, "XD Battle 01", Tier::TestedSafe},
++    {1128, "XD Battle 02", Tier::TestedSafe},
++    {1407, "XD Battle 03", Tier::TestedSafe},
++    {1318, "Colosseum Round 1", Tier::TestedSafe},
++    {1319, "Colosseum Round 2", Tier::TestedSafe},
++    {1320, "Colosseum Round 3", Tier::TestedSafe},
++    {1321, "Colosseum Round 4", Tier::TestedSafe},
++    {1240, "Orre Colosseum Battle", Tier::TestedSafe},
++    {1241, "Pyrite Battle", Tier::TestedSafe},
++    {1242, "Realgam Battle", Tier::TestedSafe},
++    {1243, "Citadark Battle", Tier::TestedSafe},
++    {1390, "Miror B. Battle", Tier::TestedSafe},
++    {1251, "Final Battle (Greevil)", Tier::TestedSafe},
++    {1252, "Shadow Lugia Battle", Tier::TestedSafe},
++    {1264, "Battle Bingo", Tier::TestedSafe},
++    {1265, "Battle Sim", Tier::TestedSafe},
++    {1293, "Pokespot Battle", Tier::TestedSafe},
++    {1410, "Willie Battle", Tier::TestedSafe},
++    // Looping non-battle BGM (locations, themes, menus).
++    {1068, "Mt. Battle", Tier::Experimental},
++    {1075, "Pokemon Center", Tier::Experimental},
++    {1070, "Gateon Port", Tier::Experimental},
++    {1370, "Gateon Port 2", Tier::Experimental},
++    {1124, "HQ Lab", Tier::Experimental},
++    {1292, "S.S. Libra", Tier::Experimental},
++    {1317, "Snagem Hideout", Tier::Experimental},
++    {1341, "Citadark Isle", Tier::Experimental},
++    {1409, "Cipher Lab", Tier::Experimental},
++    {1129, "Purify Chamber", Tier::Experimental},
++    {1468, "Orre Colosseum Lobby", Tier::Experimental},
++    {1088, "Miror B. Theme", Tier::Experimental},
++    {1471, "Greevil Theme", Tier::Experimental},
++    {1486, "Hexagon Bros", Tier::Experimental},
++    {1362, "Lugia Theme", Tier::Experimental},
++    {1419, "Title Theme", Tier::Experimental},
++    {1266, "Battle Now Menu", Tier::Experimental},
++    {1267, "Group Battle Menu", Tier::Experimental},
++    {1485, "Battle Now 2", Tier::Experimental},
++    {1133, "World Map", Tier::Experimental},
++    {1193, "Mt. Battle Rest Area", Tier::Experimental},
++    {1194, "Mt. Battle Reception", Tier::Experimental},
++    {1126, "Krabby Club", Tier::Experimental},
++    {1343, "Bingo Lobby", Tier::Experimental},
++    {1342, "Pokespot", Tier::Experimental},
++    {1291, "Kaminko's Manor 2", Tier::Experimental},
++    {4, "Kaminko's Manor", Tier::Experimental},
++    {1132, "Mecha Theme 1", Tier::Experimental},
++    {1412, "Mecha Theme 2", Tier::Experimental},
++    {1371, "Chiriru Theme", Tier::Experimental},
++    {1383, "Music Player 1", Tier::Experimental},
++    {1384, "Music Player 2", Tier::Experimental},
++    {1066, "Life Theme", Tier::Experimental},
++    {1067, "Darkside 4", Tier::Experimental},
++    {1074, "Darkside", Tier::Experimental},
++    {1071, "Stand Theme", Tier::Experimental},
++    {1072, "Saint Theme", Tier::Experimental},
++    // Looping event (ev_*) streams; stems only, names pending the listening
++    // pass like everything above.
++    {1130, "Event Theme 1130", Tier::Experimental},
++    {1131, "Event Theme 1131", Tier::Experimental},
++    {1297, "Event Theme 1297", Tier::Experimental},
++    {1361, "Event Theme 1361", Tier::Experimental},
++    {1363, "Event Theme 1363", Tier::Experimental},
++    {1391, "Event Theme 1391", Tier::Experimental},
++    {1408, "Event Theme 1408", Tier::Experimental},
++    {1411, "Event Theme 1411", Tier::Experimental},
++    {1448, "Event Theme 1448", Tier::Experimental},
++    {1449, "Event Theme 1449", Tier::Experimental},
++    {1450, "Event Theme 1450", Tier::Experimental},
++    {1469, "Event Theme 1469", Tier::Experimental},
++    {1470, "Event Theme 1470", Tier::Experimental},
++    // The low-id block (unused/leftover streams).
++    {1, "Snowfreak (unused)", Tier::Experimental},
++    {2, "Shinpi (unused)", Tier::Experimental},
++    {3, "Tretre (unused)", Tier::Experimental},
++    {5, "Latin (unused)", Tier::Experimental},
++    {6, "Keio Azuchi (unused)", Tier::Experimental},
++    {7, "Shadow Event (unused)", Tier::Experimental},
++};
++
++// Battle locations (battlefield-table indices). tested-safe = the retail VS
++// colosseum pool; experimental = colosseum rooms the retail pool never offers
++// plus story battle maps (outdoor/cave/water rooms alter Nature Power /
++// Camouflage / Secret Power terrain -- test once if strict OU parity
++// matters). Index 0 (null staging entry), the story/staging duplicates and
++// anything >= 66 (GetBattleField returns NULL -> venue 0 -> hang risk) are
++// excluded by omission. "Game default" (absent) is stock Pyrite Colosseum.
++constexpr StyleOption VENUES[] = {
++    {36, "Pyrite Colosseum", Tier::TestedSafe},
++    {37, "Mt. Battle Colosseum", Tier::TestedSafe},
++    {38, "Realgam Colosseum", Tier::TestedSafe},
++    // Colosseums outside the retail VS pool.
++    {35, "Phenac Colosseum", Tier::Experimental},
++    {39, "Orre Colosseum", Tier::Experimental},
++    // Story battle maps; 54 is the best non-colosseum bet (the game's own demo
++    // battles stage there).
++    {54, "Gateon Port docks", Tier::Experimental},
++    {5, "Outskirt Stand", Tier::Experimental},
++    {7, "Phenac City streets", Tier::Experimental},
++    {9, "Phenac Pre Gym", Tier::Experimental},
++    {8, "Phenac house interior", Tier::Experimental},
++    {10, "Pyrite Town streets", Tier::Experimental},
++    {11, "Pyrite building", Tier::Experimental},
++    {12, "Pyrite cave (Miror B. hideout)", Tier::Experimental},
++    {14, "Agate Village", Tier::Experimental},
++    {15, "Agate cave", Tier::Experimental},
++    {16, "Relic Shrine", Tier::Experimental},
++    {17, "Cipher Lab grounds", Tier::Experimental},
++    {18, "Cipher Lab B1", Tier::Experimental},
++    {41, "Cipher Lab garage", Tier::Experimental},
++    {19, "Mt. Battle entrance", Tier::Experimental},
++    {20, "Mt. Battle lobby", Tier::Experimental},
++    {21, "Mt. Battle valley", Tier::Experimental},
++    {22, "Mt. Battle magma zone", Tier::Experimental},
++    {23, "Mt. Battle clouds", Tier::Experimental},
++    {42, "S.S. Libra deck", Tier::Experimental},
++    {24, "Realgam dome", Tier::Experimental},
++    {25, "Realgam Tower hall", Tier::Experimental},
++    {64, "Battle Bingo hall", Tier::Experimental},
++    {43, "Cipher Key Lair 1F", Tier::Experimental},
++    {44, "Cipher Key Lair roof", Tier::Experimental},
++    {63, "Cipher Key Lair dome", Tier::Experimental},
++    {45, "Cipher Key Lair grounds", Tier::Experimental},
++    {46, "Citadark dome 2F", Tier::Experimental},
++    {47, "Citadark dome B1", Tier::Experimental},
++    {48, "Citadark fort", Tier::Experimental},
++    {49, "Citadark outer dome", Tier::Experimental},
++    {50, "Citadark shore", Tier::Experimental},
++    {52, "Pokemon HQ Lab", Tier::Experimental},
++    {53, "HQ Lab grounds", Tier::Experimental},
++    {55, "Gateon lighthouse top", Tier::Experimental},
++    {56, "Kaminko's manor grounds", Tier::Experimental},
++    {34, "Snagem Hideout", Tier::Experimental},
++    {57, "Rock Pokespot", Tier::Experimental},
++    {58, "Oasis Pokespot", Tier::Experimental},
++    {59, "Cave Pokespot", Tier::Experimental},
++};
++
++const StyleOption* FindOption(std::span<const StyleOption> table, int id)
++{
++  for (const StyleOption& option : table)
++  {
++    if (option.id == id)
++      return &option;
++  }
++  return nullptr;
++}
++
++// ---------------------------------------------------------------------------
++// Session state
++// ---------------------------------------------------------------------------
++
++std::mutex s_mutex;
++// The guest's submitted model, already validated. Overwritten (or reset) by
++// every TeamData arrival; wins over the host's fallback dropdown.
++std::optional<int> s_guest_model;
++// True after PrepareForStart turned MAIN_ENABLE_CHEATS on for a cosmetics-only
++// session; tells RegenerateFromConfig the user's real OU choice is still OFF
++// and tells EndSession to give the flag back.
++bool s_cheats_forced = false;
++// Whether the most recent RegenerateIni left a non-empty block in the file.
++bool s_block_active = false;
++
++std::string LocalIniPath()
++{
++  return File::GetUserPath(D_GAMESETTINGS_IDX) + std::string(GAME_INI_NAME);
++}
++
++void AppendLine(std::string* block, u32 addr_word, u32 value_word)
++{
++  if (!block->empty())
++    block->push_back('\n');
++  *block += fmt::format("{:08X} {:08X}", addr_word, value_word);
++}
++
++// Remove every line of ours from a section's line list. For [ActionReplay]
++// that means the "$OrreLink Battle Style" name line plus everything up to the
++// next "$" name (or the section end); for the enabled/disabled sections it is
++// a single exact name line. Comparison ignores surrounding whitespace only --
++// user comments and codes are preserved byte for byte.
++std::vector<std::string> WithoutStyleBlock(const std::vector<std::string>& lines)
++{
++  std::vector<std::string> kept;
++  kept.reserve(lines.size());
++  bool in_ours = false;
++  for (const std::string& line : lines)
++  {
++    const std::string_view trimmed = StripWhitespace(line);
++    if (trimmed == STYLE_CODE_LINE)
++    {
++      in_ours = true;
++      continue;
++    }
++    if (in_ours && !trimmed.empty() && trimmed[0] == '$')
++      in_ours = false;
++    if (!in_ours)
++      kept.push_back(line);
++  }
++  return kept;
++}
++
++std::vector<std::string> WithoutExactLine(const std::vector<std::string>& lines,
++                                          std::string_view target)
++{
++  std::vector<std::string> kept;
++  kept.reserve(lines.size());
++  for (const std::string& line : lines)
++  {
++    if (StripWhitespace(line) != target)
++      kept.push_back(line);
++  }
++  return kept;
++}
++
++// SetLines, or drop the section entirely when nothing of substance remains --
++// so an all-default regenerate leaves the user's file as clean as it found it.
++void StoreSection(Common::IniFile* ini, std::string_view section, std::vector<std::string> lines)
++{
++  bool only_blank = true;
++  for (const std::string& line : lines)
++  {
++    if (!StripWhitespace(line).empty())
++    {
++      only_blank = false;
++      break;
++    }
++  }
++  if (only_blank)
++    ini->DeleteSection(section);
++  else
++    ini->SetLines(section, std::move(lines));
++}
++}  // namespace
++
++std::span<const StyleOption> ModelTable()
++{
++  return MODELS;
++}
++
++std::span<const StyleOption> MusicTable()
++{
++  return MUSICS;
++}
++
++std::span<const StyleOption> VenueTable()
++{
++  return VENUES;
++}
++
++bool IsValidModelId(int id)
++{
++  return FindOption(MODELS, id) != nullptr;
++}
++
++bool IsValidMusicId(int id)
++{
++  return FindOption(MUSICS, id) != nullptr;
++}
++
++bool IsValidVenueId(int id)
++{
++  return FindOption(VENUES, id) != nullptr;
++}
++
++std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2_model,
++                              std::optional<int> bgm, std::optional<int> venue)
++{
++  // Each field independently: an id that fails validation is treated as absent
++  // (fall back, never clamp -- an out-of-table model id dereferences garbage
++  // past trainer_pkx_data, an out-of-table venue can hang the battle load).
++  const bool p1 = p1_model && IsValidModelId(*p1_model);
++  const bool p2 = p2_model && IsValidModelId(*p2_model);
++  const bool music = bgm && IsValidMusicId(*bgm);
++  const bool location = venue && IsValidVenueId(*venue);
++
++  std::string block;
++  if (!p1 && !p2 && !music && !location)
++    return block;  // genuine game default: no code at all
++
++  // Guard line first: "00000000 40000000" is the AR full terminator. On the
++  // host -- where this runs as its own fresh code -- it is a no-op (Dolphin
++  // logs it as an unsupported zero code and moves on), but a GUEST executes
++  // every synced code merged into ONE "Synced Codes" stream, where an
++  // all-lines-until conditional leaked by an earlier code would otherwise
++  // swallow our writes. The terminator closes any such scope. Our own lines
++  // are unconditional 04/02 writes, so nothing here can leak forward either.
++  AppendLine(&block, 0x00000000, 0x40000000);
++
++  if (p1)
++  {
++    // nops first, then the pinned "li r3, id" sites (see MODEL_P1_LINES).
++    AppendLine(&block, MODEL_P1_LINES[0], PPC_NOP);
++    AppendLine(&block, MODEL_P1_LINES[1], PPC_NOP);
++    const u32 li = PPC_LI_R3 | (static_cast<u32>(*p1_model) & 0xFF);
++    AppendLine(&block, MODEL_P1_LINES[2], li);
++    AppendLine(&block, MODEL_P1_LINES[3], li);
++    AppendLine(&block, MODEL_P1_LINES[4], li);
++  }
++  if (p2)
++  {
++    AppendLine(&block, MODEL_P2_LINE, PPC_LI_R3 | (static_cast<u32>(*p2_model) & 0xFF));
++  }
++  if (music)
++  {
++    // Three identical u32 slots (primary encoding; see MUSIC_LINES).
++    const u32 value = static_cast<u32>(*bgm) & 0xFFFF;
++    for (const u32 addr : MUSIC_LINES)
++      AppendLine(&block, addr, value);
++  }
++  if (location)
++  {
++    // All four link-battle records, 16-bit writes (value's upper half = fill
++    // count 0, i.e. one write each; see VENUE_LINES).
++    const u32 value = static_cast<u32>(*venue) & 0xFFFF;
++    for (const u32 addr : VENUE_LINES)
++      AppendLine(&block, addr, value);
++  }
++  return block;
++}
++
++Selection ConfigSelection()
++{
++  Selection sel;
++  sel.host_model = Config::Get(Config::MAIN_XD_STYLE_HOST_MODEL);
++  sel.guest_model_fallback = Config::Get(Config::MAIN_XD_STYLE_GUEST_MODEL);
++  sel.music = Config::Get(Config::MAIN_XD_STYLE_MUSIC);
++  sel.venue = Config::Get(Config::MAIN_XD_STYLE_VENUE);
++  return sel;
++}
++
++void BeginSession()
++{
++  {
++    std::lock_guard lock(s_mutex);
++    s_guest_model.reset();
++    s_cheats_forced = false;
++    s_block_active = false;
++  }
++  // All-default = pure removal of anything a crashed session left behind.
++  RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
++}
++
++void SetGuestModel(std::optional<int> id)
++{
++  std::lock_guard lock(s_mutex);
++  if (id && IsValidModelId(*id))
++    s_guest_model = *id;
++  else
++    s_guest_model.reset();  // no/invalid preference: the host fallback wins
++}
++
++bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
++{
++  // Guest stash (already validated) wins over the host's fallback dropdown --
++  // the same precedence the socket-3 team fallback uses.
++  std::optional<int> guest_model;
++  {
++    std::lock_guard lock(s_mutex);
++    guest_model = s_guest_model;
++  }
++  const bool guest_submitted = guest_model.has_value();
++  if (!guest_model)
++    guest_model = sel.guest_model_fallback > 0 ? std::optional<int>(sel.guest_model_fallback) :
++                                                 std::nullopt;
++
++  // Side mapping (host -> "Player" block, guest -> "Opponent" line) is the
++  // expected orientation; if the one-time emulator test shows it reversed,
++  // swap the first two arguments HERE only.
++  const std::string block = GenerateCodeBlock(
++      sel.host_model > 0 ? std::optional<int>(sel.host_model) : std::nullopt, guest_model,
++      sel.music > 0 ? std::optional<int>(sel.music) : std::nullopt,
++      sel.venue > 0 ? std::optional<int>(sel.venue) : std::nullopt);
++  const bool active = !block.empty();
++
++  const std::string path = LocalIniPath();
++  Common::IniFile ini;
++  ini.Load(path);
++
++  // IniFile's Load->Save round trip is lossy (blank lines and comments are
++  // normalized away), and this function runs on EVERY room close, for any
++  // game. So the file is only written when this call actually changes it:
++  // something of ours removed, or something new to add. A user's hand-kept
++  // GXXE01.ini survives a hundred Melee rooms untouched, and no empty file is
++  // ever created just to hold nothing.
++  bool removed_any = false;
++
++  // [ActionReplay]: strip any previous block of ours, then append the fresh
++  // one at the end -- SyncCodes ships codes in file order, so the generated
++  // block always lands after the Sys-bundled codes AND after the user's own.
++  {
++    std::vector<std::string> lines;
++    ini.GetLines("ActionReplay", &lines, false);
++    const std::size_t before = lines.size();
++    lines = WithoutStyleBlock(lines);
++    removed_any |= lines.size() != before;
++    if (active)
++    {
++      lines.emplace_back(STYLE_CODE_LINE);
++      for (const std::string& op : SplitString(block, '\n'))
++        lines.push_back(op);
++    }
++    StoreSection(&ini, "ActionReplay", std::move(lines));
++  }
++
++  // [ActionReplay_Enabled]: our "$" line, exactly how Sys enables OU Fixes.
++  {
++    std::vector<std::string> lines;
++    ini.GetLines("ActionReplay_Enabled", &lines, false);
++    const std::size_t before = lines.size();
++    lines = WithoutExactLine(lines, STYLE_CODE_LINE);
++    removed_any |= lines.size() != before;
++    if (active)
++      lines.emplace_back(STYLE_CODE_LINE);
++    StoreSection(&ini, "ActionReplay_Enabled", std::move(lines));
++  }
++
++  // [ActionReplay_Disabled]: only while cosmetics force cheats on for a host
++  // whose OU toggle is off does the Sys-enabled "$XD OU Fixes" need a local
++  // disable. Note this also removes an identical line the user might have
++  // written by hand -- acceptable, because the launcher's OU toggle (not a
++  // hand edit) is the supported control for that code.
++  {
++    std::vector<std::string> lines;
++    ini.GetLines("ActionReplay_Disabled", &lines, false);
++    const std::size_t before = lines.size();
++    lines = WithoutExactLine(lines, OU_FIXES_LINE);
++    removed_any |= lines.size() != before;
++    if (active && !ou_enabled)
++      lines.emplace_back(OU_FIXES_LINE);
++    StoreSection(&ini, "ActionReplay_Disabled", std::move(lines));
++  }
++
++  if (!active && !removed_any)
++  {
++    // Nothing of ours in the file and nothing to add: leave the disk alone.
++    std::lock_guard lock(s_mutex);
++    s_block_active = false;
++    if (status)
++      *status = "battle style: game default";
++    return true;
++  }
++
++  File::CreateFullPath(path);
++  const bool saved = ini.Save(path);
++
++  {
++    std::lock_guard lock(s_mutex);
++    s_block_active = saved && active;
++  }
++
++  if (status)
++  {
++    if (!saved)
++    {
++      *status = "battle style: could not write " + std::string(GAME_INI_NAME);
++    }
++    else if (!active)
++    {
++      *status = "battle style: game default";
++    }
++    else
++    {
++      const auto describe = [](std::span<const StyleOption> table, std::optional<int> id) {
++        const StyleOption* option = id ? FindOption(table, *id) : nullptr;
++        return std::string(option ? option->name : "default");
++      };
++      *status = fmt::format("battle style: host model {}, guest model {}{}, music {}, venue {}",
++                            describe(MODELS, sel.host_model), describe(MODELS, guest_model),
++                            guest_submitted ? " (guest's pick)" : "", describe(MUSICS, sel.music),
++                            describe(VENUES, sel.venue));
++    }
++  }
++  return saved;
++}
++
++bool RegenerateFromConfig(std::string* status)
++{
++  bool forced;
++  {
++    std::lock_guard lock(s_mutex);
++    forced = s_cheats_forced;
++  }
++  // Once PrepareForStart has forced cheats on, MAIN_ENABLE_CHEATS no longer
++  // reflects the user's OU choice -- it was OFF, or no force would have
++  // happened. Without this, the regenerate before a SECOND Start in the same
++  // room would drop the OU-Fixes disable and hand the guest OU patches the
++  // host never asked for.
++  const bool ou_enabled = !forced && Config::Get(Config::MAIN_ENABLE_CHEATS);
++  return RegenerateIni(ConfigSelection(), ou_enabled, status);
++}
++
++void PrepareForStart()
++{
++  RegenerateFromConfig(nullptr);
++
++  bool active;
++  bool forced;
++  {
++    std::lock_guard lock(s_mutex);
++    active = s_block_active;
++    forced = s_cheats_forced;
++  }
++  // The AR engine and SyncCodes are both gated on the host's global cheats
++  // flag; a cosmetic pick with the OU toggle off would silently do nothing
++  // without this. Runs before RequestStartGame, therefore before the
++  // SetupNetSettings snapshot and the SyncCodes INI read. When nothing is
++  // active the flag is left entirely alone -- a stock session stays stock.
++  if (active && !forced && !Config::Get(Config::MAIN_ENABLE_CHEATS))
++  {
++    {
++      std::lock_guard lock(s_mutex);
++      s_cheats_forced = true;
++    }
++    // RegenerateFromConfig above already saw the pre-force value (OU off) and
++    // wrote the "$XD OU Fixes" local disable, so forcing afterwards is safe.
++    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
++  }
++  else if (!active && forced)
++  {
++    // The force is a per-start invariant, not a latch. If the block emptied
++    // between battles in the same room (guest re-submitted without a model,
++    // host zeroed the dropdowns), the regenerate above stripped the OU-Fixes
++    // disable -- so leaving cheats forced on would ship Sys-enabled OU
++    // patches the host's toggle says are OFF. Give the flag back before the
++    // SetupNetSettings snapshot reads it.
++    {
++      std::lock_guard lock(s_mutex);
++      s_cheats_forced = false;
++    }
++    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
++  }
++}
++
++void EndSession()
++{
++  bool forced;
++  {
++    std::lock_guard lock(s_mutex);
++    s_guest_model.reset();
++    forced = s_cheats_forced;
++    s_cheats_forced = false;
++  }
++  // Pure removal: with the stash cleared and an all-default selection this
++  // strips the block, its enabled line and the OU-Fixes disable, leaving the
++  // user's GXXE01.ini as it was before the session.
++  RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
++  // Give the cheats flag back if the pre-start hook forced it: the user's OU
++  // toggle reads this key, and leaving it flipped would turn a cosmetics-only
++  // session into OU rules next time.
++  if (forced)
++  {
++    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
++    Config::Save();
++  }
++}
++}  // namespace XDNetplay::BattleCustomizer
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+new file mode 100644
+index 0000000..7e9cb0f
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+@@ -0,0 +1,178 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <span>
++#include <string>
++
++namespace XDNetplay::BattleCustomizer
++{
++// ---------------------------------------------------------------------------
++// Cosmetic battle selectors ("$OrreLink Battle Style")
++// ---------------------------------------------------------------------------
++//
++// Three purely cosmetic choices for the XD GBA-vs-GBA netplay battle -- the
++// trainer models, the battle music and the battle location -- realized as ONE
++// host-assembled ActionReplay code that rides the EXISTING enabled-codes sync
++// (NetPlayServer::SyncCodes ships codes by full text, NETPLAY_SYNC_CODES is
++// already forced on). The per-player choice happens at ASSEMBLY time on the
++// host, never as per-client codes, so both clients always execute an identical
++// instruction stream and the feature cannot introduce a desync.
++//
++// Who picks what:
++//  - the HOST picks its own model, the music and the location in the launcher
++//    (persisted in the MAIN_XD_STYLE_* config keys);
++//  - the GUEST picks its own model. The choice travels as a "Model:" header
++//    line in the existing MessageID::TeamData payload (grammar documented in
++//    TeamInjector.h) and is stashed here via SetGuestModel;
++//  - the host's "Guest model" dropdown is ONLY the fallback for a guest that
++//    never submitted one -- mirroring exactly how the socket-3 team fallback
++//    works.
++//
++// "Game default" genuinely means the code is ABSENT. No section ever writes a
++// vanilla value back, so an all-default session is byte-for-byte a stock
++// session and the feature can never regress one. With zero enabled codes,
++// SyncCodes still runs and sends an empty list -- the guest clears its synced
++// set, which is equally stock.
++//
++// Where the code lives: the on-disk local game INI, User/GameSettings/
++// GXXE01.ini. That is the ONE place a session-generated code can go, because
++// both consumers read it straight from disk: NetPlayServer::SyncCodes builds
++// its own IniFile pair from Sys + User GameSettings, and the host's own boot
++// re-reads the same files (PatchEngine::LoadPatches -> ActionReplay::
++// LoadCodes). Host and wire therefore always agree. The block is written with
++// surgical GetLines/SetLines edits (the ARCodeWidget::SaveCodes idiom) so the
++// user's own codes in that file are never touched.
++//
++// Cheats gating: nothing ships unless the host's MAIN_ENABLE_CHEATS is true
++// when RequestStartGame runs (SetupNetSettings snapshots it; guests inherit
++// it through the netplay config layer). The launcher equates that flag with
++// its "OU rules ($XD OU Fixes)" toggle, so when a cosmetic is active while
++// the OU toggle is OFF, PrepareForStart forces cheats on and RegenerateIni
++// writes "$XD OU Fixes" into the local [ActionReplay_Disabled] -- the local
++// pass of ReadEnabledAndDisabled can disable a Sys-bundled code -- keeping
++// the OU patches off while the cosmetic block runs. EndSession undoes both.
++//
++// Every address in the generated block is NTSC-U (GXXE01) ONLY. The block is
++// keyed to the GXXE01 local INI, so a future PAL/JP experiment cannot inherit
++// these patches.
++
++// "tested-safe" entries are things the vanilla game itself does in this
++// context (vanilla battling trainers covered by Ralf's community-circulated
++// modifier codes; the retail VS colosseum pool; looping battle-context BGM
++// streams). "experimental" entries are valid table data that vanilla never
++// uses quite this way -- offer them behind an "Experimental" divider until
++// smoke-tested. IDs the research EXCLUDED (crash/hang/silence risks) are not
++// in these tables at all: validation is table membership, so they can neither
++// be offered by the launcher nor smuggled in by a guest submission.
++enum class Tier
++{
++  TestedSafe,
++  Experimental,
++};
++
++struct StyleOption
++{
++  // models: trainer model id (index into the 0x44-entry trainer_pkx_data
++  //         table at 0x8040CE88);
++  // music:  BGM stream id (the id space of XD's RoomBGM/battle BGM fields);
++  // venues: battlefield-table index (consumed via GetBattleField).
++  int id;
++  // Launcher display name. Music names marked provisional in the .cpp must be
++  // finalized by a listening pass through the selector before release.
++  const char* name;
++  Tier tier;
++};
++
++// The tables, tested-safe entries first, then experimental -- a dropdown can
++// insert its divider at the first tier change. "Game default" is NOT an entry:
++// it is the absence of a selection (id <= 0 / std::nullopt everywhere here).
++std::span<const StyleOption> ModelTable();
++std::span<const StyleOption> MusicTable();
++std::span<const StyleOption> VenueTable();
++
++// Table membership. Anything else -- including the excluded ids 0x00/0x0A
++// (no-model enum entries, expect invisible trainer or hang), ids past the
++// 0x44-entry model table (garbage pointer read), venue 0 / >= 66 (NULL
++// battlefield -> hang risk) and non-looping jingle BGM (permanent silence) --
++// must be treated as ABSENT by callers: silently fall back, never clamp.
++bool IsValidModelId(int id);
++bool IsValidMusicId(int id);
++bool IsValidVenueId(int id);
++
++// Pure assembly: returns the op lines of the "$OrreLink Battle Style" AR code
++// (one "AAAAAAAA VVVVVVVV" per line, '\n'-separated, no "$" name line), or an
++// EMPTY string when every field is absent -- the caller must then emit no code
++// at all. std::nullopt (or any id that fails the predicates above) means
++// "game default" for that field and contributes NO lines; each field is fully
++// independent.
++//
++// p1_model patches the "Player" side of the battle, p2_model the "Opponent"
++// side. Which physical player (host vs guest) renders on which side in the
++// GBA-vs-GBA mode is still unverified -- if an emulator test shows it
++// reversed, swap the two arguments AT THE CALL SITE (RegenerateIni); the code
++// lines themselves do not change.
++std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2_model,
++                              std::optional<int> bgm, std::optional<int> venue);
++
++// The host's four launcher selections. 0 (the config default) = game default.
++struct Selection
++{
++  int host_model = 0;
++  int guest_model_fallback = 0;
++  int music = 0;
++  int venue = 0;
++};
++
++// Reads the four MAIN_XD_STYLE_* config keys.
++Selection ConfigSelection();
++
++// Session-boundary scrub: clears the stashed guest model and removes any
++// "$OrreLink Battle Style" block a crashed session left orphaned in
++// User/GameSettings/GXXE01.ini (plus its enabled line and the OU-Fixes local
++// disable), so stale cosmetics can never leak into a solo boot or the next
++// session. Call when a hosting flow begins (desktop: EnsureGbaConfig;
++// Android: nativeHost). Do NOT call while a room is open -- it would discard
++// a guest's submitted model.
++void BeginSession();
++
++// Stash the guest's submitted model (host side, netplay thread). Called on
++// EVERY TeamData arrival: a value that fails IsValidModelId -- including
++// nullopt, i.e. no "Model:" header -- RESETS the stash to "no preference", so
++// the latest submission is always the guest's current word and the host's
++// fallback dropdown wins again. The id is untrusted remote input; invalid
++// values are dropped here, never clamped. Cleared by Begin/EndSession.
++void SetGuestModel(std::optional<int> id);
++
++// Rewrites the "$OrreLink Battle Style" block in User/GameSettings/GXXE01.ini
++// from sel (+ the stashed guest model, which wins over sel.guest_model_
++// fallback), enables it via [ActionReplay_Enabled], and -- only while the
++// block is active AND ou_enabled is false -- disables the Sys-bundled
++// "$XD OU Fixes" via [ActionReplay_Disabled]. An all-default call is a pure
++// removal. status, when given, receives a one-line human-readable summary.
++bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status);
++
++// RegenerateIni driven entirely by config: selection from the MAIN_XD_STYLE_*
++// keys, ou_enabled from MAIN_ENABLE_CHEATS (corrected for a force applied by
++// PrepareForStart earlier in this session, so a second Start in the same room
++// cannot mistake our own forcing for the user's OU choice). This is the call
++// for the host's TeamData handlers: regenerate on every submission arrival so
++// a model submitted any time before Start is honored.
++bool RegenerateFromConfig(std::string* status);
++
++// The pre-start hook, host side, strictly before RequestStartGame (desktop:
++// ApplyStartForcing; Android: nativeStartGame): regenerates the block once
++// more, then -- only when the block is non-empty -- forces MAIN_ENABLE_CHEATS
++// on so the block actually loads and ships (see the gating note above).
++// A submission that arrives after this point is rejected by the server while
++// the battle runs, so the synced set can never diverge mid-session.
++void PrepareForStart();
++
++// End-of-session cleanup, next to RestoreHostTeam in the OnRoomClosed hooks:
++// clears the guest stash, removes the block/enabled/disabled lines (pure
++// removal -- the file is stock again), and gives MAIN_ENABLE_CHEATS back to
++// the user if PrepareForStart forced it on this session.
++void EndSession();
++}  // namespace XDNetplay::BattleCustomizer
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index 91f0c4b..abcdf8e 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -5,6 +5,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <charconv>
+ #include <mutex>
+ #include <optional>
+ #include <string>
+@@ -21,6 +22,7 @@
+ #include "Common/FileUtil.h"
+ #include "Common/HookableEvent.h"
+ #include "Common/IOFile.h"
++#include "Common/StringUtil.h"
+ 
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
+@@ -53,7 +55,59 @@ constexpr const char* BACKUP_SUFFIX = ".bak";
+ constexpr const char* TMP_SUFFIX = ".tmp";
+ 
+ // See TeamInjector.h for the payload grammar.
+-constexpr std::string_view NAME_HEADER_PREFIX = "Name:";
++constexpr std::string_view NAME_HEADER_KEY = "Name";
++constexpr std::string_view MODEL_HEADER_KEY = "Model";
++// Headers are framing, not a payload channel: both value lines stay bounded.
++constexpr size_t MAX_NAME_LINE = 64;
++constexpr size_t MAX_MODEL_VALUE = 32;
++
++// A line containing only spaces/tabs/CR (or nothing) terminates the header
++// block. Same blank test the original single-header grammar used.
++bool IsBlankLine(std::string_view line)
++{
++  return line.find_first_not_of(" \t\r") == std::string_view::npos;
++}
++
++// Split "Key: value" where the key has the exact shape
++// [A-Za-z][A-Za-z0-9_-]* immediately followed by ':'. Returns false when the
++// line does not fit -- which, per the grammar, aborts the whole header block.
++bool SplitHeaderLine(std::string_view line, std::string_view* key, std::string_view* value)
++{
++  if (line.empty() || !Common::IsAlpha(line[0]))
++    return false;
++  size_t i = 1;
++  while (i < line.size() && (Common::IsAlnum(line[i]) || line[i] == '_' || line[i] == '-'))
++    ++i;
++  if (i >= line.size() || line[i] != ':')
++    return false;
++  *key = line.substr(0, i);
++  *value = line.substr(i + 1);
++  return true;
++}
++
++// "Model:" value: an integer, decimal or 0xHH hex. Untrusted remote text --
++// anything that does not parse cleanly is "no preference", never an error.
++std::optional<int> ParseModelValue(std::string_view value)
++{
++  value = StripWhitespace(value);
++  if (value.empty() || value.size() > MAX_MODEL_VALUE)
++    return std::nullopt;
++
++  int base = 10;
++  if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X'))
++  {
++    base = 16;
++    value.remove_prefix(2);
++  }
++
++  int result = 0;
++  const char* const first = value.data();
++  const char* const last = first + value.size();
++  const auto [ptr, ec] = std::from_chars(first, last, result, base);
++  if (ec != std::errc{} || ptr != last)
++    return std::nullopt;
++  return result;
++}
+ 
+ // The save path netplay will read for this socket, or empty when the setup
+ // isn't complete enough to have one.
+@@ -240,9 +294,9 @@ bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
+ #endif
+ 
+ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+-                                       const std::string& trainer_name)
++                                       const std::string& trainer_name, std::optional<int> model)
+ {
+-  // A newline in the name would forge a second header/blank line, so flatten
++  // A newline in the name would forge extra header/blank lines, so flatten
+   // any line break to a space before it goes on the wire. The 7-character Gen 3
+   // clamp is deliberately NOT applied here: the host sanitizes what it receives
+   // and is the only side whose opinion counts.
+@@ -251,54 +305,66 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+   for (const char c : trainer_name)
+     one_line.push_back(c == '\n' || c == '\r' ? ' ' : c);
+ 
+-  // Keep the line bounded; the header is framing, not a payload channel.
+-  constexpr size_t MAX_NAME_LINE = 64;
+   if (one_line.size() > MAX_NAME_LINE)
+     one_line.resize(MAX_NAME_LINE);
+ 
+-  if (one_line.find_first_not_of(" \t") == std::string::npos)
++  std::string headers;
++  if (one_line.find_first_not_of(" \t") != std::string::npos)
++    headers += std::string(NAME_HEADER_KEY) + ": " + one_line + "\n";
++  // "Game default" (or anything nonsensical) means no Model line at all; the
++  // host's own fallback dropdown then decides.
++  if (model && *model > 0)
++    headers += std::string(MODEL_HEADER_KEY) + ": " + std::to_string(*model) + "\n";
++
++  if (headers.empty())
+     return showdown_text;  // nothing to say -- emit the old bare format
+ 
+-  return std::string(NAME_HEADER_PREFIX) + " " + one_line + "\n\n" + showdown_text;
++  return headers + "\n" + showdown_text;
+ }
+ 
+ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+ {
+   TeamSubmission out;
+-
+-  // The header only counts at byte 0. Anything else is team text.
+-  if (payload.compare(0, NAME_HEADER_PREFIX.size(), NAME_HEADER_PREFIX) != 0)
+-  {
+-    out.showdown_text = payload;
+-    return out;
+-  }
+-  const size_t eol = payload.find('\n');
+-  if (eol == std::string::npos)
++  // Until a complete, blank-line-terminated header block proves otherwise,
++  // the whole payload is team text (the pre-header behavior).
++  out.showdown_text = payload;
++
++  std::string name;
++  std::optional<int> model;
++  bool any_header = false;
++  size_t pos = 0;
++  while (pos < payload.size())
+   {
+-    out.showdown_text = payload;
+-    return out;
+-  }
++    const size_t eol = payload.find('\n', pos);
++    if (eol == std::string::npos)
++      return out;  // payload ended before the blank line: no header block
++    const std::string_view line(payload.data() + pos, eol - pos);
+ 
+-  // The header line must be followed by a blank line. That is what makes a
+-  // Showdown export -- whose first line is always followed by more set lines --
+-  // impossible to mistake for a header.
+-  size_t rest = eol + 1;
+-  size_t blank_end = rest;
+-  while (blank_end < payload.size() && (payload[blank_end] == ' ' || payload[blank_end] == '\t' ||
+-                                        payload[blank_end] == '\r'))
+-  {
+-    ++blank_end;
+-  }
+-  if (blank_end >= payload.size() || payload[blank_end] != '\n')
+-  {
+-    out.showdown_text = payload;
+-    return out;
+-  }
++    if (IsBlankLine(line))
++    {
++      if (!any_header)
++        return out;  // a blank FIRST line is not a header block
++      out.trainer_name = std::move(name);  // trimmed/sanitized by the caller
++      out.model = model;
++      out.showdown_text = payload.substr(eol + 1);
++      return out;
++    }
+ 
+-  std::string name = payload.substr(NAME_HEADER_PREFIX.size(), eol - NAME_HEADER_PREFIX.size());
+-  out.trainer_name = std::move(name);  // trimmed/sanitized by the caller
+-  out.showdown_text = payload.substr(blank_end + 1);
+-  return out;
++    std::string_view key;
++    std::string_view value;
++    if (!SplitHeaderLine(line, &key, &value))
++      return out;  // the run broke before a blank line: team text after all
++
++    // Recognized keys; unknown ones are skipped harmlessly (TeamInjector.h).
++    if (key == NAME_HEADER_KEY)
++      name = std::string(value);
++    else if (key == MODEL_HEADER_KEY)
++      model = ParseModelValue(value);
++
++    any_header = true;
++    pos = eol + 1;
++  }
++  return out;  // ran off the end without a blank line
+ }
+ 
+ bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index fd84646..25acfe1 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -3,6 +3,7 @@
+ 
+ #pragma once
+ 
++#include <optional>
+ #include <string>
+ 
+ namespace XDNetplay
+@@ -11,46 +12,71 @@ namespace XDNetplay
+ // MessageID::TeamData payload format
+ // ---------------------------------------------------------------------------
+ //
+-// The payload is still ONE string (no second message type). A submission that
+-// carries an in-game trainer name prefixes the Showdown text with a header
+-// line and a blank line:
++// The payload is still ONE string (no second message type). A submission may
++// prefix the Showdown text with a HEADER BLOCK: a run of "Key: value" lines
++// followed by one blank line:
+ //
+ //     Name: Logan\n
++//     Model: 43\n
+ //     \n
+ //     Blaziken @ Life Orb\n
+ //     ...
+ //
+ // Rules, deliberately narrow so a Showdown export can never be mistaken for a
+-// header:
+-//  - the header is recognized ONLY at byte 0 of the payload, ONLY as the exact
+-//    ASCII prefix "Name:" (case-sensitive), and ONLY when the line that
+-//    follows it is blank. A Showdown set's first line is a species/nickname
+-//    line and is never followed by a blank line, so a plain export cannot trip
+-//    this.
+-//  - everything after "Name:" up to the newline is the name (trimmed and
+-//    sanitized host-side; see EmeraldSave::SanitizeTrainerName).
++// header block:
++//  - the block is recognized ONLY at byte 0 of the payload. Every line up to
++//    the first blank line must be a header line -- a key of the exact shape
++//    [A-Za-z][A-Za-z0-9_-]* immediately followed by ':' -- and that blank
++//    line must exist. If ANY line breaks the run, or the payload ends before
++//    a blank line, the WHOLE payload is team text (the pre-header behavior).
++//  - why an export cannot trip this: some real set lines do look like headers
++//    ("Type: Null @ Eviolite" -- Type: Null is a species -- and "Ability:"/
++//    "EVs:"/"IVs:" lines), but every playable set breaks the run before its
++//    blank line with a nature line ("Adamant Nature") or a move line
++//    ("- Protect"), neither of which fits the key shape. Only a degenerate
++//    set with no moves and no nature could be eaten, and that is not a
++//    playable set to begin with.
++//  - recognized keys, both case-sensitive:
++//      "Name"  -- in-game trainer name. Everything after the colon up to the
++//                 newline, trimmed and sanitized HOST-side (see
++//                 EmeraldSave::SanitizeTrainerName).
++//      "Model" -- the guest's cosmetic trainer-model pick for the battle
++//                 style feature, an integer in decimal or 0xHH hex. The value
++//                 is untrusted remote text: it is parsed here, but VALIDATED
++//                 by the host against BattleCustomizer's model table. Absent
++//                 or unparseable means "no preference" (the host's fallback
++//                 dropdown wins) and MUST NOT reject the team; an unknown id
++//                 is dropped, never clamped.
++//    Unknown keys are skipped harmlessly. Netplay refuses mismatched builds,
++//    so both ends of a session always speak the same grammar -- the skipping
++//    is robustness, not a compatibility channel.
+ //  - anything after the blank line is the Showdown text, byte for byte.
+ //
+ // Backward compatibility, both directions:
+-//  - a payload with no header parses as name = "" and the whole payload as
+-//    Showdown text, which is exactly what pre-name clients send;
+-//  - a pre-name HOST handed a header payload feeds the two extra lines to
+-//    ShowdownParser, which skips them as unrecognized -- the team still lands,
+-//    only the rename is lost.
++//  - a payload with no header block parses as name = "", no model, and the
++//    whole payload as Showdown text, which is exactly what pre-header clients
++//    send (the original "Name:"-only single-header grammar is a strict subset
++//    of this one, so those payloads parse identically);
++//  - a pre-header HOST handed a header payload feeds the extra lines to
++//    ShowdownParser, which skips them as unrecognized -- the team still
++//    lands, only the rename/model are lost.
+ struct TeamSubmission
+ {
+-  std::string trainer_name;  // "" when the payload carried no header
++  std::string trainer_name;  // "" when the payload carried no Name header
++  std::optional<int> model;  // "Model:" header; nullopt = no preference
+   std::string showdown_text;
+ };
+ 
+-// Joiner side: wrap showdown_text with the trainer-name header. An empty (or
+-// whitespace-only) name produces a bare payload identical to the old format.
+-// Newlines in the name are replaced with spaces so they cannot forge framing.
++// Joiner side: wrap showdown_text with the header block. An empty (or
++// whitespace-only) name and an absent model produce a bare payload identical
++// to the old format. Newlines in the name are replaced with spaces so they
++// cannot forge framing; a model without a value (or <= 0) emits no line.
+ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+-                                       const std::string& trainer_name);
++                                       const std::string& trainer_name,
++                                       std::optional<int> model = std::nullopt);
+ 
+-// Host side: split a received payload. Never fails -- an unparseable header is
+-// simply treated as part of the team text.
++// Host side: split a received payload. Never fails -- an unparseable header
++// block is simply treated as part of the team text.
+ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload);
+ 
+ // Writes a Showdown-format team into the GBA save the netplay host syncs to
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 5311897..36f7ae0 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.1.1";
++constexpr char VERSION[] = "1.2.0";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
