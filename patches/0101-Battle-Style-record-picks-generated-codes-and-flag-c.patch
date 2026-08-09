@@ -1,4 +1,4 @@
-From 1bbc9d4f4a04cb5feb0ab21912ced43e0ad5d42c Mon Sep 17 00:00:00 2001
+From 283c4c5c44e924cbc6033bf4a96f0928eb037984 Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sun, 9 Aug 2026 12:15:07 -0700
 Subject: [PATCH] Battle Style: record picks, generated codes and flag changes
@@ -7,8 +7,8 @@ Subject: [PATCH] Battle Style: record picks, generated codes and flag changes
 ---
  Source/Core/Core/HW/GBADetectLog.cpp          | 24 ++++++++
  Source/Core/Core/HW/GBADetectLog.h            |  7 +++
- .../UICommon/XDNetplay/BattleCustomizer.cpp   | 56 +++++++++++++++++--
- 3 files changed, 82 insertions(+), 5 deletions(-)
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 61 +++++++++++++++++--
+ 3 files changed, 86 insertions(+), 6 deletions(-)
 
 diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
 index 22c1c90..17f68d2 100644
@@ -78,7 +78,7 @@ index 05760d0..fec8967 100644
  //
  // OnDeviceDestroyed() closes the file as soon as the last GBA device is torn
 diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
-index 8c34d7a..a2dd273 100644
+index 8c34d7a..f28a958 100644
 --- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
 +++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
 @@ -21,6 +21,10 @@
@@ -157,7 +157,19 @@ index 8c34d7a..a2dd273 100644
    const std::string path = LocalIniPath();
    Common::IniFile ini;
    ini.Load(path);
-@@ -736,6 +774,7 @@ void PrepareForStart()
+@@ -701,7 +739,10 @@ void PrepareForStart()
+   // something of ours is actually in it.
+   static std::once_flag hook_once;
+   std::call_once(hook_once, [] {
+-    Core::AddOnStateChangedCallback([](Core::State state) {
++    // The handle is [[nodiscard]] and dropping it unregisters the hook -- a
++    // static keeps it alive for the process, same as TeamInjector's.
++    static Common::EventHook s_state_hook;
++    s_state_hook = Core::AddOnStateChangedCallback([](Core::State state) {
+       if (state != Core::State::Uninitialized)
+         return;
+       {
+@@ -736,6 +777,7 @@ void PrepareForStart()
      // RegenerateFromConfig above already saw the pre-force value (OU off) and
      // wrote the "$XD OU Fixes" local disable, so forcing afterwards is safe.
      Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
@@ -165,7 +177,7 @@ index 8c34d7a..a2dd273 100644
    }
    else if (!active && forced)
    {
-@@ -750,6 +789,7 @@ void PrepareForStart()
+@@ -750,6 +792,7 @@ void PrepareForStart()
        s_cheats_forced = false;
      }
      Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
@@ -173,7 +185,7 @@ index 8c34d7a..a2dd273 100644
    }
  }
  
-@@ -775,5 +815,11 @@ void EndSession()
+@@ -775,5 +818,11 @@ void EndSession()
      Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
      Config::Save();
    }
