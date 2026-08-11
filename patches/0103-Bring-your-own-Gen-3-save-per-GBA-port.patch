@@ -1,0 +1,2477 @@
+From 76b63000bffa3a06cec389bfcbf65e11f3c02a10 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 10 Aug 2026 17:26:32 -0700
+Subject: [PATCH] Bring your own Gen 3 save, per GBA port
+
+The bundled team-editor saves stay the default; each port gains an opt-in
+"Import my save" and a "Restore default", on both launchers. An import is
+validated before it is accepted -- size (64 KiB single-bank dumps are padded,
+with or without an emulator footer; 128 KiB taken as-is, footer preserved),
+section checksums with per-game tables, and game detection matched against the
+port's ROM, since the game itself would reject a mismatch. The chosen file is
+only ever read; whatever was in the slot is kept as a .preimport backup whose
+name provably survives every cleanup sweep, first backup wins, and restore
+never touches it.
+
+Ruby/Sapphire imports stay fully editable (same party layout as Emerald,
+verified against the decompilations). FireRed/LeafGreen saves are playable but
+the editor refuses them rather than writing Emerald offsets into a different
+layout -- and team submission now refuses an FRLG guest slot for the same
+reason, loudly: the section checksums coincide, so the corrupt write would
+VERIFY and then silently play the wrong team, which is worse than any error.
+
+The stash that protects the host's own team is now checked: if it cannot be
+written, the submission is refused instead of proceeding into a state whose
+cleanup would scrub the host's save. Imported saves raised the stakes there
+from "reseeded template" to "someone's real save".
+
+The import point says plainly that netplay uses the host's saves -- importing
+matters for solo play and for hosting; joiners still submit teams.
+
+Version 1.3.0.
+---
+ .../features/settings/model/Settings.kt       |   1 +
+ .../features/settings/model/StringSetting.kt  |  16 +
+ .../features/xdnetplay/SaveImportBridge.kt    |  59 +++
+ .../features/xdnetplay/gen3/Gen3Save.kt       |  97 ++++-
+ .../features/xdnetplay/gen3/SaveImport.kt     | 325 ++++++++++++++
+ .../xdnetplay/ui/TeamEditorActivity.kt        |  62 ++-
+ .../features/xdnetplay/ui/TeamEditorScreen.kt |  13 +-
+ .../xdnetplay/ui/XDLauncherActivity.kt        | 178 ++++++++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 137 ++++++
+ .../app/src/main/res/values/strings.xml       |  24 ++
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        |  52 ++-
+ Source/Core/Core/Config/MainSettings.cpp      |   2 +
+ Source/Core/Core/Config/MainSettings.h        |   7 +
+ Source/Core/DolphinLib.props                  |   2 +
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  60 ++-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.h    |   7 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 162 +++++++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  19 +
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ Source/Core/UICommon/XDNetplay/Gen3Save.cpp   |  93 +++-
+ Source/Core/UICommon/XDNetplay/Gen3Save.h     |  37 +-
+ Source/Core/UICommon/XDNetplay/SaveImport.cpp | 403 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/SaveImport.h   |  81 ++++
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  |  24 +-
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 25 files changed, 1835 insertions(+), 30 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
+ create mode 100644 Source/Core/UICommon/XDNetplay/SaveImport.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/SaveImport.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/Settings.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/Settings.kt
+index da54d81..125352e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/Settings.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/Settings.kt
+@@ -113,6 +113,7 @@ class Settings : Closeable {
+         const val SECTION_INI_DSP = "DSP"
+         const val SECTION_INI_GBA = "GBA"
+         const val SECTION_INI_NETPLAY = "NetPlay"
++        const val SECTION_INI_XD_NETPLAY = "XDNetplay"
+         const val SECTION_LOGGER_LOGS = "Logs"
+         const val SECTION_LOGGER_OPTIONS = "Options"
+         const val SECTION_GFX_HARDWARE = "Hardware"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+index df98372..3ffce5c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+@@ -80,6 +80,22 @@ enum class StringSetting(
+     MAIN_GBA_ROM_4(Settings.FILE_DOLPHIN, Settings.SECTION_INI_GBA, "Rom4", ""),
+     MAIN_GB_PLAYER_ROM(Settings.FILE_DOLPHIN, Settings.SECTION_INI_GBA, "GBPlayerRom", ""),
+     MAIN_GBA_SAVES_PATH(Settings.FILE_DOLPHIN, Settings.SECTION_INI_GBA, "SavesPath", ""),
++
++    // Display filename of the user save imported over a GBA socket's team save
++    // (see features/xdnetplay/gen3/SaveImport.kt); "" = the bundled
++    // team-editor save. Same keys as the C++ MAIN_XD_IMPORTED_SAVE_2/3.
++    MAIN_XD_IMPORTED_SAVE_2(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "ImportedSave2",
++        ""
++    ),
++    MAIN_XD_IMPORTED_SAVE_3(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "ImportedSave3",
++        ""
++    ),
+     MAIN_TRIFORCE_IP_REDIRECTIONS(
+         Settings.FILE_DOLPHIN,
+         Settings.SECTION_INI_CORE,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+new file mode 100644
+index 0000000..c57fb99
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+@@ -0,0 +1,59 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++/**
++ * Kotlin side of the save-import group in
++ * Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp — opt-in import of a
++ * user's own Gen 3 save over a GBA socket's bundled team-editor save.
++ *
++ * This is a thin accessor, deliberately: ALL of the logic lives in the shared
++ * core (UICommon/XDNetplay/SaveImport, the same code the desktop launcher
++ * calls) — the validation (size, structure, checksums, save-game vs port-ROM
++ * match), the refusals while emulation or a hosted room owns the save, the
++ * once-only `<save>.preimport` backup, the tmp/readback/rename write, and the
++ * per-port ImportedSave2/3 config bookkeeping. Every message that comes back
++ * is user-displayable and identical across platforms.
++ *
++ * The one Android-specific rule callers must follow: the core reads plain
++ * files, so a SAF content:// pick must be fully drained and copied to a real
++ * path first (the ROM-picker idiom; see XDLauncherActivity.importUserSave).
++ * Never hand a content:// string to [importUserSave].
++ */
++object SaveImportBridge {
++    /** Result of an import/restore: [message] is user-displayable as-is. */
++    data class Outcome(val ok: Boolean, val message: String)
++
++    /** GBA port 2 — your side. Matches TeamRole.HOST.deviceNumber. */
++    const val DEVICE_PORT_2 = 1
++
++    /** GBA port 3 — the guest slot. Matches TeamRole.GUEST.deviceNumber. */
++    const val DEVICE_PORT_3 = 2
++
++    /**
++     * Import the (already real-path) save file at [sourcePath] into GBA socket
++     * [deviceNumber]. The source file is only ever read; whatever the socket
++     * held is backed up once to `<save>.preimport`, which no cleanup path ever
++     * deletes. On success [Outcome.message] carries the summary (game, trainer,
++     * backup name, host-saves note); on refusal it says exactly why.
++     */
++    fun importUserSave(sourcePath: String, deviceNumber: Int): Outcome =
++        parseOutcome(nativeImportUserSave(sourcePath, deviceNumber))
++
++    /**
++     * Put the bundled team-editor template back into socket [deviceNumber]'s
++     * save and clear its ImportedSave config key. The replaced save is kept as
++     * `<save>.bak`; `<save>.preimport` is never touched. On success
++     * [Outcome.message] is empty — the caller shows its own localized string.
++     */
++    fun restoreDefaultSave(deviceNumber: Int): Outcome =
++        parseOutcome(nativeRestoreDefaultSave(deviceNumber))
++
++    /** Outcome encoding shared with the C++ side: ["1"/"0", message]. */
++    private fun parseOutcome(flat: Array<String>): Outcome =
++        Outcome(ok = flat.getOrNull(0) == "1", message = flat.getOrNull(1) ?: "")
++
++    private external fun nativeImportUserSave(sourcePath: String, device: Int): Array<String>
++
++    private external fun nativeRestoreDefaultSave(device: Int): Array<String>
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+index f45d405..590b098 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/Gen3Save.kt
+@@ -52,6 +52,21 @@ data class ChecksumMismatch(
+     val calculated: Int
+ )
+ 
++/**
++ * Which Gen 3 game wrote a save image. The block/section/footer layout is
++ * identical across all five cartridges; what differs is the per-section
++ * checksum length table and some section-interior offsets, so game-aware
++ * callers pick behavior off this enum. [EmeraldSave.detectGame] is the single
++ * authoritative detector on every platform (mirrors Gen3Save.cpp).
++ *
++ * [displayName] mirrors the C++ GameDisplayName(), for user-facing messages.
++ */
++enum class Gen3Game(val displayName: String) {
++    RubySapphire("Ruby/Sapphire"),
++    FireRedLeafGreen("FireRed/LeafGreen"),
++    Emerald("Emerald")
++}
++
+ /**
+  * Pokemon Emerald (Gen 3) save file: 131072 bytes of flash plus any trailing
+  * bytes (e.g. the 16-byte mGBA RTC footer), which are preserved verbatim.
+@@ -163,7 +178,12 @@ class EmeraldSave(raw: ByteArray) {
+      * Check every section footer checksum in BOTH blocks. Returns the list of
+      * mismatches (empty when the file is fully consistent).
+      */
+-    fun verifyAllChecksums(): List<ChecksumMismatch> {
++    /**
++     * Game-aware callers pass [detectGame]'s answer; the Emerald default keeps
++     * the bundled-save paths (and every pre-import caller) unchanged.
++     */
++    fun verifyAllChecksums(game: Gen3Game = Gen3Game.Emerald): List<ChecksumMismatch> {
++        val lengths = sectionDataLengths(game)
+         val bad = ArrayList<ChecksumMismatch>()
+         for (block in 0..1) {
+             for (slot in 0 until SECTIONS_PER_BLOCK) {
+@@ -173,7 +193,7 @@ class EmeraldSave(raw: ByteArray) {
+                 if (sid >= SECTIONS_PER_BLOCK) {
+                     continue
+                 }
+-                val calc = sectionChecksum(raw, off, EMERALD_SECTION_DATA_LENGTHS[sid])
++                val calc = sectionChecksum(raw, off, lengths[sid])
+                 if (calc != stored) {
+                     bad.add(ChecksumMismatch(block, slot, sid, stored, calc))
+                 }
+@@ -182,9 +202,9 @@ class EmeraldSave(raw: ByteArray) {
+         return bad
+     }
+ 
+-    fun updateSectionChecksum(sectionId: Int) {
++    fun updateSectionChecksum(sectionId: Int, game: Gen3Game = Gen3Game.Emerald) {
+         val off = sectionOffsets[sectionId]
+-        val calc = sectionChecksum(raw, off, EMERALD_SECTION_DATA_LENGTHS[sectionId])
++        val calc = sectionChecksum(raw, off, sectionDataLengths(game)[sectionId])
+         Gen3Bytes.writeU16(raw, off + SECTION_FOOTER_OFFSET + 2, calc)
+     }
+ 
+@@ -305,6 +325,22 @@ class EmeraldSave(raw: ByteArray) {
+         const val TRAINER_NAME_FIELD_SIZE = TRAINER_NAME_LEN + 1
+         const val TRAINER_GENDER_OFFSET = 0x0008
+         const val TRAINER_ID_OFFSET = 0x000A   // u32: low u16 public, high u16 secret
++        // u32 read by [detectGame]: 0 in Ruby/Sapphire (the field is unused
++        // there), the constant 1 in FireRed/LeafGreen, and Emerald's security
++        // key -- an effectively random nonzero value -- otherwise. Same
++        // heuristic every Gen 3 save tool uses; the bundled team saves carry
++        // 0xAA2F3199 / 0xCF0579AC.
++        const val GAME_CODE_OFFSET = 0x00AC
++
++        /** THE authoritative game detector (see [Gen3Game]). */
++        fun detectGame(save: EmeraldSave): Gen3Game {
++            val sec0 = save.sectionBytes(0)
++            return when (Gen3Bytes.readU32(sec0, GAME_CODE_OFFSET)) {
++                0 -> Gen3Game.RubySapphire
++                1 -> Gen3Game.FireRedLeafGreen
++                else -> Gen3Game.Emerald
++            }
++        }
+ 
+         /**
+          * Coerce arbitrary (possibly untrusted, possibly over-long) text into
+@@ -344,6 +380,59 @@ class EmeraldSave(raw: ByteArray) {
+             2000  // 13 PC buffer I
+         )
+ 
++        /**
++         * Ruby/Sapphire and FireRed/LeafGreen checksum the same 14 sections
++         * over different lengths. Each length is the sizeof() of that game's
++         * own save struct chunk -- transcribed from the decomps' chunk tables
++         * (pret/pokeruby src/save.c sSaveBlockChunks, pret/pokefirered
++         * src/save.c sSaveSlotLayout: section 0 = SaveBlock2, 1..4 = SaveBlock1
++         * split at 3968, 5..13 = PokemonStorage) with the struct sizes as
++         * documented in PKHeX's SAV3 buffers (0x890/0xC40 RS, 0xF24/0xEE8
++         * FRLG, 0x83D0 storage for all). Bytes past a section's length are
++         * zeroed by the game's write buffer, which is why Emerald-length tools
++         * APPEAR to work on RS/FRLG saves; verifying against the game's own
++         * stored checksums still needs the real lengths.
++         */
++        val RS_SECTION_DATA_LENGTHS = intArrayOf(
++            2192, // 0  Trainer info (sizeof(SaveBlock2) = 0x890)
++            3968, // 1  Team / items
++            3968, // 2  Game state
++            3968, // 3  Misc data
++            3136, // 4  Rival info (SaveBlock1 = 0x3AC0 leaves 0xC40)
++            3968, // 5  PC buffer A
++            3968, // 6  PC buffer B
++            3968, // 7  PC buffer C
++            3968, // 8  PC buffer D
++            3968, // 9  PC buffer E
++            3968, // 10 PC buffer F
++            3968, // 11 PC buffer G
++            3968, // 12 PC buffer H
++            2000  // 13 PC buffer I
++        )
++
++        val FRLG_SECTION_DATA_LENGTHS = intArrayOf(
++            3876, // 0  Trainer info (sizeof(SaveBlock2) = 0xF24)
++            3968, // 1  Team / items
++            3968, // 2  Game state
++            3968, // 3  Misc data
++            3816, // 4  Rival info (SaveBlock1 = 0x3D68 leaves 0xEE8)
++            3968, // 5  PC buffer A
++            3968, // 6  PC buffer B
++            3968, // 7  PC buffer C
++            3968, // 8  PC buffer D
++            3968, // 9  PC buffer E
++            3968, // 10 PC buffer F
++            3968, // 11 PC buffer G
++            3968, // 12 PC buffer H
++            2000  // 13 PC buffer I
++        )
++
++        fun sectionDataLengths(game: Gen3Game): IntArray = when (game) {
++            Gen3Game.RubySapphire -> RS_SECTION_DATA_LENGTHS
++            Gen3Game.FireRedLeafGreen -> FRLG_SECTION_DATA_LENGTHS
++            Gen3Game.Emerald -> EMERALD_SECTION_DATA_LENGTHS
++        }
++
+         /**
+          * Sum [dataLength] bytes starting at [base] as little-endian u32s
+          * (mod 2^32), then fold to u16: ((sum & 0xFFFF) + (sum >> 16)) & 0xFFFF.
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
+new file mode 100644
+index 0000000..ceb95fd
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
+@@ -0,0 +1,325 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay.gen3
++
++import java.io.File
++import java.io.RandomAccessFile
++
++/**
++ * Kotlin mirror of UICommon/XDNetplay/SaveImport.{h,cpp}: opt-in import of a
++ * user's own Gen 3 save into a GBA socket, replacing the bundled team-editor
++ * save. Guarantees, in order of importance:
++ *  - the bytes the user picked are only ever READ (the launcher hands them in
++ *    after fully draining the SAF stream; nothing here re-opens the source);
++ *  - whatever occupied the socket is backed up ONCE to `<save>.preimport`, a
++ *    name no cleanup path (TeamInjector's purge included) ever deletes, and a
++ *    re-import never overwrites that first backup;
++ *  - nothing lands in the socket unless the image validated in memory first
++ *    (size, structure, checksums, and game-vs-ROM match).
++ *
++ * Pure JVM on purpose: callers supply the resolved save path (via
++ * [SaveNaming.deriveSavePath]), the ROM path, the bundled template bytes, and
++ * the room state. Config bookkeeping (StringSetting.MAIN_XD_IMPORTED_SAVE_*)
++ * and the emulation-not-running precondition are the caller's job.
++ * Error and status strings are shared verbatim with the desktop build.
++ */
++object SaveImport {
++    /**
++     * Backup of whatever occupied a GBA socket before the FIRST user import.
++     * PROVABLY outside TeamInjector's cleanup set (.hostteam / .guestteam /
++     * .bak / .tmp / NetPlayTemp*.sav): no code path in the tree deletes a
++     * .preimport file, so the pre-import world survives every session, purge,
++     * and re-import.
++     */
++    const val PREIMPORT_SUFFIX = ".preimport"
++
++    // TeamInjector's session bookkeeping files. MUST stay in step with the
++    // suffix constants in TeamInjector.cpp: their presence next to a socket
++    // save means a room's injection round trip owns that file right now.
++    private const val HOST_STASH_SUFFIX = ".hostteam"
++    private const val GUEST_MARK_SUFFIX = ".guestteam"
++
++    /**
++     * The full 128 KiB flash image every Gen 3 cartridge writes. EmeraldSave
++     * only needs the two game-save blocks, but an import always stores the
++     * whole flash so the Hall of Fame / e-Reader sectors and any emulator
++     * footer ride along verbatim.
++     */
++    private const val FULL_FLASH_SIZE = 131072
++
++    /** A 64 KiB dump holds a single bank: block 0 plus the start of block 1. */
++    private const val SINGLE_BANK_SIZE = 65536
++
++    /**
++     * Requirement 5, appended to every success status: an import must never
++     * leave a joiner believing their file reaches a host's room.
++     */
++    private const val HOST_SAVES_NOTE =
++        "Netplay rooms always use the HOST's saves. An imported save applies when you play " +
++            "solo or host; when you join someone's room, use Submit Team instead."
++
++    private const val RS_REVISION_NOTE =
++        "Note: Ruby/Sapphire revisions (1.0/1.1/1.2) also differ — use a save from your exact " +
++            "ROM revision."
++
++    /** What [validateGen3SaveImage] learned about an accepted image. */
++    class SaveValidation(
++        val game: Gen3Game,
++        /** Byte count of the file as picked, before any padding. */
++        val originalSize: Int,
++        /**
++         * A 65536-byte single-bank file was 0xFF-padded (flash erase state) up
++         * to the full 131072; block 0 carries the whole save in that case.
++         */
++        val paddedFrom64k: Boolean,
++        /** Always 0 on an accepted image -- any mismatch refuses it. */
++        val badChecksums: Int,
++        /**
++         * Exactly the image an import may write (the C++ side pads its in/out
++         * buffer instead; ByteArray is fixed-size, so the copy lives here).
++         */
++        val bytes: ByteArray
++    )
++
++    /**
++     * Pure, no I/O. Size gate (exactly 65536, or >= 131072 with any trailing
++     * emulator footer preserved) -> optional 0xFF pad to 131072 -> structure
++     * parse -> game detection -> game-aware checksum verification.
++     *
++     * @throws IllegalArgumentException with a user-displayable reason.
++     */
++    fun validateGen3SaveImage(bytes: ByteArray): SaveValidation {
++        val originalSize = bytes.size
++        var paddedFrom64k = false
++        val image = when {
++            bytes.size == SINGLE_BANK_SIZE -> {
++                // 0xFF is flash erase state: the padded second bank scans as
++                // invalid and block 0 becomes the active block, exactly like a
++                // once-saved cartridge.
++                paddedFrom64k = true
++                ByteArray(FULL_FLASH_SIZE) { i ->
++                    if (i < bytes.size) bytes[i] else 0xFF.toByte()
++                }
++            }
++            bytes.size < FULL_FLASH_SIZE -> throw IllegalArgumentException(
++                "That file is not a Gen 3 save: expected 131,072 bytes of save data (128 KiB, " +
++                    "optionally with an emulator footer), got $originalSize bytes."
++            )
++            else -> bytes.copyOf()
++        }
++
++        val save = try {
++            EmeraldSave(image)
++        } catch (_: IllegalArgumentException) {
++            throw IllegalArgumentException(
++                "No valid save block found — the file may be corrupt, or from a different " +
++                    "game/emulator format."
++            )
++        }
++
++        val game = EmeraldSave.detectGame(save)
++        val bad = save.verifyAllChecksums(game)
++        if (bad.isNotEmpty()) {
++            throw IllegalArgumentException(
++                "${bad.size} section checksum(s) are invalid — the save looks corrupt, so it " +
++                    "was not imported."
++            )
++        }
++        return SaveValidation(game, originalSize, paddedFrom64k, 0, image)
++    }
++
++    /**
++     * The Gen 3 game a GBA ROM is, from the 4-character game code at header
++     * 0xAC..0xAF ("BPE*" Emerald, "AXV*"/"AXP*" Ruby/Sapphire, "BPR*"/"BPG*"
++     * FireRed/LeafGreen; the fourth letter is only the language). The
++     * launcher's manual picker accepts any GBA ROM, so this cannot assume
++     * Emerald.
++     *
++     * @throws IllegalArgumentException for unreadable files and non-Pokemon ROMs.
++     */
++    fun detectRomGame(romPath: String): Gen3Game {
++        val code = ByteArray(4)
++        try {
++            RandomAccessFile(romPath, "r").use { rom ->
++                require(rom.length() >= 0xC0)
++                rom.seek(0xAC)
++                rom.readFully(code)
++            }
++        } catch (_: Exception) {
++            throw IllegalArgumentException("could not read the ROM header of $romPath")
++        }
++
++        val id = String(code, Charsets.US_ASCII)
++        return when (id.substring(0, 3)) { // fourth letter = language
++            "AXV", "AXP" -> Gen3Game.RubySapphire
++            "BPR", "BPG" -> Gen3Game.FireRedLeafGreen
++            "BPE" -> Gen3Game.Emerald
++            else -> {
++                val printable = id.map { if (it.code in 0x20..0x7E) it else '?' }
++                    .joinToString("")
++                throw IllegalArgumentException(
++                    "this ROM is not a Gen 3 Pokemon game (game code \"$printable\"), so there " +
++                        "is nothing to match the save against"
++                )
++            }
++        }
++    }
++
++    /**
++     * The whole no-destruction import flow for GBA socket [deviceNumber]
++     * (1 = port 2, the user's side; 2 = port 3, the guest slot). [sourceBytes]
++     * must be the fully drained content of the picked file (a SAF content://
++     * stream can silently truncate, so the byte COUNT is validated here before
++     * anything is written -- never stream-copy into the save slot).
++     *
++     * Returns a user-displayable success summary.
++     *
++     * @throws IllegalArgumentException with a user-displayable refusal.
++     */
++    fun importUserSave(
++        sourceBytes: ByteArray,
++        sourceDisplayName: String,
++        savePath: File,
++        romPath: String,
++        deviceNumber: Int,
++        isHostingRoom: Boolean
++    ): String {
++        require(deviceNumber == 1 || deviceNumber == 2) {
++            "no such GBA socket ($deviceNumber)"
++        }
++        refuseIfGuestSlotIsLive(deviceNumber, savePath, isHostingRoom)
++
++        val validation = validateGen3SaveImage(sourceBytes)
++        val romGame = detectRomGame(romPath)
++        if (validation.game != romGame) {
++            var message =
++                "That save is from ${validation.game.displayName}, but this GBA port runs " +
++                    "${romGame.displayName}. The game itself would refuse a mismatched save, " +
++                    "so it was not imported."
++            if (validation.game == Gen3Game.RubySapphire) {
++                message += " $RS_REVISION_NOTE"
++            }
++            throw IllegalArgumentException(message)
++        }
++
++        // First backup wins, forever: a re-import must never overwrite the
++        // record of what the socket held before the FIRST import.
++        val backup = File(savePath.path + PREIMPORT_SUFFIX)
++        val backupExisted = backup.exists()
++        val hadPrevious = savePath.exists()
++        if (hadPrevious && !backupExisted) {
++            try {
++                savePath.copyTo(backup)
++            } catch (e: Exception) {
++                throw IllegalArgumentException(
++                    "could not back up the current save to ${backup.path} — nothing was changed"
++                )
++            }
++        }
++
++        writeFileVerified(savePath, validation.bytes)
++
++        val trainer = try {
++            // The trainer-name field lives at the same section-0 offset in all
++            // five cartridges, so it is worth showing whatever the game is.
++            EmeraldSave(validation.bytes).trainerName
++        } catch (_: Exception) {
++            "?"
++        }
++        var status = "Imported $sourceDisplayName (${validation.game.displayName}, " +
++            "trainer $trainer)."
++        if (validation.paddedFrom64k) {
++            status += " The 64 KiB file was padded to the full 128 KiB flash size."
++        }
++        if (backupExisted) {
++            status += " Your original save from before the first import is kept as ${backup.name}."
++        } else if (hadPrevious) {
++            status += " Your previous save is kept as ${backup.name}."
++        }
++        if (validation.game == Gen3Game.RubySapphire) {
++            status += " $RS_REVISION_NOTE"
++        }
++        return status + "\n\n" + HOST_SAVES_NOTE
++    }
++
++    /**
++     * Put the bundled team-editor template ([templateBytes], read from the
++     * role's asset) back into the socket's save. The replaced file is kept as
++     * `<save>.bak` (one-level undo, same as every verified write);
++     * `<save>.preimport` is deliberately left alone -- it belongs to the
++     * pre-import world and nothing may delete it. The caller clears the
++     * per-port config key on success.
++     *
++     * @throws IllegalArgumentException with a user-displayable refusal.
++     */
++    fun restoreDefaultSave(
++        savePath: File,
++        templateBytes: ByteArray,
++        deviceNumber: Int,
++        isHostingRoom: Boolean
++    ) {
++        require(deviceNumber == 1 || deviceNumber == 2) {
++            "no such GBA socket ($deviceNumber)"
++        }
++        refuseIfGuestSlotIsLive(deviceNumber, savePath, isHostingRoom)
++        writeFileVerified(savePath, templateBytes)
++    }
++
++    /**
++     * True when `<save>.preimport` exists for the socket. This -- not the
++     * config key, which is display-only -- is the authoritative "an import
++     * happened" signal, so a hand-deleted file cannot desync the UI.
++     */
++    fun hasImportBackup(savePath: File): Boolean =
++        File(savePath.path + PREIMPORT_SUFFIX).exists()
++
++    /**
++     * Never touch the guest slot while a room's injection bookkeeping owns it
++     * (the purge would later copy the stash straight over whatever was
++     * written).
++     */
++    private fun refuseIfGuestSlotIsLive(
++        deviceNumber: Int,
++        savePath: File,
++        isHostingRoom: Boolean
++    ) {
++        if (deviceNumber == 2 &&
++            (isHostingRoom ||
++                File(savePath.path + GUEST_MARK_SUFFIX).exists() ||
++                File(savePath.path + HOST_STASH_SUFFIX).exists())
++        ) {
++            throw IllegalArgumentException(
++                "You are hosting a room right now — the guest slot holds your opponent's team. " +
++                    "Close the room, then import."
++            )
++        }
++    }
++
++    /**
++     * The tmp/readback/rename discipline of TeamRepo.saveToDisk (and the C++
++     * VerifiedWriteSaveFile), minus the Emerald-only re-parse -- an already
++     * validated RS/FRLG image must pass. The destination is never touched
++     * until the tmp has been read back byte-identical, and an existing
++     * destination is kept as one-level .bak undo.
++     */
++    private fun writeFileVerified(path: File, bytes: ByteArray) {
++        path.parentFile?.mkdirs()
++        val tmp = File(path.path + ".tmp")
++        tmp.writeBytes(bytes)
++        if (!tmp.readBytes().contentEquals(bytes)) {
++            tmp.delete()
++            throw IllegalArgumentException("tmp readback mismatch for ${tmp.path}")
++        }
++        if (path.exists()) {
++            try {
++                path.copyTo(File(path.path + ".bak"), overwrite = true)
++            } catch (e: Exception) {
++                tmp.delete()
++                throw IllegalArgumentException("could not back up ${path.path}")
++            }
++        }
++        if (!tmp.renameTo(path)) {
++            throw IllegalArgumentException("could not rename ${tmp.path} into place")
++        }
++    }
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index 443b559..92bddb5 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -16,10 +16,12 @@ import androidx.lifecycle.lifecycleScope
+ import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.R
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Data
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Game
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Text
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.MonFactory
+@@ -99,7 +101,13 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+             val loaded = repo.load(role)
+             TeamEditorState(
+                 role = role,
+-                ready = true,
++                // An imported FireRed/LeafGreen save is usable for PLAY but not
++                // editable here (FRLG keeps the party at different offsets);
++                // the repo explains that in loaded.messages. Its lock message
++                // is self-contained, so the generic "set your ROM" setup hint
++                // would only mislead.
++                ready = loaded.editable,
++                setupHint = loaded.editable,
+                 trainer = loaded.trainerLabel,
+                 trainerName = loaded.trainerName,
+                 party = loaded.party,
+@@ -207,6 +215,12 @@ enum class TeamRole(val deviceNumber: Int, val label: String, val templateAsset:
+ data class TeamEditorState(
+     val role: TeamRole = TeamRole.HOST,
+     val ready: Boolean = false,
++    /**
++     * Whether the not-ready panel should append the generic "set your Emerald
++     * ROM" setup hint. False when [messages] already fully explains the lock
++     * (e.g. an imported FRLG save), where that hint would be misleading.
++     */
++    val setupHint: Boolean = true,
+     val trainer: String = "",
+     /** Editable in-game trainer name; max [EmeraldSave.TRAINER_NAME_LEN] chars. */
+     val trainerName: String = "",
+@@ -222,7 +236,14 @@ class TeamRepo(private val context: Context) {
+         val trainerLabel: String,
+         val trainerName: String,
+         val party: List<Gen3Mon>,
+-        val messages: List<String>
++        val messages: List<String>,
++        /**
++         * False for an imported FireRed/LeafGreen save: it will be USED for
++         * play exactly as imported, but the editor must not touch it (FRLG
++         * stores the party at different offsets, so an Emerald-offset write
++         * would corrupt it). [messages] then carries the explanation.
++         */
++        val editable: Boolean = true
+     )
+ 
+     private val data: Gen3Data by lazy { Gen3Data.load(context) }
+@@ -230,6 +251,14 @@ class TeamRepo(private val context: Context) {
+ 
+     private var save: EmeraldSave? = null
+     private var savePath: File? = null
++
++    /**
++     * Which Gen 3 game wrote the loaded save (an import can put a
++     * Ruby/Sapphire or FRLG save here). Ruby/Sapphire shares every section-0/1
++     * offset this editor touches, but its section-0 checksum length differs,
++     * so every checksum verify/re-stamp must go through this.
++     */
++    private var game: Gen3Game = Gen3Game.Emerald
+     var party: MutableList<Gen3Mon> = mutableListOf()
+         private set
+ 
+@@ -263,7 +292,24 @@ class TeamRepo(private val context: Context) {
+         }
+ 
+         val parsed = EmeraldSave(bytes)
+-        val mismatches = parsed.verifyAllChecksums()
++        game = EmeraldSave.detectGame(parsed)
++        if (game == Gen3Game.FireRedLeafGreen) {
++            // Never read (or later write) FRLG bytes through Emerald party
++            // offsets: drop the handle so saveToDisk/importShowdown fail
++            // closed on "No save loaded" even if the UI gate is bypassed.
++            save = null
++            party = mutableListOf()
++            return Loaded(
++                trainerLabel = "",
++                trainerName = "",
++                party = emptyList(),
++                messages = listOf(context.getString(R.string.xd_editor_frlg_locked)),
++                editable = false
++            )
++        }
++        // Game-aware verify: an imported Ruby/Sapphire save is fully valid
++        // against ITS table and must not show Emerald-table false warnings.
++        val mismatches = parsed.verifyAllChecksums(game)
+         if (mismatches.isNotEmpty()) {
+             messages += "Warning: ${mismatches.size} section checksum(s) invalid in source save"
+         }
+@@ -348,11 +394,19 @@ class TeamRepo(private val context: Context) {
+         }
+         return try {
+             s.writeParty(party)
++            // setTrainerName/writeParty stamp sections 0/1 with the Emerald
++            // length table (they are Emerald/RS-only by construction, and RS
++            // section 1 is the same length). RS section 0 is SHORTER, so
++            // re-stamp both with the detected game's table — a no-op for
++            // Emerald, and the difference between a save Ruby/Sapphire accepts
++            // and one it silently rejects.
++            s.updateSectionChecksum(0, game)
++            s.updateSectionChecksum(1, game)
+             val out = s.toBytes()
+ 
+             // Independent verification of our own output before it touches disk.
+             val reparsed = EmeraldSave(out)
+-            val bad = reparsed.verifyAllChecksums()
++            val bad = reparsed.verifyAllChecksums(game)
+             check(bad.isEmpty()) { "output failed checksum verification: $bad" }
+             check(reparsed.readParty().filter { !it.isEmpty() }.size == party.size) {
+                 "output party did not round-trip"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+index d6b8232..5ddc96c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -99,10 +99,15 @@ fun TeamEditorScreen(
+             if (!state.ready) {
+                 SeaPanel(title = "SETUP NEEDED") {
+                     state.messages.forEach { Text(it, color = XDColors.TextPrimary) }
+-                    Text(
+-                        "Set your Emerald ROM in Settings → GBA, then come back.",
+-                        color = XDColors.TextDim
+-                    )
++                    // Suppressed when the messages already fully explain the
++                    // lock (imported FRLG save): the ROM is configured fine
++                    // there, so this hint would point at the wrong fix.
++                    if (state.setupHint) {
++                        Text(
++                            "Set your Emerald ROM in Settings → GBA, then come back.",
++                            color = XDColors.TextDim
++                        )
++                    }
+                 }
+                 return@Column
+             }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 81af96e..0a1d767 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -22,12 +22,14 @@ import kotlinx.coroutines.flow.launchIn
+ import kotlinx.coroutines.flow.onEach
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
++import org.dolphinemu.dolphinemu.R
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
+ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
+ import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.SaveImportBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.XdMatchmaker
+ import java.io.File
+ import java.security.MessageDigest
+@@ -35,6 +37,8 @@ import org.dolphinemu.dolphinemu.features.settings.model.BooleanSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveImport
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveNaming
+ import org.dolphinemu.dolphinemu.features.xdnetplay.input.AutoMapper
+ import org.dolphinemu.dolphinemu.features.settings.ui.MenuTag
+@@ -46,6 +50,7 @@ import org.dolphinemu.dolphinemu.ui.main.MainActivity
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+ import org.dolphinemu.dolphinemu.utils.AfterDirectoryInitializationRunner
++import org.dolphinemu.dolphinemu.utils.ContentHandler
+ import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
+ import org.dolphinemu.dolphinemu.utils.ThemeHelper
+ 
+@@ -76,6 +81,14 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+     private var searching by mutableStateOf(false)
+ 
++    // Save Files card: which Gen 3 save each GBA socket boots from. State is
++    // re-derived from disk + config on every refreshChecks, mirroring the
++    // desktop launcher's RefreshSaveSlots.
++    private var saveSlotPort2 by mutableStateOf<SaveSlotUiState?>(null)
++    private var saveSlotPort3 by mutableStateOf<SaveSlotUiState?>(null)
++    private var saveFilesMessage by mutableStateOf<String?>(null)
++    private var saveFilesMessageIsError by mutableStateOf(false)
++
+     /**
+      * Reads a picked file (extracting the first ROM out of a zip if needed),
+      * validates it, and writes it to the app's private GBA folder as a real,
+@@ -169,6 +182,82 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+             }
+         }
+ 
++    // Per-port user-save import (Save Files card). One launcher per socket so
++    // the SAF callback knows which device it serves, copying the
++    // pickGbaBios/pickEmeraldRom idiom.
++    private val pickSaveFilePort2 =
++        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++            if (uri != null) importUserSave(uri, SaveImportBridge.DEVICE_PORT_2)
++        }
++
++    private val pickSaveFilePort3 =
++        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
++            if (uri != null) importUserSave(uri, SaveImportBridge.DEVICE_PORT_3)
++        }
++
++    /**
++     * Runs the shared core's import for GBA socket [deviceNumber] on the
++     * picked document. The content:// stream is fully drained into memory and
++     * written to a REAL temp file first — the ROM-picker idiom — because the
++     * core reads plain files (content:// fds are not reliably seekable) and
++     * because a SAF stream can silently truncate: the core re-validates the
++     * byte count from the copy before anything touches the save slot. The
++     * temp file keeps the pick's display name, which is what the core records
++     * in the ImportedSave config key for the row's "Imported: X" label. All
++     * validation, refusal and no-destruction bookkeeping live in the core;
++     * every message shown here arrives user-displayable from it.
++     */
++    private fun importUserSave(uri: android.net.Uri, deviceNumber: Int) {
++        lifecycleScope.launch {
++            val outcome = withContext(Dispatchers.IO) {
++                var temp: File? = null
++                try {
++                    val bytes = contentResolver.openInputStream(uri)?.use { it.readBytes() }
++                        ?: return@withContext SaveImportBridge.Outcome(
++                            false, getString(R.string.xd_saves_read_failed)
++                        )
++                    // Display name, made safe as a single path component.
++                    val name = (ContentHandler.getDisplayName(uri) ?: "imported.sav")
++                        .replace('/', '_').replace('\\', '_')
++                        .let { if (it.isBlank() || it == "." || it == "..") "imported.sav" else it }
++                    val dir = File(cacheDir, "xd_save_import").apply { mkdirs() }
++                    val tempFile = File(dir, name)
++                    temp = tempFile
++                    tempFile.writeBytes(bytes)
++                    SaveImportBridge.importUserSave(tempFile.absolutePath, deviceNumber)
++                } catch (e: Exception) {
++                    SaveImportBridge.Outcome(
++                        false, e.message ?: getString(R.string.xd_saves_read_failed)
++                    )
++                } finally {
++                    temp?.delete()
++                }
++            }
++            saveFilesMessage = outcome.message
++            saveFilesMessageIsError = !outcome.ok
++            refreshChecks()
++        }
++    }
++
++    /**
++     * Puts the bundled team-editor template back into socket [deviceNumber]'s
++     * save (shared core; replaced file kept as .bak, .preimport untouched).
++     */
++    private fun restoreDefaultSave(deviceNumber: Int) {
++        lifecycleScope.launch {
++            val outcome = withContext(Dispatchers.IO) {
++                SaveImportBridge.restoreDefaultSave(deviceNumber)
++            }
++            saveFilesMessage = if (outcome.ok) {
++                getString(R.string.xd_saves_restore_done)
++            } else {
++                outcome.message
++            }
++            saveFilesMessageIsError = !outcome.ok
++            refreshChecks()
++        }
++    }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         installSplashScreen().setKeepOnScreenCondition {
+             !DirectoryInitialization.areDolphinDirectoriesReady()
+@@ -198,6 +287,21 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     controllerMapped = controllerMapped,
+                     biosLinkReady = biosLinkReady,
+                     statusMessage = statusMessage,
++                    saveSlotPort2 = saveSlotPort2,
++                    saveSlotPort3 = saveSlotPort3,
++                    saveFilesMessage = saveFilesMessage,
++                    saveFilesMessageIsError = saveFilesMessageIsError,
++                    onImportSave = { device ->
++                        // The SAF picker has no useful MIME type for .sav files;
++                        // filter nothing and let the core's validation decide,
++                        // like the ROM and BIOS pickers do.
++                        if (device == SaveImportBridge.DEVICE_PORT_2) {
++                            pickSaveFilePort2.launch(arrayOf("*/*"))
++                        } else {
++                            pickSaveFilePort3.launch(arrayOf("*/*"))
++                        }
++                    },
++                    onRestoreDefaultSave = { device -> restoreDefaultSave(device) },
+                     onPickXdFolder = { pickXdFolder.launch(null) },
+                     onPickGbaBios = { pickGbaBios.launch(arrayOf("*/*")) },
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+@@ -451,6 +555,80 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+             false
+         }
+         biosLinkReady = checkOfficialBios()
++        refreshSaveSlots()
++    }
++
++    /** Mirror of the desktop launcher's RefreshSaveSlots for the Save Files card. */
++    private fun refreshSaveSlots() {
++        saveSlotPort2 = describeSaveSlot(
++            SaveImportBridge.DEVICE_PORT_2, StringSetting.MAIN_XD_IMPORTED_SAVE_2
++        )
++        saveSlotPort3 = describeSaveSlot(
++            SaveImportBridge.DEVICE_PORT_3, StringSetting.MAIN_XD_IMPORTED_SAVE_3
++        )
++    }
++
++    /**
++     * What the Save Files row for GBA socket [deviceNumber] should show. The
++     * ImportedSave config key only remembers the picked file's NAME for
++     * display; the authoritative "an import happened" signal is the .preimport
++     * backup (SaveImport.hasImportBackup), so the restore action also unlocks
++     * when the key was lost but the backup proves an import occurred. Game and
++     * trainer are parsed from the save file itself, so the row cannot disagree
++     * with what would actually boot.
++     */
++    private fun describeSaveSlot(deviceNumber: Int, importedKey: StringSetting): SaveSlotUiState {
++        // Same ROM resolution as the shared core (SaveImport/TeamInjector):
++        // the socket's own ROM, falling back to the other socket's.
++        val preferred = if (deviceNumber == SaveImportBridge.DEVICE_PORT_2) {
++            StringSetting.MAIN_GBA_ROM_2.string
++        } else {
++            StringSetting.MAIN_GBA_ROM_3.string
++        }
++        val fallback = if (deviceNumber == SaveImportBridge.DEVICE_PORT_2) {
++            StringSetting.MAIN_GBA_ROM_3.string
++        } else {
++            StringSetting.MAIN_GBA_ROM_2.string
++        }
++        val rom = listOf(preferred, fallback)
++            .firstOrNull { it.isNotEmpty() && File(it).exists() }
++            ?: return SaveSlotUiState(
++                stateText = getString(R.string.xd_saves_state_no_rom),
++                restoreEnabled = false
++            )
++
++        val savesDir = File(
++            DirectoryInitialization.getUserDirectory(),
++            "GBA" + File.separator + "Saves"
++        )
++        val save = File(SaveNaming.deriveSavePath(savesDir.path, rom, deviceNumber))
++        val importedName = importedKey.string
++        val restoreEnabled = SaveImport.hasImportBackup(save) || importedName.isNotEmpty()
++        if (!save.exists()) {
++            return SaveSlotUiState(
++                stateText = getString(R.string.xd_saves_state_not_installed),
++                restoreEnabled = restoreEnabled
++            )
++        }
++
++        var text = if (importedName.isEmpty()) {
++            getString(R.string.xd_saves_state_default)
++        } else {
++            getString(R.string.xd_saves_state_imported, importedName)
++        }
++        text += try {
++            val parsed = EmeraldSave(save.readBytes())
++            getString(
++                R.string.xd_saves_state_game_trainer,
++                EmeraldSave.detectGame(parsed).displayName,
++                parsed.trainerName
++            )
++        } catch (_: Exception) {
++            // A parse failure (hand-edited file, mid-write crash) is worth
++            // surfacing here instead of hiding.
++            getString(R.string.xd_saves_state_unreadable)
++        }
++        return SaveSlotUiState(stateText = text, restoreEnabled = restoreEnabled)
+     }
+ 
+     /**
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 0833667..76fe29d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -37,6 +37,19 @@ import androidx.compose.ui.unit.dp
+ import org.dolphinemu.dolphinemu.R
+ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ 
++/**
++ * What the Save Files card shows for one GBA socket. Assembled by
++ * XDLauncherActivity.describeSaveSlot from the save file itself (game +
++ * trainer are parsed from disk, so the row cannot disagree with what would
++ * actually boot) plus the ImportedSave config key and the .preimport backup.
++ */
++data class SaveSlotUiState(
++    /** e.g. "Team editor save (default) — Emerald, trainer LOGAN". */
++    val stateText: String,
++    /** True once an import happened (backup exists or config key set). */
++    val restoreEnabled: Boolean
++)
++
+ @Composable
+ fun XDLauncherScreen(
+     initialized: Boolean,
+@@ -46,6 +59,12 @@ fun XDLauncherScreen(
+     controllerMapped: Boolean,
+     biosLinkReady: Boolean,
+     statusMessage: String?,
++    saveSlotPort2: SaveSlotUiState?,
++    saveSlotPort3: SaveSlotUiState?,
++    saveFilesMessage: String?,
++    saveFilesMessageIsError: Boolean,
++    onImportSave: (Int) -> Unit,
++    onRestoreDefaultSave: (Int) -> Unit,
+     onPickXdFolder: () -> Unit,
+     onPickGbaBios: () -> Unit,
+     onPickEmeraldRom: () -> Unit,
+@@ -119,6 +138,15 @@ fun XDLauncherScreen(
+                         style = MaterialTheme.typography.bodyMedium
+                     )
+                 }
++                Spacer(Modifier.height(12.dp))
++                SaveFilesCard(
++                    port2 = saveSlotPort2,
++                    port3 = saveSlotPort3,
++                    message = saveFilesMessage,
++                    messageIsError = saveFilesMessageIsError,
++                    onImport = onImportSave,
++                    onRestore = onRestoreDefaultSave
++                )
+                 Spacer(Modifier.height(24.dp))
+ 
+                 FilledTonalButton(
+@@ -350,6 +378,115 @@ private fun ReadinessCard(
+     }
+ }
+ 
++/**
++ * Which Gen 3 save each GBA socket boots from. The bundled team-editor save
++ * stays the default; importing your own cartridge save is opt-in and per port
++ * (the shared SaveImport core does the validation and the no-destruction
++ * bookkeeping — see SaveImportBridge). The caption is a permanent fixture
++ * rather than a popup because it is the one fact every importer must know
++ * BEFORE picking a file: netplay syncs the HOST's saves, so a joiner's import
++ * never reaches the room — joiners submit their team instead. Mirrors the
++ * desktop launcher's "Save Files" box (XDLauncherDialog).
++ */
++@Composable
++private fun SaveFilesCard(
++    port2: SaveSlotUiState?,
++    port3: SaveSlotUiState?,
++    message: String?,
++    messageIsError: Boolean,
++    onImport: (Int) -> Unit,
++    onRestore: (Int) -> Unit
++) {
++    Card(modifier = Modifier.fillMaxWidth()) {
++        Column(
++            modifier = Modifier.padding(16.dp),
++            verticalArrangement = Arrangement.spacedBy(10.dp)
++        ) {
++            Text(
++                text = stringResource(R.string.xd_saves_section_title),
++                style = MaterialTheme.typography.titleMedium,
++                fontWeight = FontWeight.SemiBold
++            )
++            Text(
++                text = stringResource(R.string.xd_saves_host_note),
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
++            SaveSlotRow(
++                label = stringResource(R.string.xd_saves_port2_label),
++                state = port2,
++                deviceNumber = 1,
++                onImport = onImport,
++                onRestore = onRestore
++            )
++            SaveSlotRow(
++                label = stringResource(R.string.xd_saves_port3_label),
++                state = port3,
++                deviceNumber = 2,
++                onImport = onImport,
++                onRestore = onRestore
++            )
++            if (message != null) {
++                Text(
++                    text = message,
++                    style = MaterialTheme.typography.bodySmall,
++                    color = if (messageIsError) {
++                        MaterialTheme.colorScheme.error
++                    } else {
++                        MaterialTheme.colorScheme.primary
++                    }
++                )
++            }
++        }
++    }
++}
++
++/**
++ * One GBA socket in the Save Files card: label, live state line, and the
++ * import/restore actions. [deviceNumber] is 1 (port 2) or 2 (port 3), the
++ * same numbering as TeamRole.deviceNumber and the shared core. Both buttons
++ * stay visible so the restore action is discoverable before any import; it
++ * only enables once an import actually happened.
++ */
++@Composable
++private fun SaveSlotRow(
++    label: String,
++    state: SaveSlotUiState?,
++    deviceNumber: Int,
++    onImport: (Int) -> Unit,
++    onRestore: (Int) -> Unit
++) {
++    Column(modifier = Modifier.fillMaxWidth()) {
++        Text(
++            text = label,
++            style = MaterialTheme.typography.bodyMedium,
++            fontWeight = FontWeight.Medium
++        )
++        Text(
++            text = state?.stateText ?: "",
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            TextButton(
++                onClick = { onImport(deviceNumber) },
++                enabled = state != null,
++                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
++            ) {
++                Text(stringResource(R.string.xd_saves_import_button))
++            }
++            Spacer(Modifier.width(20.dp))
++            TextButton(
++                onClick = { onRestore(deviceNumber) },
++                enabled = state?.restoreEnabled == true,
++                contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp)
++            ) {
++                Text(stringResource(R.string.xd_saves_restore_button))
++            }
++        }
++    }
++}
++
+ @Composable
+ private fun CheckRow(
+     ok: Boolean,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 3e0972a..36c324d 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1127,4 +1127,28 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_style_experimental">Experimental</string>
+     <string name="xd_style_submit_model_label">Trainer model</string>
+     <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
++
++    <!-- XD Netplay launcher: per-GBA-port save import (Save Files card).
++         User-visible wording mirrors the desktop launcher's Save Files box
++         (DolphinQt XDLauncherDialog) verbatim; refusal/success messages come
++         from the shared core (UICommon/XDNetplay/SaveImport) and are not
++         duplicated here. -->
++    <string name="xd_saves_section_title">Save Files</string>
++    <string name="xd_saves_host_note">Netplay rooms always use the HOST\'s saves. An imported save applies when you play solo or host; when you join someone\'s room, use Submit Team instead.</string>
++    <string name="xd_saves_port2_label">Your save (GBA port 2)</string>
++    <string name="xd_saves_port3_label">Guest-slot save (GBA port 3)</string>
++    <string name="xd_saves_import_button">Import my save…</string>
++    <string name="xd_saves_restore_button">Restore default</string>
++    <string name="xd_saves_state_no_rom">No GBA ROM configured yet</string>
++    <string name="xd_saves_state_not_installed">Not installed yet — installs automatically once the Emerald ROM is set</string>
++    <string name="xd_saves_state_default">Team editor save (default)</string>
++    <string name="xd_saves_state_imported">Imported: %1$s</string>
++    <string name="xd_saves_state_game_trainer">" — %1$s, trainer %2$s"</string>
++    <string name="xd_saves_state_unreadable">" — unreadable save file"</string>
++    <string name="xd_saves_read_failed">Could not read the selected file — pick it again.</string>
++    <string name="xd_saves_restore_done">The bundled team-editor save is back in place. If it replaced another save, that one was kept next to it as a .bak file.</string>
++
++    <!-- Team editor gate for imported FireRed/LeafGreen saves: usable for
++         play, not editable (FRLG stores the party at different offsets). -->
++    <string name="xd_editor_frlg_locked">This is a FireRed/LeafGreen save. It will be used for play, but the Team Editor only edits Ruby/Sapphire/Emerald saves (FRLG stores the party elsewhere). Restore the default save to edit a team here.</string>
+ </resources>
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index 44f34ba..fa281f0 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -2,10 +2,11 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ // Android bridge for the NetPlay session index ("lobby server", NETPLAY_INDEX_URL,
+-// default https://lobby.dolphin-emu.org), plus the two other small xdnetplay-package bridges
++// default https://lobby.dolphin-emu.org), plus the three other small xdnetplay-package bridges
+ // that share this file: the XD Netplay release check (second extern "C" group; Kotlin
+-// counterpart features/xdnetplay/UpdateCheckBridge) and the cosmetic battle-style selectors
+-// (third group; Kotlin counterpart features/xdnetplay/BattleStyleBridge).
++// counterpart features/xdnetplay/UpdateCheckBridge), the cosmetic battle-style selectors
++// (third group; Kotlin counterpart features/xdnetplay/BattleStyleBridge), and the per-port
++// user-save import (fourth group; Kotlin counterpart features/xdnetplay/SaveImportBridge).
+ //
+ // Listing only. Publishing is deliberately NOT exposed here: Core's NetPlayServer
+ // already owns a NetPlayIndex (NetPlayServer::m_index) and publishes automatically
+@@ -46,6 +47,7 @@
+ #include "Core/Config/MainSettings.h"
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/SaveImport.h"
+ #include "UICommon/XDNetplay/UpdateCheck.h"
+ #include "UICommon/XDNetplay/Version.h"
+ 
+@@ -370,4 +372,48 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativePrepar
+   XDNetplay::BattleCustomizer::PrepareForStart();
+ }
+ 
++// ---------------------------------------------------------------------------
++// Save-import bridge (Kotlin counterpart: features/xdnetplay/SaveImportBridge)
++// ---------------------------------------------------------------------------
++//
++// Opt-in import of a user's own Gen 3 save over a GBA socket's bundled
++// team-editor save. ALL of the logic lives in UICommon/XDNetplay/SaveImport,
++// shared verbatim with the desktop launcher: the validation (size, structure,
++// checksums, save-game vs port-ROM match), the refusals while emulation or a
++// hosted room owns the save, the once-only <save>.preimport backup, the
++// tmp/readback/rename write, and the per-port ImportedSave2/3 config
++// bookkeeping. This bridge only ferries a REAL file path in -- the Kotlin
++// side copies the SAF content:// pick to one first, exactly like the ROM
++// picker, because the core reads plain files -- and the user-displayable
++// outcome back.
++//
++// Outcome encoding (String[2], shared with SaveImportBridge.kt):
++//   [0] "1" success / "0" refusal
++//   [1] user-displayable message (import success/refusal text from the core;
++//       empty on a successful restore, where Kotlin shows its own string)
++// device is 1 (GBA port 2, your side) or 2 (GBA port 3, the guest slot),
++// matching TeamRole.deviceNumber and the desktop launcher.
++
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_SaveImportBridge_nativeImportUserSave(
++    JNIEnv* env, jobject, jstring jsource_path, jint device)
++{
++  std::string status;
++  std::string error;
++  const bool ok =
++      XDNetplay::SaveImport::ImportUserSave(GetJString(env, jsource_path), device, &status, &error);
++  const std::vector<std::string> outcome{ok ? "1" : "0", ok ? status : error};
++  return SpanToJStringArray(env, outcome);
++}
++
++JNIEXPORT jobjectArray JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_SaveImportBridge_nativeRestoreDefaultSave(
++    JNIEnv* env, jobject, jint device)
++{
++  std::string error;
++  const bool ok = XDNetplay::SaveImport::RestoreDefaultSave(device, &error);
++  const std::vector<std::string> outcome{ok ? "1" : "0", ok ? std::string{} : error};
++  return SpanToJStringArray(env, outcome);
++}
++
+ }  // extern "C"
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 470ded6..752aafa 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -427,6 +427,8 @@ const Info<int> MAIN_XD_STYLE_HOST_MODEL{{System::Main, "XDNetplay", "StyleHostM
+ const Info<int> MAIN_XD_STYLE_GUEST_MODEL{{System::Main, "XDNetplay", "StyleGuestModel"}, 0};
+ const Info<int> MAIN_XD_STYLE_MUSIC{{System::Main, "XDNetplay", "StyleMusic"}, 0};
+ const Info<int> MAIN_XD_STYLE_VENUE{{System::Main, "XDNetplay", "StyleVenue"}, 0};
++const Info<std::string> MAIN_XD_IMPORTED_SAVE_2{{System::Main, "XDNetplay", "ImportedSave2"}, ""};
++const Info<std::string> MAIN_XD_IMPORTED_SAVE_3{{System::Main, "XDNetplay", "ImportedSave3"}, ""};
+ 
+ // Main.Network
+ 
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index f6d759f..e565a73 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -247,6 +247,13 @@ extern const Info<int> MAIN_XD_STYLE_GUEST_MODEL;  // fallback only; the guest's
+ extern const Info<int> MAIN_XD_STYLE_MUSIC;
+ extern const Info<int> MAIN_XD_STYLE_VENUE;
+ 
++// Display filename of the user save imported over a GBA socket's team save by
++// UICommon/XDNetplay/SaveImport; "" = the bundled team-editor save. Display
++// only: the authoritative "was imported" signal is SaveImport::HasImportBackup
++// (the on-disk .preimport backup), so a hand-deleted file cannot desync the UI.
++extern const Info<std::string> MAIN_XD_IMPORTED_SAVE_2;  // GBA port 2 (device 1)
++extern const Info<std::string> MAIN_XD_IMPORTED_SAVE_3;  // GBA port 3 (device 2)
++
+ // Main.Network
+ 
+ extern const Info<bool> MAIN_NETWORK_SSL_DUMP_READ;
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index a30e73c..507b655 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -602,6 +602,7 @@
+     <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Text.h" />
+     <ClInclude Include="UICommon\XDNetplay\MonFactory.h" />
++    <ClInclude Include="UICommon\XDNetplay\SaveImport.h" />
+     <ClInclude Include="UICommon\XDNetplay\ShowdownParser.h" />
+     <ClInclude Include="UICommon\XDNetplay\TeamInjector.h" />
+     <ClInclude Include="UICommon\XDNetplay\UpdateCheck.h" />
+@@ -1315,6 +1316,7 @@
+     <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Text.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\MonFactory.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\SaveImport.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\ShowdownParser.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\TeamInjector.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\UpdateCheck.cpp" />
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 9c65edb..e5ce66a 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -151,6 +151,9 @@ void TeamEditorDialog::ReloadForRole()
+   m_save_path.clear();
+   m_trainer_label->setText(QString());
+   m_trainer_name_edit->clear();
++  // A previous load may have locked the controls (FRLG save); every reload
++  // starts from "editable" and re-decides below.
++  SetEditingEnabled(true);
+ 
+   QStringList messages;
+ 
+@@ -238,9 +241,39 @@ void TeamEditorDialog::ReloadForRole()
+     RefreshPartyList();
+     return;
+   }
+-  if (!parsed->VerifyAllChecksums().empty())
++
++  // A user-imported save can be any Gen 3 game (the launcher's import
++  // validates game-vs-ROM, not game-vs-editor). Verify with the detected
++  // game's own checksum table -- Ruby/Sapphire sizes some sections
++  // differently, and the Emerald table would cry wolf on a perfectly healthy
++  // RS save.
++  const Gen3Game game = EmeraldSave::DetectGame(*parsed);
++  if (!parsed->VerifyAllChecksums(game).empty())
+     messages << tr("Warning: section checksum(s) invalid in the source save");
+ 
++  if (game == Gen3Game::FireRedLeafGreen)
++  {
++    // FRLG keeps its party at different section offsets, so Emerald-offset
++    // edits would land inside unrelated data and corrupt the save. It stays
++    // fully PLAYABLE (the import path allowed it on an FRLG ROM); it is only
++    // this editor that must keep its hands off. The trainer name lives at the
++    // same offset in every Gen 3 game, so showing it read-only is safe.
++    // m_save stays unset: even if a disabled control fired, every action
++    // bails on "No save loaded."
++    m_trainer_name_edit->setText(QString::fromStdString(parsed->GetTrainerName()));
++    std::string file_name = m_save_path;
++    SplitPath(m_save_path, nullptr, &file_name, nullptr);
++    m_trainer_label->setText(tr("Trainer ID %1  ·  %2.sav  ·  FireRed/LeafGreen")
++                                 .arg(parsed->GetTrainerPublicId())
++                                 .arg(QString::fromStdString(file_name)));
++    SetEditingEnabled(false);
++    SetMessages({tr("This is a FireRed/LeafGreen save. It will be used for play, but the Team "
++                    "Editor only edits Ruby/Sapphire/Emerald saves (FRLG stores the party "
++                    "elsewhere). Restore the default save to edit a team here.")});
++    RefreshPartyList();
++    return;
++  }
++
+   auto party = parsed->ReadParty(&error);
+   if (!party)
+   {
+@@ -257,12 +290,22 @@ void TeamEditorDialog::ReloadForRole()
+       m_party.push_back(std::move(mon));
+   }
+ 
++  // Ruby/Sapphire stays editable alongside Emerald: the party and trainer
++  // fields this editor touches sit at the same section-0/1 offsets in both,
++  // and RS's section 1 checksums over the same length as Emerald's. (RS sizes
++  // section 0 shorter, but the game zero-fills the tail of every written
++  // sector, so the Emerald-length checksum the name edit writes computes to
++  // the same value -- and the verified-write re-check refuses the save rather
++  // than corrupt it should that assumption ever not hold.)
+   std::string file_name = m_save_path;
+   SplitPath(m_save_path, nullptr, &file_name, nullptr);
+   m_trainer_name_edit->setText(QString::fromStdString(m_save->GetTrainerName()));
+-  m_trainer_label->setText(tr("Trainer ID %1  ·  %2.sav")
+-                               .arg(m_save->GetTrainerPublicId())
+-                               .arg(QString::fromStdString(file_name)));
++  QString trainer_label = tr("Trainer ID %1  ·  %2.sav")
++                              .arg(m_save->GetTrainerPublicId())
++                              .arg(QString::fromStdString(file_name));
++  if (game == Gen3Game::RubySapphire)
++    trainer_label += tr("  ·  Ruby/Sapphire");
++  m_trainer_label->setText(trainer_label);
+ #else
+   messages << tr("GBA support (libmgba) is not compiled into this build.");
+ #endif
+@@ -293,6 +336,15 @@ void TeamEditorDialog::SetMessages(const QStringList& messages)
+   m_log_label->setText(messages.join(QStringLiteral("\n")));
+ }
+ 
++void TeamEditorDialog::SetEditingEnabled(bool enabled)
++{
++  m_trainer_name_edit->setEnabled(enabled);
++  m_paste_edit->setEnabled(enabled);
++  m_import_button->setEnabled(enabled);
++  m_remove_button->setEnabled(enabled);
++  m_save_button->setEnabled(enabled);
++}
++
+ void TeamEditorDialog::OnImport()
+ {
+   if (m_fetching)
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+index 8b0c702..200e077 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+@@ -49,6 +49,13 @@ private:
+   void RefreshPartyList();
+   void SetMessages(const QStringList& messages);
+ 
++  // Enable/disable everything that can modify the loaded save (name field,
++  // paste box, import/remove/save). Role switching and "Show save in folder"
++  // stay live either way. Used to make a FireRed/LeafGreen save -- playable,
++  // but laid out differently where the party lives -- read-only instead of
++  // silently corruptible.
++  void SetEditingEnabled(bool enabled);
++
+   void OnImport();
+   void ApplyImportText(const std::string& text);
+   void OnRemoveSelected();
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 58587b7..902cc7b 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -48,6 +48,8 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/Gen3Save.h"
++#include "UICommon/XDNetplay/SaveImport.h"
+ 
+ namespace
+ {
+@@ -120,6 +122,22 @@ bool TeamSavesInstalled()
+ #endif
+ }
+ 
++#ifdef HAS_LIBMGBA
++// The save file GBA socket |device| (1 = port 2, 2 = port 3) boots from, or
++// empty while no ROM is configured. Same ROM fallback as the team editor and
++// TeamInjector: the socket's own ROM, then the other socket's (a
++// launcher-made setup points both ports at one Emerald dump).
++std::string SaveSlotPath(int device)
++{
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++    return {};
++  return HW::GBA::Core::GetSavePath(rom, device);
++}
++#endif
++
+ bool VsSaveInstalled()
+ {
+   return File::Exists(File::GetUserPath(D_GCUSER_IDX) + "USA/Card A/01-GXXE-PokemonXD.gci");
+@@ -272,6 +290,41 @@ void XDLauncherDialog::CreateMainLayout()
+   checklist_box->setLayout(checklist_layout);
+   layout->addWidget(checklist_box);
+ 
++  // Save Files: which Gen 3 save each GBA socket boots from. The bundled
++  // team-editor save stays the default; importing your own cartridge save is
++  // opt-in and per port (SaveImport does the validation and the no-destruction
++  // bookkeeping). The caption is a permanent fixture rather than a popup
++  // because it is the one fact every importer must know BEFORE picking a
++  // file: netplay syncs the HOST's saves, so a joiner's import never reaches
++  // the room -- joiners submit their team instead.
++  auto* saves_box = new QGroupBox(tr("Save Files"));
++  auto* saves_layout = new QGridLayout;
++  auto* saves_caption = new QLabel(
++      tr("Netplay rooms always use the HOST's saves. An imported save applies when you play solo "
++         "or host; when you join someone's room, use Submit Team instead."));
++  saves_caption->setWordWrap(true);
++  saves_layout->addWidget(saves_caption, 0, 0, 1, 4);
++  int save_row = 1;
++  const auto add_save_row = [&](SaveSlotRow* target, const QString& label) {
++    target->state = new QLabel;
++    target->state->setWordWrap(true);
++    target->import_button = new NonDefaultQPushButton(tr("Import my save..."));
++    target->restore_button = new NonDefaultQPushButton(tr("Restore default"));
++    target->restore_button->setToolTip(
++        tr("Puts the bundled team-editor save back. The replaced save is kept next to it as a "
++           ".bak file."));
++    saves_layout->addWidget(new QLabel(label), save_row, 0);
++    saves_layout->addWidget(target->state, save_row, 1);
++    saves_layout->addWidget(target->import_button, save_row, 2);
++    saves_layout->addWidget(target->restore_button, save_row, 3);
++    save_row++;
++  };
++  add_save_row(&m_save_row_port2, tr("Your save (GBA port 2):"));
++  add_save_row(&m_save_row_port3, tr("Guest-slot save (GBA port 3):"));
++  saves_layout->setColumnStretch(1, 1);
++  saves_box->setLayout(saves_layout);
++  layout->addWidget(saves_box);
++
+   auto* battle_box = new QGroupBox(tr("Battle"));
+   auto* battle_layout = new QGridLayout;
+   m_boot_button = new NonDefaultQPushButton(tr("Boot Pokémon XD (solo)"));
+@@ -415,6 +468,15 @@ void XDLauncherDialog::ConnectWidgets()
+   connect(m_gba_input_row.fix_button, &QPushButton::clicked, this,
+           &XDLauncherDialog::OnGbaInputInfo);
+ 
++  connect(m_save_row_port2.import_button, &QPushButton::clicked, this,
++          [this] { OnImportSave(1); });
++  connect(m_save_row_port3.import_button, &QPushButton::clicked, this,
++          [this] { OnImportSave(2); });
++  connect(m_save_row_port2.restore_button, &QPushButton::clicked, this,
++          [this] { OnRestoreDefaultSave(1); });
++  connect(m_save_row_port3.restore_button, &QPushButton::clicked, this,
++          [this] { OnRestoreDefaultSave(2); });
++
+   connect(m_boot_button, &QPushButton::clicked, this, &XDLauncherDialog::OnBootSolo);
+   connect(m_search_button, &QPushButton::clicked, this, &XDLauncherDialog::OnSearchForMatch);
+   connect(m_host_button, &QPushButton::clicked, this, &XDLauncherDialog::OnHost);
+@@ -516,6 +578,106 @@ void XDLauncherDialog::RefreshChecklist()
+   m_gba_input_row.description->setText(
+       input_mapped ? tr("GBA controls mapped (your GBA is \"GBA 1\" in Controllers)") :
+                      tr("GBA controls not mapped — your GBA will not respond to input"));
++  RefreshSaveSlots();
++}
++
++void XDLauncherDialog::RefreshSaveSlots()
++{
++  const auto refresh_row = [](SaveSlotRow* row, int device,
++                              const Config::Info<std::string>& imported_key) {
++#ifdef HAS_LIBMGBA
++    // The config key only remembers the picked file's NAME for display; the
++    // authoritative "an import happened" signal is the .preimport backup, so
++    // the restore action also unlocks when the key was lost but the backup
++    // proves an import occurred.
++    const std::string imported_name = Config::Get(imported_key);
++    const std::string save_path = SaveSlotPath(device);
++
++    QString text;
++    if (save_path.empty())
++    {
++      text = tr("No GBA ROM configured yet");
++    }
++    else if (!File::Exists(save_path))
++    {
++      text = tr("Not installed yet — use the checklist's Install button");
++    }
++    else
++    {
++      text = imported_name.empty() ?
++                 tr("Team editor save (default)") :
++                 tr("Imported: %1").arg(QString::fromStdString(imported_name));
++      // Game and trainer come from the save file itself, so the row cannot
++      // disagree with what would actually boot. A parse failure (hand-edited
++      // file, mid-write crash) is worth surfacing here instead of hiding.
++      if (const auto save = XDNetplay::LoadSaveFile(save_path))
++      {
++        text += tr(" — %1, trainer %2")
++                    .arg(QString::fromUtf8(
++                        XDNetplay::GameDisplayName(XDNetplay::EmeraldSave::DetectGame(*save))))
++                    .arg(QString::fromStdString(save->GetTrainerName()));
++      }
++      else
++      {
++        text += tr(" — unreadable save file");
++      }
++    }
++    row->state->setText(text);
++    row->import_button->setEnabled(true);
++    row->restore_button->setEnabled(XDNetplay::SaveImport::HasImportBackup(device) ||
++                                    !imported_name.empty());
++#else
++    static_cast<void>(device);
++    static_cast<void>(imported_key);
++    row->state->setText(tr("GBA support (libmgba) is not compiled into this build"));
++    row->import_button->setEnabled(false);
++    row->restore_button->setEnabled(false);
++#endif
++  };
++  refresh_row(&m_save_row_port2, 1, Config::MAIN_XD_IMPORTED_SAVE_2);
++  refresh_row(&m_save_row_port3, 2, Config::MAIN_XD_IMPORTED_SAVE_3);
++}
++
++void XDLauncherDialog::OnImportSave(int device)
++{
++  const QString path =
++      QFileDialog::getOpenFileName(this, tr("Select a Gen 3 save file"), QString(),
++                                   tr("Gen 3 save files (*.sav *.sa2 *.srm);;All files (*)"));
++  if (path.isEmpty())
++    return;
++
++  // All validation (size, structure, checksums, save-game vs port-ROM match)
++  // and the no-destruction bookkeeping (.preimport backup, tmp/readback/
++  // rename) live in SaveImport; the picked file is only ever read. |error| and
++  // |status| arrive user-displayable, refusal reasons included.
++  std::string status;
++  std::string error;
++  if (!XDNetplay::SaveImport::ImportUserSave(path.toStdString(), device, &status, &error))
++  {
++    ModalMessageBox::warning(this, tr("OrreLink"), QString::fromStdString(error));
++  }
++  else
++  {
++    ModalMessageBox::information(this, tr("OrreLink"), QString::fromStdString(status));
++  }
++  RefreshChecklist();
++}
++
++void XDLauncherDialog::OnRestoreDefaultSave(int device)
++{
++  std::string error;
++  if (!XDNetplay::SaveImport::RestoreDefaultSave(device, &error))
++  {
++    ModalMessageBox::warning(this, tr("OrreLink"), QString::fromStdString(error));
++  }
++  else
++  {
++    ModalMessageBox::information(
++        this, tr("OrreLink"),
++        tr("The bundled team-editor save is back in place. If it replaced another save, that one "
++           "was kept next to it as a .bak file."));
++  }
++  RefreshChecklist();
+ }
+ 
+ void XDLauncherDialog::AutoDiscoverFromGameFolder()
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 3d5acba..3066fe2 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -60,9 +60,20 @@ private:
+     QPushButton* fix_button = nullptr;
+   };
+ 
++  // One GBA socket's row in the "Save Files" box: which save source is active
++  // (bundled team save vs a user import, plus game and trainer read from the
++  // file itself), an import picker and a restore-default action.
++  struct SaveSlotRow
++  {
++    QLabel* state = nullptr;
++    QPushButton* import_button = nullptr;
++    QPushButton* restore_button = nullptr;
++  };
++
+   void CreateMainLayout();
+   void ConnectWidgets();
+   void RefreshChecklist();
++  void RefreshSaveSlots();
+   void AutoDiscoverFromGameFolder();
+ 
+   std::shared_ptr<const UICommon::GameFile> FindXdGame() const;
+@@ -75,6 +86,11 @@ private:
+   void OnFixVsSave();
+   void OnGbaInputInfo();
+ 
++  // |device| is the GBA device number: 1 = port 2 (your side), 2 = port 3
++  // (the guest slot).
++  void OnImportSave(int device);
++  void OnRestoreDefaultSave(int device);
++
+   void OnBootSolo();
+   void OnHost();
+   void OnJoin();
+@@ -97,6 +113,9 @@ private:
+   ChecklistRow m_vs_save_row;
+   ChecklistRow m_gba_input_row;
+ 
++  SaveSlotRow m_save_row_port2;
++  SaveSlotRow m_save_row_port3;
++
+   // Battle Style: the host's cosmetic picks (own trainer model, guest-model
+   // fallback, music, location), persisted in the MAIN_XD_STYLE_* keys and
+   // assembled into the synced "$OrreLink Battle Style" AR block by
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index bbdd8e3..5e6e551 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -31,6 +31,8 @@ add_library(uicommon
+   XDNetplay/Gen3Text.h
+   XDNetplay/MonFactory.cpp
+   XDNetplay/MonFactory.h
++  XDNetplay/SaveImport.cpp
++  XDNetplay/SaveImport.h
+   XDNetplay/ShowdownParser.cpp
+   XDNetplay/ShowdownParser.h
+   XDNetplay/TeamInjector.cpp
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+index 21f0dcb..984e509 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+@@ -35,6 +35,90 @@ const std::array<u32, EmeraldSave::SECTIONS_PER_BLOCK> EmeraldSave::EMERALD_SECT
+     2000,  // 13 PC buffer I
+ };
+ 
++// Ruby/Sapphire and FireRed/LeafGreen checksum the same 14 sections over
++// different lengths. Each length is the sizeof() of that game's own save
++// struct chunk -- transcribed from the decomps' chunk tables
++// (pret/pokeruby src/save.c sSaveBlockChunks, pret/pokefirered src/save.c
++// sSaveSlotLayout: section 0 = SaveBlock2, 1..4 = SaveBlock1 split at 3968,
++// 5..13 = PokemonStorage) with the struct sizes as documented in PKHeX's
++// SAV3 buffers (0x890/0xC40 RS, 0xF24/0xEE8 FRLG, 0x83D0 storage for all).
++// Bytes past a section's length are zeroed by the game's write buffer, which
++// is why Emerald-length tools APPEAR to work on RS/FRLG saves; verifying
++// against the game's own stored checksums still needs the real lengths.
++const std::array<u32, EmeraldSave::SECTIONS_PER_BLOCK> EmeraldSave::RS_SECTION_DATA_LENGTHS = {
++    2192,  // 0  Trainer info (sizeof(SaveBlock2) = 0x890)
++    3968,  // 1  Team / items
++    3968,  // 2  Game state
++    3968,  // 3  Misc data
++    3136,  // 4  Rival info (SaveBlock1 = 0x3AC0 leaves 0xC40)
++    3968,  // 5  PC buffer A
++    3968,  // 6  PC buffer B
++    3968,  // 7  PC buffer C
++    3968,  // 8  PC buffer D
++    3968,  // 9  PC buffer E
++    3968,  // 10 PC buffer F
++    3968,  // 11 PC buffer G
++    3968,  // 12 PC buffer H
++    2000,  // 13 PC buffer I
++};
++
++const std::array<u32, EmeraldSave::SECTIONS_PER_BLOCK> EmeraldSave::FRLG_SECTION_DATA_LENGTHS = {
++    3876,  // 0  Trainer info (sizeof(SaveBlock2) = 0xF24)
++    3968,  // 1  Team / items
++    3968,  // 2  Game state
++    3968,  // 3  Misc data
++    3816,  // 4  Rival info (SaveBlock1 = 0x3D68 leaves 0xEE8)
++    3968,  // 5  PC buffer A
++    3968,  // 6  PC buffer B
++    3968,  // 7  PC buffer C
++    3968,  // 8  PC buffer D
++    3968,  // 9  PC buffer E
++    3968,  // 10 PC buffer F
++    3968,  // 11 PC buffer G
++    3968,  // 12 PC buffer H
++    2000,  // 13 PC buffer I
++};
++
++const std::array<u32, EmeraldSave::SECTIONS_PER_BLOCK>&
++EmeraldSave::SectionDataLengths(Gen3Game game)
++{
++  switch (game)
++  {
++  case Gen3Game::RubySapphire:
++    return RS_SECTION_DATA_LENGTHS;
++  case Gen3Game::FireRedLeafGreen:
++    return FRLG_SECTION_DATA_LENGTHS;
++  case Gen3Game::Emerald:
++  default:
++    return EMERALD_SECTION_DATA_LENGTHS;
++  }
++}
++
++const char* GameDisplayName(Gen3Game game)
++{
++  switch (game)
++  {
++  case Gen3Game::RubySapphire:
++    return "Ruby/Sapphire";
++  case Gen3Game::FireRedLeafGreen:
++    return "FireRed/LeafGreen";
++  case Gen3Game::Emerald:
++  default:
++    return "Emerald";
++  }
++}
++
++Gen3Game EmeraldSave::DetectGame(const EmeraldSave& save)
++{
++  const std::vector<u8> sec0 = save.SectionBytes(0);
++  const u32 code = ReadU32(sec0.data(), GAME_CODE_OFFSET);
++  if (code == 0)
++    return Gen3Game::RubySapphire;
++  if (code == 1)
++    return Gen3Game::FireRedLeafGreen;
++  return Gen3Game::Emerald;
++}
++
+ u32 EmeraldSave::SectionChecksum(const u8* buf, size_t base, u32 data_length)
+ {
+   u32 total = 0;
+@@ -133,8 +217,9 @@ std::vector<u8> EmeraldSave::SectionBytes(size_t section_id) const
+   return std::vector<u8>(m_raw.begin() + off, m_raw.begin() + off + SECTION_SIZE);
+ }
+ 
+-std::vector<ChecksumMismatch> EmeraldSave::VerifyAllChecksums() const
++std::vector<ChecksumMismatch> EmeraldSave::VerifyAllChecksums(Gen3Game game) const
+ {
++  const std::array<u32, SECTIONS_PER_BLOCK>& lengths = SectionDataLengths(game);
+   std::vector<ChecksumMismatch> bad;
+   for (int block = 0; block <= 1; block++)
+   {
+@@ -145,7 +230,7 @@ std::vector<ChecksumMismatch> EmeraldSave::VerifyAllChecksums() const
+       const u32 stored = ReadU16(m_raw.data(), off + SECTION_FOOTER_OFFSET + 2);
+       if (sid >= SECTIONS_PER_BLOCK)
+         continue;
+-      const u32 calc = SectionChecksum(m_raw.data(), off, EMERALD_SECTION_DATA_LENGTHS[sid]);
++      const u32 calc = SectionChecksum(m_raw.data(), off, lengths[sid]);
+       if (calc != stored)
+       {
+         bad.push_back({block, static_cast<int>(slot), static_cast<int>(sid), stored, calc});
+@@ -155,10 +240,10 @@ std::vector<ChecksumMismatch> EmeraldSave::VerifyAllChecksums() const
+   return bad;
+ }
+ 
+-void EmeraldSave::UpdateSectionChecksum(size_t section_id)
++void EmeraldSave::UpdateSectionChecksum(size_t section_id, Gen3Game game)
+ {
+   const size_t off = m_section_offsets[section_id];
+-  const u32 calc = SectionChecksum(m_raw.data(), off, EMERALD_SECTION_DATA_LENGTHS[section_id]);
++  const u32 calc = SectionChecksum(m_raw.data(), off, SectionDataLengths(game)[section_id]);
+   WriteU16(m_raw.data(), off + SECTION_FOOTER_OFFSET + 2, calc);
+ }
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.h b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+index 1396d91..c3ad613 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.h
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+@@ -24,6 +24,21 @@ struct ChecksumMismatch
+   u32 calculated = 0;
+ };
+ 
++// Which Gen 3 game wrote a save image. The block/section/footer layout is
++// identical across all five cartridges; what differs is the per-section
++// checksum length table and some section-interior offsets, so game-aware
++// callers pick behavior off this enum. EmeraldSave::DetectGame is the single
++// authoritative detector on every platform (mirrored in Gen3Save.kt).
++enum class Gen3Game
++{
++  RubySapphire,
++  FireRedLeafGreen,
++  Emerald,
++};
++
++// "Ruby/Sapphire" / "FireRed/LeafGreen" / "Emerald", for user-facing messages.
++const char* GameDisplayName(Gen3Game game);
++
+ // Pokemon Emerald (Gen 3) save file: 131072 bytes of flash plus any trailing
+ // bytes (e.g. the 16-byte mGBA RTC footer), which are preserved verbatim.
+ //
+@@ -60,11 +75,25 @@ public:
+   static constexpr size_t TRAINER_NAME_FIELD_SIZE = TRAINER_NAME_LEN + 1;
+   static constexpr size_t TRAINER_GENDER_OFFSET = 0x0008;
+   static constexpr size_t TRAINER_ID_OFFSET = 0x000A;  // u32: low public, high secret
++  // u32 read by DetectGame: 0 in Ruby/Sapphire (the field is unused there),
++  // the constant 1 in FireRed/LeafGreen, and Emerald's security key -- an
++  // effectively random nonzero value -- otherwise. Same heuristic every Gen 3
++  // save tool uses; the bundled team saves carry 0xAA2F3199 / 0xCF0579AC.
++  static constexpr size_t GAME_CODE_OFFSET = 0x00AC;
+ 
+   // Per-section valid data length used by the checksum (Emerald). Index =
+   // logical section ID. Empirically confirmed: with these exact lengths every
+   // section checksum in the test saves matches.
+   static const std::array<u32, SECTIONS_PER_BLOCK> EMERALD_SECTION_DATA_LENGTHS;
++  // Ruby/Sapphire and FireRed/LeafGreen counterparts; see the transcription
++  // note in Gen3Save.cpp before trusting either table.
++  static const std::array<u32, SECTIONS_PER_BLOCK> RS_SECTION_DATA_LENGTHS;
++  static const std::array<u32, SECTIONS_PER_BLOCK> FRLG_SECTION_DATA_LENGTHS;
++  static const std::array<u32, SECTIONS_PER_BLOCK>& SectionDataLengths(Gen3Game game);
++
++  // THE authoritative game detector (see Gen3Game). The save must have been
++  // parsed by Create so section 0 is mapped.
++  static Gen3Game DetectGame(const EmeraldSave& save);
+ 
+   // Parse a save image. Returns std::nullopt (with *error set, if given) when
+   // the file is too small or no fully valid block exists.
+@@ -87,10 +116,12 @@ public:
+   std::vector<u8> SectionBytes(size_t section_id) const;
+ 
+   // Check every section footer checksum in BOTH blocks. Returns the list of
+-  // mismatches (empty when the file is fully consistent).
+-  std::vector<ChecksumMismatch> VerifyAllChecksums() const;
++  // mismatches (empty when the file is fully consistent). Game-aware callers
++  // pass DetectGame's answer; the Emerald default keeps the bundled-save
++  // paths (and every pre-import caller) byte-identical in behavior.
++  std::vector<ChecksumMismatch> VerifyAllChecksums(Gen3Game game = Gen3Game::Emerald) const;
+ 
+-  void UpdateSectionChecksum(size_t section_id);
++  void UpdateSectionChecksum(size_t section_id, Gen3Game game = Gen3Game::Emerald);
+ 
+   // -- trainer info (logical section 0) --------------------------------------
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/SaveImport.cpp b/Source/Core/UICommon/XDNetplay/SaveImport.cpp
+new file mode 100644
+index 0000000..3d0f9ec
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/SaveImport.cpp
+@@ -0,0 +1,403 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/SaveImport.h"
++
++#include <array>
++#include <string_view>
++#include <utility>
++
++#include <fmt/format.h>
++
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Common/IOFile.h"
++
++#include "Core/Config/MainSettings.h"
++#include "Core/Core.h"
++#include "Core/NetPlayProto.h"
++#include "Core/System.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBACore.h"
++#endif
++
++namespace XDNetplay::SaveImport
++{
++namespace
++{
++// The full 128 KiB flash image every Gen 3 cartridge writes. EmeraldSave only
++// needs the two game-save blocks (114688 bytes), but an import always stores
++// the whole flash so the Hall of Fame / e-Reader sectors and any emulator
++// footer ride along verbatim.
++constexpr size_t FULL_FLASH_SIZE = 131072;
++// A 64 KiB dump holds a single bank: block 0 plus the start of block 1.
++constexpr size_t SINGLE_BANK_SIZE = 65536;
++// Largest emulator footer accepted on a single-bank dump. mGBA's RTC tail is
++// 16 bytes; 256 leaves headroom for other emulators without letting a
++// truncated dual-bank file masquerade as bank-plus-footer.
++constexpr size_t MAX_FOOTER_SIZE = 256;
++
++#ifdef HAS_LIBMGBA
++// TeamInjector's session bookkeeping files. MUST stay in step with the
++// suffix constants in TeamInjector.cpp: their presence next to a socket save
++// means a room's injection round trip owns that file right now.
++constexpr const char* HOST_STASH_SUFFIX = ".hostteam";
++constexpr const char* GUEST_MARK_SUFFIX = ".guestteam";
++// Same ROM resolution as TeamInjector and the team editors: the socket's own
++// ROM, falling back to the other socket's (a launcher-made setup points both
++// at one dump). Empty when the setup is not complete enough to have one.
++std::string ResolveRomForDevice(int device)
++{
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++    return {};
++  return rom;
++}
++
++std::string SavePathForDevice(int device)
++{
++  const std::string rom = ResolveRomForDevice(device);
++  if (rom.empty())
++    return {};
++  return HW::GBA::Core::GetSavePath(rom, device);
++}
++
++const Config::Info<std::string>& ImportedSaveKey(int device)
++{
++  return device == 1 ? Config::MAIN_XD_IMPORTED_SAVE_2 : Config::MAIN_XD_IMPORTED_SAVE_3;
++}
++
++std::string BaseName(const std::string& path)
++{
++  return path.substr(path.find_last_of("/\\") + 1);
++}
++
++bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
++{
++  File::IOFile file(path, "rb");
++  if (!file)
++    return false;
++  out->resize(file.GetSize());
++  return out->empty() || file.ReadBytes(out->data(), out->size());
++}
++
++// The tmp/readback/rename discipline of VerifiedWriteSaveFile (Gen3Save.cpp),
++// minus its Emerald-only re-parse -- an already-validated RS/FRLG image must
++// pass. The destination is never touched until the tmp has been read back
++// byte-identical, and an existing destination is kept as one-level .bak undo.
++bool WriteFileVerified(const std::string& path, const std::vector<u8>& bytes, std::string* error)
++{
++  File::CreateFullPath(path);
++  const std::string tmp_path = path + ".tmp";
++  {
++    File::IOFile tmp(tmp_path, "wb");
++    if (!tmp || !tmp.WriteBytes(bytes.data(), bytes.size()) || !tmp.Flush())
++    {
++      if (error)
++        *error = "could not write " + tmp_path;
++      return false;
++    }
++  }
++  {
++    File::IOFile tmp(tmp_path, "rb");
++    std::vector<u8> readback(bytes.size());
++    if (!tmp || tmp.GetSize() != bytes.size() ||
++        !tmp.ReadBytes(readback.data(), readback.size()) || readback != bytes)
++    {
++      if (error)
++        *error = "tmp readback mismatch for " + tmp_path;
++      File::Delete(tmp_path);
++      return false;
++    }
++  }
++  if (File::Exists(path) && !File::CopyRegularFile(path, path + ".bak"))
++  {
++    if (error)
++      *error = "could not back up " + path;
++    File::Delete(tmp_path);
++    return false;
++  }
++  if (!File::Rename(tmp_path, path))
++  {
++    if (error)
++      *error = "could not rename " + tmp_path + " into place";
++    return false;
++  }
++  return true;
++}
++
++// Refusals shared by import and restore: never touch a socket save while the
++// emulated GBAs could rewrite it from memory, and never touch the guest slot
++// while a room's injection bookkeeping owns it (the purge would later copy
++// the stash straight over whatever was written).
++bool RefuseIfSaveIsLive(int device, const std::string& save_path, std::string* error)
++{
++  if (!Core::IsUninitialized(Core::System::GetInstance()))
++  {
++    if (error)
++    {
++      *error = "A game is running — the emulated GBA owns its save file and would overwrite the "
++               "change. Stop emulation first.";
++    }
++    return true;
++  }
++  if (device == 2 &&
++      (NetPlay::IsNetPlayRunning() || File::Exists(save_path + GUEST_MARK_SUFFIX) ||
++       File::Exists(save_path + HOST_STASH_SUFFIX)))
++  {
++    if (error)
++    {
++      *error = "You are hosting a room right now — the guest slot holds your opponent's team. "
++               "Close the room, then import.";
++    }
++    return true;
++  }
++  return false;
++}
++
++// Requirement 5, appended to every success status: an import must never leave
++// a joiner believing their file reaches a host's room.
++constexpr const char* HOST_SAVES_NOTE =
++    "Netplay rooms always use the HOST's saves. An imported save applies when you play solo or "
++    "host; when you join someone's room, use Submit Team instead.";
++
++constexpr const char* RS_REVISION_NOTE =
++    "Note: Ruby/Sapphire revisions (1.0/1.1/1.2) also differ — use a save from your exact ROM "
++    "revision.";
++#endif  // HAS_LIBMGBA
++}  // namespace
++
++std::optional<SaveValidation> ValidateGen3SaveImage(std::vector<u8>* bytes, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  SaveValidation result;
++  result.original_size = bytes->size();
++
++  if (bytes->size() == SINGLE_BANK_SIZE)
++  {
++    // 0xFF is flash erase state: the padded second bank scans as invalid and
++    // block 0 becomes the active block, exactly like a once-saved cartridge.
++    bytes->resize(FULL_FLASH_SIZE, 0xFF);
++    result.padded_from_64k = true;
++  }
++  else if (bytes->size() > SINGLE_BANK_SIZE && bytes->size() < FULL_FLASH_SIZE &&
++           bytes->size() - SINGLE_BANK_SIZE <= MAX_FOOTER_SIZE)
++  {
++    // A 64 KiB dump that carries an emulator footer (mGBA's RTC tail is 16
++    // bytes): pad the flash bank to full size and re-attach the footer after
++    // it, where the rest of the pipeline expects footers to live.
++    std::vector<u8> footer(bytes->begin() + SINGLE_BANK_SIZE, bytes->end());
++    bytes->resize(SINGLE_BANK_SIZE);
++    bytes->resize(FULL_FLASH_SIZE, 0xFF);
++    bytes->insert(bytes->end(), footer.begin(), footer.end());
++    result.padded_from_64k = true;
++  }
++  else if (bytes->size() < FULL_FLASH_SIZE)
++  {
++    return fail(fmt::format(
++        "That file is not a Gen 3 save: expected 131,072 bytes of save data (128 KiB, optionally "
++        "with an emulator footer), got {} bytes.",
++        result.original_size));
++  }
++
++  std::string parse_error;
++  const auto save = EmeraldSave::Create(*bytes, &parse_error);
++  if (!save)
++  {
++    return fail("No valid save block found — the file may be corrupt, or from a different "
++                "game/emulator format.");
++  }
++
++  result.game = EmeraldSave::DetectGame(*save);
++  const auto bad = save->VerifyAllChecksums(result.game);
++  if (!bad.empty())
++  {
++    return fail(fmt::format(
++        "{} section checksum(s) are invalid — the save looks corrupt, so it was not imported.",
++        bad.size()));
++  }
++  return result;
++}
++
++std::optional<Gen3Game> DetectRomGame(const std::string& rom_path, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  std::array<char, 4> code{};
++  {
++    File::IOFile file(rom_path, "rb");
++    if (!file || file.GetSize() < 0xC0 || !file.Seek(0xAC, File::SeekOrigin::Begin) ||
++        !file.ReadBytes(code.data(), code.size()))
++    {
++      return fail("could not read the ROM header of " + rom_path);
++    }
++  }
++
++  const std::string_view id(code.data(), code.size());
++  const std::string_view family = id.substr(0, 3);  // fourth letter = language
++  if (family == "AXV" || family == "AXP")
++    return Gen3Game::RubySapphire;
++  if (family == "BPR" || family == "BPG")
++    return Gen3Game::FireRedLeafGreen;
++  if (family == "BPE")
++    return Gen3Game::Emerald;
++
++  std::string printable;
++  for (const char c : id)
++    printable.push_back(c >= 0x20 && c < 0x7F ? c : '?');
++  return fail(fmt::format(
++      "this ROM is not a Gen 3 Pokemon game (game code \"{}\"), so there is nothing to match the "
++      "save against",
++      printable));
++}
++
++bool ImportUserSave(const std::string& source_path, int device, std::string* status,
++                    std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return false;
++  };
++
++#ifndef HAS_LIBMGBA
++  return fail("this build has no GBA support");
++#else
++  if (device != 1 && device != 2)
++    return fail(fmt::format("no such GBA socket ({})", device));
++
++  const std::string rom = ResolveRomForDevice(device);
++  if (rom.empty())
++    return fail("no GBA ROM configured for that port — run the launcher checklist first");
++  const std::string save_path = HW::GBA::Core::GetSavePath(rom, device);
++
++  if (RefuseIfSaveIsLive(device, save_path, error))
++    return false;
++
++  // The chosen file is read once, fully, and never opened for writing.
++  std::vector<u8> bytes;
++  if (!ReadFileBytes(source_path, &bytes))
++    return fail("could not read " + source_path);
++
++  const auto validation = ValidateGen3SaveImage(&bytes, error);
++  if (!validation)
++    return false;
++
++  const auto rom_game = DetectRomGame(rom, error);
++  if (!rom_game)
++    return false;
++  if (validation->game != *rom_game)
++  {
++    std::string message = fmt::format(
++        "That save is from {}, but this GBA port runs {}. The game itself would refuse a "
++        "mismatched save, so it was not imported.",
++        GameDisplayName(validation->game), GameDisplayName(*rom_game));
++    if (validation->game == Gen3Game::RubySapphire)
++      message += std::string(" ") + RS_REVISION_NOTE;
++    return fail(message);
++  }
++
++  // First backup wins, forever: a re-import must never overwrite the record
++  // of what the socket held before the FIRST import.
++  const std::string backup_path = save_path + PREIMPORT_SUFFIX;
++  const bool backup_existed = File::Exists(backup_path);
++  const bool had_previous = File::Exists(save_path);
++  if (had_previous && !backup_existed && !File::CopyRegularFile(save_path, backup_path))
++    return fail("could not back up the current save to " + backup_path + " — nothing was changed");
++
++  if (!WriteFileVerified(save_path, bytes, error))
++    return false;
++
++  // Display-only record of what was imported; HasImportBackup stays the
++  // authoritative signal.
++  Config::SetBase(ImportedSaveKey(device), BaseName(source_path));
++  Config::Save();
++
++  if (status)
++  {
++    const auto parsed = EmeraldSave::Create(bytes);
++    // The trainer-name field lives at the same section-0 offset in all five
++    // cartridges, so it is worth showing whatever the game is.
++    const std::string trainer = parsed ? parsed->GetTrainerName() : "?";
++    *status = fmt::format("Imported {} ({}, trainer {}).", BaseName(source_path),
++                          GameDisplayName(validation->game), trainer);
++    if (validation->padded_from_64k)
++      *status += " The 64 KiB file was padded to the full 128 KiB flash size.";
++    if (backup_existed)
++    {
++      *status += fmt::format(" Your original save from before the first import is kept as {}.",
++                             BaseName(backup_path));
++    }
++    else if (had_previous)
++    {
++      *status += fmt::format(" Your previous save is kept as {}.", BaseName(backup_path));
++    }
++    if (validation->game == Gen3Game::RubySapphire)
++      *status += std::string(" ") + RS_REVISION_NOTE;
++    *status += std::string("\n\n") + HOST_SAVES_NOTE;
++  }
++  return true;
++#endif
++}
++
++bool RestoreDefaultSave(int device, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return false;
++  };
++
++#ifndef HAS_LIBMGBA
++  return fail("this build has no GBA support");
++#else
++  if (device != 1 && device != 2)
++    return fail(fmt::format("no such GBA socket ({})", device));
++
++  const std::string save_path = SavePathForDevice(device);
++  if (save_path.empty())
++    return fail("no GBA ROM configured for that port — run the launcher checklist first");
++
++  if (RefuseIfSaveIsLive(device, save_path, error))
++    return false;
++
++  const std::string template_path =
++      File::GetSysDirectory() +
++      (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++  std::vector<u8> bytes;
++  if (!ReadFileBytes(template_path, &bytes))
++    return fail("bundled template missing: " + template_path);
++
++  // The replaced import survives as .bak (WriteFileVerified's one-level
++  // undo); .preimport is deliberately left alone -- it belongs to the
++  // pre-import world and nothing may delete it.
++  if (!WriteFileVerified(save_path, bytes, error))
++    return false;
++
++  Config::SetBase(ImportedSaveKey(device), std::string{});
++  Config::Save();
++  return true;
++#endif
++}
++
++bool HasImportBackup(int device)
++{
++#ifndef HAS_LIBMGBA
++  return false;
++#else
++  const std::string save_path = SavePathForDevice(device);
++  return !save_path.empty() && File::Exists(save_path + PREIMPORT_SUFFIX);
++#endif
++}
++}  // namespace XDNetplay::SaveImport
+diff --git a/Source/Core/UICommon/XDNetplay/SaveImport.h b/Source/Core/UICommon/XDNetplay/SaveImport.h
+new file mode 100644
+index 0000000..7979613
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/SaveImport.h
+@@ -0,0 +1,81 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++#include "UICommon/XDNetplay/Gen3Save.h"
++
++// Opt-in import of a user's own Gen 3 save into a GBA socket, replacing the
++// bundled team-editor save. Guarantees, in order of importance:
++//  - the file the user picked is only ever READ;
++//  - whatever occupied the socket is backed up ONCE to <save>.preimport, a
++//    name no cleanup path (TeamInjector's purge included) ever deletes, and a
++//    re-import never overwrites that first backup;
++//  - nothing lands in the socket unless the image validated in memory first
++//    (size, structure, checksums, and game-vs-ROM match).
++// Mirrored 1:1 on Android in features/xdnetplay/gen3/SaveImport.kt.
++namespace XDNetplay::SaveImport
++{
++// Backup of whatever occupied a GBA socket before the FIRST user import.
++// PROVABLY outside TeamInjector's cleanup set (.hostteam / .guestteam / .bak /
++// .tmp / NetPlayTemp*.sav -- TeamInjector.cpp's PurgeNow): no code path in the
++// tree deletes a .preimport file, so the pre-import world survives every
++// session, purge, and re-import.
++constexpr const char* PREIMPORT_SUFFIX = ".preimport";
++
++// What ValidateGen3SaveImage learned about an accepted image.
++struct SaveValidation
++{
++  Gen3Game game = Gen3Game::Emerald;
++  // Byte count of the file as picked, before any padding.
++  size_t original_size = 0;
++  // A 65536-byte single-bank file was 0xFF-padded (flash erase state) up to
++  // the full 131072; block 0 carries the whole save in that case.
++  bool padded_from_64k = false;
++  // Always 0 on an accepted image -- any mismatch refuses it. Kept so the
++  // struct mirrors the Kotlin port field-for-field.
++  int bad_checksums = 0;
++};
++
++// Pure, no I/O. Size gate (exactly 65536, or >= 131072 with any trailing
++// emulator footer preserved) -> optional 0xFF pad to 131072 -> structure parse
++// -> game detection -> game-aware checksum verification. On success *bytes
++// holds exactly the image an import may write; on failure *bytes is
++// unspecified and *error (if given) holds a user-displayable reason.
++std::optional<SaveValidation> ValidateGen3SaveImage(std::vector<u8>* bytes,
++                                                    std::string* error = nullptr);
++
++// The Gen 3 game a GBA ROM is, from the 4-character game code at header
++// 0xAC.. 0xAF ("BPE*" Emerald, "AXV*"/"AXP*" Ruby/Sapphire, "BPR*"/"BPG*"
++// FireRed/LeafGreen; the fourth letter is only the language). std::nullopt
++// (with *error) for unreadable files and non-Pokemon ROMs -- the launcher's
++// manual picker accepts any GBA ROM, so this cannot assume Emerald.
++std::optional<Gen3Game> DetectRomGame(const std::string& rom_path, std::string* error = nullptr);
++
++// The whole no-destruction import flow for GBA socket `device` (1 = port 2,
++// the user's side; 2 = port 3, the guest slot): resolve the socket's save
++// path, refuse while a room or emulation could clobber the result, validate
++// the source in memory, back up the current save once, then tmp-write /
++// read back / rename the validated image into place and record the source
++// filename in the per-port config key. The source file is never written.
++// *status gets a user-displayable success summary.
++bool ImportUserSave(const std::string& source_path, int device, std::string* status,
++                    std::string* error);
++
++// Put the bundled team-editor template back into socket `device`'s save and
++// clear the per-port config key. The replaced file is kept as <save>.bak
++// (one-level undo, same as every verified write); <save>.preimport is left
++// untouched forever.
++bool RestoreDefaultSave(int device, std::string* error);
++
++// True when <save>.preimport exists for the socket. This -- not the config
++// key, which is display-only -- is the authoritative "an import happened"
++// signal, so a hand-deleted file cannot desync the UI.
++bool HasImportBackup(int device);
++}  // namespace XDNetplay::SaveImport
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index abcdf8e..86664c9 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -421,14 +421,32 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+ 
+   // Stash the host's own team once per session, so it can be put back when the
+   // room closes. Only the FIRST injection stashes: a second submission must not
+-  // overwrite the stash with the first guest's team.
+-  if (File::Exists(save_path) && !File::Exists(save_path + HOST_STASH_SUFFIX))
+-    File::CopyRegularFile(save_path, save_path + HOST_STASH_SUFFIX);
++  // overwrite the stash with the first guest's team. A failed stash REFUSES the
++  // injection: proceeding would leave the cleanup's no-stash branch to scrub
++  // the host's save afterwards -- with a user-imported save in the slot, that
++  // is real data on the line, not just a template reseed.
++  if (File::Exists(save_path) && !File::Exists(save_path + HOST_STASH_SUFFIX) &&
++      !File::CopyRegularFile(save_path, save_path + HOST_STASH_SUFFIX))
++  {
++    return fail("could not back up the host's own team; submission not applied");
++  }
+ 
+   auto save = EmeraldSave::Create(std::move(bytes), &error);
+   if (!save)
+     return fail(fmt::format("host save unreadable ({})", error));
+ 
++  // Team submission writes at Emerald section offsets. Ruby/Sapphire shares
++  // them (verified), FireRed/LeafGreen does NOT -- its party lives elsewhere in
++  // section 1, and because the section checksum lengths coincide, an Emerald-
++  // offset write into an FRLG save PASSES verification and then silently plays
++  // the host's FRLG party instead of the guest's submitted team. Refuse loudly
++  // instead; the status lands in the room chat.
++  if (EmeraldSave::DetectGame(*save) == Gen3Game::FireRedLeafGreen)
++  {
++    return fail("the guest slot holds a FireRed/LeafGreen save, which team submission cannot "
++                "write to -- restore the default team save to host with submissions");
++  }
++
+   const std::vector<ShowdownSet> sets = ShowdownParser::ParseTeam(showdown_text);
+   if (sets.empty())
+     return fail("nothing recognizable in that paste");
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 64e4ee6..42cdfa3 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.2.2";
++constexpr char VERSION[] = "1.3.0";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
