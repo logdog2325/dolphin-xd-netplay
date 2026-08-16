@@ -1,0 +1,1893 @@
+From 278fe35d4056ee466bec10aa4684790e0c668403 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 16 Aug 2026 10:50:22 -0700
+Subject: [PATCH] Submit your team straight from your save, remember the
+ dialog, curate the music
+
+Guest save submission, after the design Akiak built for OrreLink's ancestor:
+instead of a Showdown paste, "Use my save" reads the guest's own save locally,
+extracts a small party-and-identity bundle -- the six party mons byte-for-byte,
+trainer name, gender, TID and SID -- and sends that through the existing team
+submission channel. The host rebuilds the guest's disposable socket-3 save from
+the bundled template with the bundle's party AND its trainer identity, so the
+mons' OT is the save's own trainer and obedience is intrinsically right; no
+re-stamping happens anywhere on this path. Nicknames, ribbons and met history
+survive because the real bytes ride the wire. The original save is only ever
+read, the bundle is strictly validated host-side before anything else happens,
+and the stash/restore/cleanup lifecycle is exactly the one every submitted team
+already gets. The dialog says plainly that sending a party reveals its details
+to the host's machine.
+
+The submit dialog also finally remembers itself: team text, trainer name,
+model pick and the use-my-save choice persist across sessions and prefill on
+open, stored on successful submission.
+
+And one music entry leaves the catalog: "Shadow Event" (id 7) is a sequenced
+archive container, not a streamable track -- the original research excluded
+that class and this one slipped through; the field test caught it as silence.
+
+Version 1.3.1.
+---
+ .../features/netplay/NetplaySession.kt        |  19 +
+ .../netplay/model/NetplayViewModel.kt         |  93 +++++
+ .../features/netplay/ui/NetplayActivity.kt    |  11 +-
+ .../features/netplay/ui/NetplayScreen.kt      |  78 ++++-
+ .../features/settings/model/BooleanSetting.kt |  12 +
+ .../features/settings/model/IntSetting.kt     |   9 +
+ .../features/settings/model/StringSetting.kt  |  19 +
+ .../app/src/main/res/values/strings.xml       |   8 +
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |  10 +-
+ Source/Android/jni/NetPlay/Netplay.cpp        |  70 ++++
+ Source/Core/Core/Config/MainSettings.cpp      |   4 +
+ Source/Core/Core/Config/MainSettings.h        |  17 +
+ Source/Core/DolphinLib.props                  |   2 +
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  | 164 ++++++++-
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   |  11 +-
+ Source/Core/UICommon/XDNetplay/Gen3Save.cpp   |  13 +
+ Source/Core/UICommon/XDNetplay/Gen3Save.h     |  10 +
+ .../Core/UICommon/XDNetplay/PartyBundle.cpp   | 327 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/PartyBundle.h  |  99 ++++++
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 261 +++++++++++---
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  46 +++
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 23 files changed, 1214 insertions(+), 73 deletions(-)
+ create mode 100644 Source/Core/UICommon/XDNetplay/PartyBundle.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/PartyBundle.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+index ef0276b..ac3889c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+@@ -185,6 +185,23 @@ class NetplaySession(
+     fun submitTeam(showdownText: String, trainerName: String, modelId: Int) =
+         nativeSubmitTeam(showdownText, trainerName, modelId)
+ 
++    /**
++     * "Use my save": submit the party from this player's OWN local save (their
++     * imported or team-editor port-2 slot) instead of a Showdown paste. The
++     * native side reads the save, extracts the fixed-size party bundle -- the
++     * real mon bytes plus the save's real trainer identity, which is why no
++     * trainer-name parameter exists here (renaming would make the party
++     * disobedient; see UICommon/XDNetplay/PartyBundle.h) -- and sends it as a
++     * "SaveBundle:" TeamData payload the host validates strictly.
++     *
++     * [modelId] rides along exactly as for [submitTeam]; <= 0 means "no
++     * preference". Reads the save file, so call off the main thread.
++     *
++     * @return "" when the bundle was sent, else a user-displayable reason why
++     * nothing was sent (no save, empty party, FireRed/LeafGreen save, ...).
++     */
++    fun submitSaveBundle(modelId: Int): String = nativeSubmitSaveBundle(modelId)
++
+     /** Show a line in this player's own chat log; nothing is sent over the wire. */
+     fun showLocalMessage(message: String) {
+         _chatMessages.tryEmit(message)
+@@ -285,6 +302,8 @@ class NetplaySession(
+ 
+     private external fun nativeSubmitTeam(showdownText: String, trainerName: String, modelId: Int)
+ 
++    private external fun nativeSubmitSaveBundle(modelId: Int): String
++
+     private external fun nativeSetHostInputAuthority(enable: Boolean)
+ 
+     private external fun nativeAdjustClientPadBufferSize(buffer: Int)
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index 5aac2b4..580199f 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -2,6 +2,7 @@
+ 
+ package org.dolphinemu.dolphinemu.features.netplay.model
+ 
++import android.util.Base64
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.ViewModelProvider
+ import androidx.lifecycle.asFlow
+@@ -144,6 +145,34 @@ class NetplayViewModel(
+     val defaultTrainerName: String
+         get() = EmeraldSave.sanitizeTrainerName(netplaySession.nickName)
+ 
++    /** What the Submit Team sheet opens pre-filled with. */
++    data class SubmitPrefill(
++        val teamText: String,
++        val trainerName: String,
++        val modelId: Int,
++        val useMySave: Boolean,
++    )
++
++    /**
++     * The last-submitted Submit Team sheet state, from the MAIN_XD_SUBMIT_*
++     * config keys (stored by [submitTeam]/[submitSaveBundle] on each
++     * successful submit), so a joiner does not retype team, name and model
++     * every session. The team text round-trips through base64 because a
++     * Showdown export is multi-line and Dolphin's INI config layer is
++     * line-based; the same encoding is read/written by the desktop dialog.
++     * A never-stored (or unsanitizable) name falls back to the netplay
++     * nickname, exactly what the sheet always pre-filled.
++     */
++    fun submitPrefill(): SubmitPrefill {
++        val storedName = EmeraldSave.sanitizeTrainerName(StringSetting.MAIN_XD_SUBMIT_NAME.string)
++        return SubmitPrefill(
++            teamText = decodeStoredTeamText(StringSetting.MAIN_XD_SUBMIT_TEAM_B64.string),
++            trainerName = storedName.ifEmpty { defaultTrainerName },
++            modelId = IntSetting.MAIN_XD_SUBMIT_MODEL.int,
++            useMySave = BooleanSetting.MAIN_XD_SUBMIT_USE_SAVE.boolean,
++        )
++    }
++
+     /**
+      * XD Netplay: hand this player's own team to the host, which writes it into
+      * the GBA save it syncs when the battle starts. A pokepast.es link is
+@@ -174,6 +203,7 @@ class NetplayViewModel(
+         }
+         val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+").find(trimmed)?.value
+         if (pokepaste == null) {
++            storeSubmitDrafts(trimmed, name, modelId, useMySave = false)
+             netplaySession.submitTeam(trimmed, name, modelId)
+             return
+         }
+@@ -189,12 +219,75 @@ class NetplayViewModel(
+                         "Could not fetch that paste (network error)."
+                     )
+                 } else {
++                    // Store what the user typed (the link, not the fetched
++                    // body) so next session's sheet prefills the same way.
++                    storeSubmitDrafts(trimmed, name, modelId, useMySave = false)
+                     netplaySession.submitTeam(body, name, modelId)
+                 }
+             }
+         }
+     }
+ 
++    /**
++     * XD Netplay "Use my save": submit the party from this player's OWN local
++     * save -- real mon bytes, real trainer identity -- instead of a Showdown
++     * paste. The extraction and refusals (FireRed/LeafGreen save, empty
++     * party, no save at all) live native-side; a refusal surfaces as a local
++     * chat line and nothing is sent. The in-game-name field does not apply
++     * here (the save's real trainer name always wins; see NetplaySession), so
++     * only [modelId] rides along.
++     */
++    fun submitSaveBundle(modelId: Int) {
++        viewModelScope.launch(Dispatchers.IO) {
++            val error = netplaySession.submitSaveBundle(modelId)
++            withContext(Dispatchers.Main) {
++                if (error.isEmpty()) {
++                    // The team/name drafts were not part of this submission;
++                    // leave their stored values alone.
++                    storeSubmitDrafts(null, null, modelId, useMySave = true)
++                } else {
++                    netplaySession.showLocalMessage(
++                        "Could not submit the team from your save — $error."
++                    )
++                }
++            }
++        }
++    }
++
++    /**
++     * Persist the Submit Team sheet's state on a successful submit, so the
++     * sheet opens pre-filled next session ([submitPrefill]). A null
++     * [teamText]/[trainerName] leaves that stored value untouched (the bundle
++     * path, which uses neither).
++     */
++    private fun storeSubmitDrafts(
++        teamText: String?,
++        trainerName: String?,
++        modelId: Int,
++        useMySave: Boolean,
++    ) {
++        if (teamText != null) {
++            StringSetting.MAIN_XD_SUBMIT_TEAM_B64.setString(
++                NativeConfig.LAYER_BASE,
++                Base64.encodeToString(teamText.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
++            )
++        }
++        if (trainerName != null) {
++            StringSetting.MAIN_XD_SUBMIT_NAME.setString(NativeConfig.LAYER_BASE, trainerName)
++        }
++        IntSetting.MAIN_XD_SUBMIT_MODEL.setInt(NativeConfig.LAYER_BASE, modelId)
++        BooleanSetting.MAIN_XD_SUBMIT_USE_SAVE.setBoolean(NativeConfig.LAYER_BASE, useMySave)
++        NativeConfig.save(NativeConfig.LAYER_BASE)
++    }
++
++    /** Base64 -> Showdown text; "" on a corrupt stored value (prefill is best-effort). */
++    private fun decodeStoredTeamText(b64: String): String =
++        try {
++            String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8)
++        } catch (e: IllegalArgumentException) {
++            ""
++        }
++
+     fun sendMessage(message: String) {
+         val trimmedMessage = message.trim()
+         if (trimmedMessage.isEmpty()) {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index e086046..54a207e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -50,6 +50,11 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+         // travels with the team submission, so no extra session state exists.
+         val modelOptions = BattleStyleBridge.modelTable()
+ 
++        // Last-submitted Submit Team sheet state (config-backed), so the sheet
++        // opens pre-filled instead of empty. Read once: while this activity
++        // lives, the sheet's own drafts already hold anything newer.
++        val submitPrefill = viewModel.submitPrefill()
++
+         setContent {
+             DolphinTheme {
+                 NetplayScreen(
+@@ -60,7 +65,11 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     messages = viewModel.messages.collectAsState().value,
+                     onSendMessage = viewModel::sendMessage,
+                     onSubmitTeam = viewModel::submitTeam,
+-                    defaultTrainerName = viewModel.defaultTrainerName,
++                    onSubmitSaveBundle = viewModel::submitSaveBundle,
++                    initialTeamText = submitPrefill.teamText,
++                    initialTrainerName = submitPrefill.trainerName,
++                    initialModelId = submitPrefill.modelId,
++                    initialUseMySave = submitPrefill.useMySave,
+                     modelOptions = modelOptions,
+                     game = viewModel.game.collectAsState().value,
+                     onStartGame = viewModel::startGame,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 1aa44b6..6fe26b1 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -149,30 +149,63 @@ fun NetplayScreen(
+     gameDigestProgress: GameDigestProgress?,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+     onSubmitTeam: (String, String, Int) -> Unit,
+-    defaultTrainerName: String,
++    onSubmitSaveBundle: (Int) -> Unit,
++    initialTeamText: String,
++    initialTrainerName: String,
++    initialModelId: Int,
++    initialUseMySave: Boolean,
+     modelOptions: List<BattleStyleBridge.StyleOption>,
+ ) {
+     val scrollState = rememberScrollState()
+-    // XD Netplay: joiner's "Submit Team" paste sheet.
++    // XD Netplay: joiner's "Submit Team" sheet. Every field opens pre-filled
++    // with the last-submitted values (the initial* parameters, config-backed
++    // via NetplayViewModel.submitPrefill) and is stored back on a successful
++    // submit, so nothing has to be retyped next session.
+     var showSubmitTeam by rememberSaveable { mutableStateOf(false) }
+-    var teamDraft by rememberSaveable { mutableStateOf("") }
+-    // In-game name, pre-filled with the netplay nickname (already cut down to
+-    // what a Gen 3 save can hold) so the common case is zero typing.
+-    var nameDraft by rememberSaveable { mutableStateOf(defaultTrainerName) }
++    var teamDraft by rememberSaveable { mutableStateOf(initialTeamText) }
++    // In-game name: the stored one, else the netplay nickname (already cut
++    // down to what a Gen 3 save can hold) so the common case is zero typing.
++    var nameDraft by rememberSaveable { mutableStateOf(initialTrainerName) }
+     // Cosmetic trainer-model pick, travelling as a "Model:" header in the same
+     // TeamData payload as the team. 0 = "No preference": no header is sent and
+     // the host's Guest-model fallback dropdown decides.
+-    var modelDraft by rememberSaveable { mutableIntStateOf(0) }
++    var modelDraft by rememberSaveable { mutableIntStateOf(initialModelId) }
++    // "Use my save": submit the party straight from this player's own save as
++    // a bundle -- real mon bytes, real trainer identity -- instead of the
++    // Showdown paste. The name and team fields do not apply in that mode (the
++    // save's real trainer name always wins; see NetplaySession), so both grey
++    // out. The model pick stays meaningful either way.
++    var useMySave by rememberSaveable { mutableStateOf(initialUseMySave) }
+     if (showSubmitTeam) {
+         AlertDialog(
+             title = { Text("Submit Team") },
+             text = {
+-                Column {
++                Column(Modifier.verticalScroll(rememberScrollState())) {
+                     Text(
+                         "Paste a Showdown team export, or a pokepast.es link. " +
+                             "The host writes it into the save you'll play with."
+                     )
+                     Spacer(Modifier.height(12.dp))
++                    Row(verticalAlignment = Alignment.CenterVertically) {
++                        Column(Modifier.weight(1f)) {
++                            Text(stringResource(R.string.xd_submit_use_save))
++                            Text(
++                                stringResource(R.string.xd_submit_use_save_hint),
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant
++                            )
++                        }
++                        Switch(checked = useMySave, onCheckedChange = { useMySave = it })
++                    }
++                    if (useMySave) {
++                        Spacer(Modifier.height(4.dp))
++                        Text(
++                            stringResource(R.string.xd_submit_privacy_note),
++                            style = MaterialTheme.typography.bodySmall,
++                            color = MaterialTheme.colorScheme.onSurfaceVariant
++                        )
++                    }
++                    Spacer(Modifier.height(12.dp))
+                     OutlinedTextField(
+                         value = nameDraft,
+                         // Reject unencodable keystrokes as they are typed, and
+@@ -180,9 +213,20 @@ fun NetplayScreen(
+                         onValueChange = {
+                             nameDraft = Gen3Text.sanitize(it, EmeraldSave.TRAINER_NAME_LEN)
+                         },
++                        // A bundle always plays under the save's own trainer
++                        // name (renaming would split the trainer from the
++                        // mons' OT copies and make the party disobedient), so
++                        // the field greys out rather than promising a rename
++                        // that cannot happen.
++                        enabled = !useMySave,
+                         singleLine = true,
+                         label = { Text("In-game name (max 7)") },
+-                        supportingText = { Text("Shown to your opponent in the battle.") },
++                        supportingText = {
++                            Text(
++                                if (useMySave) stringResource(R.string.xd_submit_name_ignored)
++                                else "Shown to your opponent in the battle."
++                            )
++                        },
+                         modifier = Modifier.fillMaxWidth()
+                     )
+                     Spacer(Modifier.height(12.dp))
+@@ -199,6 +243,8 @@ fun NetplayScreen(
+                     OutlinedTextField(
+                         value = teamDraft,
+                         onValueChange = { teamDraft = it },
++                        // Not part of a bundle submission; the draft is kept.
++                        enabled = !useMySave,
+                         modifier = Modifier.fillMaxWidth().height(220.dp)
+                     )
+                 }
+@@ -206,10 +252,14 @@ fun NetplayScreen(
+             confirmButton = {
+                 TextButton(
+                     onClick = {
+-                        onSubmitTeam(teamDraft.trim(), nameDraft.trim(), modelDraft)
++                        if (useMySave) {
++                            onSubmitSaveBundle(modelDraft)
++                        } else {
++                            onSubmitTeam(teamDraft.trim(), nameDraft.trim(), modelDraft)
++                        }
+                         showSubmitTeam = false
+                     },
+-                    enabled = teamDraft.isNotBlank()
++                    enabled = useMySave || teamDraft.isNotBlank()
+                 ) {
+                     Text("Send")
+                 }
+@@ -1498,7 +1548,11 @@ private fun PreviewNetplayScreen() {
+             JoinInfoType.LOCAL to JoinAddress.Loaded("192.168.1.5:2626"),
+         ),
+         onSubmitTeam = { _, _, _ -> },
+-        defaultTrainerName = "PLAYER",
++        onSubmitSaveBundle = {},
++        initialTeamText = "",
++        initialTrainerName = "PLAYER",
++        initialModelId = 0,
++        initialUseMySave = false,
+         modelOptions = emptyList(),
+ //        saveTransferProgress = SaveTransferProgress(
+ //            title = "Title",
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index 0637866..4235494 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -995,6 +995,18 @@ enum class BooleanSetting(
+         Settings.SECTION_INI_NETPLAY,
+         "AutoBuffer",
+         true
++    ),
++
++    /**
++     * Guest Submit Team sheet persistence: whether "Use my save" (submit the
++     * party from the player's own save as a bundle, instead of a Showdown
++     * paste) was chosen last time. Same key as the C++ MAIN_XD_SUBMIT_USE_SAVE.
++     */
++    MAIN_XD_SUBMIT_USE_SAVE(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "SubmitUseSave",
++        false
+     );
+ 
+     override val isOverridden: Boolean
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+index 31bf573..afd714d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+@@ -188,6 +188,15 @@ enum class IntSetting(
+         Settings.SECTION_INI_NETPLAY,
+         "BufferSize",
+         5
++    ),
++
++    // Guest Submit Team sheet persistence: last cosmetic trainer-model pick
++    // (0 = no preference). Same key as the C++ MAIN_XD_SUBMIT_MODEL.
++    MAIN_XD_SUBMIT_MODEL(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "SubmitModel",
++        0
+     );
+ 
+     override val isOverridden: Boolean
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+index 3ffce5c..e8c43cf 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/StringSetting.kt
+@@ -96,6 +96,25 @@ enum class StringSetting(
+         "ImportedSave3",
+         ""
+     ),
++
++    // Guest Submit Team sheet persistence: last-submitted Showdown text and
++    // in-game trainer name, so a joiner does not retype them every session.
++    // Same keys as the C++ MAIN_XD_SUBMIT_TEAM_B64/_NAME (MainSettings.h has
++    // the full story). The team text is stored BASE64-encoded because a
++    // Showdown export is multi-line and Dolphin's INI config layer is
++    // line-based -- NetplayViewModel does the encode/decode.
++    MAIN_XD_SUBMIT_TEAM_B64(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "SubmitTeamB64",
++        ""
++    ),
++    MAIN_XD_SUBMIT_NAME(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "SubmitName",
++        ""
++    ),
+     MAIN_TRIFORCE_IP_REDIRECTIONS(
+         Settings.FILE_DOLPHIN,
+         Settings.SECTION_INI_CORE,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 36c324d..c90e909 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1128,6 +1128,14 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_style_submit_model_label">Trainer model</string>
+     <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
+ 
++    <!-- XD Netplay: joiner's Submit Team sheet, "Use my save" (party-bundle)
++         mode. Refusal messages (FireRed/LeafGreen save, empty party, ...) come
++         from the shared core and are not duplicated here. -->
++    <string name="xd_submit_use_save">Use my save</string>
++    <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID.</string>
++    <string name="xd_submit_privacy_note">Sending your save\'s party reveals its details — nicknames, OT, IDs — to the host\'s machine. (They battle you and see the party anyway.)</string>
++    <string name="xd_submit_name_ignored">Your save\'s real trainer name is used instead.</string>
++
+     <!-- XD Netplay launcher: per-GBA-port save import (Save Files card).
+          User-visible wording mirrors the desktop launcher's Save Files box
+          (DolphinQt XDLauncherDialog) verbatim; refusal/success messages come
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index 4750b93..ec174c9 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -187,8 +187,16 @@ std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
+   XDNetplay::BattleCustomizer::SetGuestModel(submission.model);
+   XDNetplay::BattleCustomizer::RegenerateFromConfig(nullptr);
+ 
++  // A payload is EITHER a party bundle (the guest's own save's team and
++  // trainer identity, validated strictly before anything is written) OR
++  // Showdown text; the Name header is ignored for bundles -- the bundle's
++  // real trainer name wins (TeamInjector.h).
+   std::string status;
+-  if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
++  const bool applied =
++      submission.save_bundle ?
++          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status) :
++          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status);
++  if (!applied)
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+ }
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index f81392d..057f0fd 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "Common/CommonTypes.h"
+ #include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
+ #include "Common/TraversalClient.h"
+ #include "Core/Boot/Boot.h"
+ #include "Core/Config/MainSettings.h"
+@@ -18,8 +19,13 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/NetPlayCommon.h"
+ #include "Core/NetPlayServer.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBACore.h"
++#endif
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/Gen3Save.h"
++#include "UICommon/XDNetplay/PartyBundle.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ 
+ #include "jni/AndroidCommon/AndroidCommon.h"
+@@ -44,6 +50,25 @@ static NetPlay::NetPlayServer* GetServerPointer(JNIEnv* env, jobject obj)
+       env->GetLongField(obj, IDCache::GetNetPlayServerPointer()));
+ }
+ 
++// The save file this player's OWN GBA slot (port 2, device 1) will play with:
++// the same ROM resolution as SaveImport/TeamInjector (this socket's ROM,
++// falling back to the other socket's -- a launcher-made setup points both at
++// one dump), then the same GetSavePath netplay's SyncSaveData reads. Empty
++// when the setup is not complete enough to have one.
++static std::string OwnGbaSavePath()
++{
++#ifdef HAS_LIBMGBA
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[1]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[2]);
++  if (rom.empty() || !File::Exists(rom))
++    return {};
++  return HW::GBA::Core::GetSavePath(rom, 1);
++#else
++  return {};
++#endif
++}
++
+ extern "C" {
+ 
+ JNIEXPORT void JNICALL
+@@ -78,6 +103,51 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(
+   }
+ }
+ 
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitSaveBundle(
++    JNIEnv* env, jobject obj, jint jmodel)
++{
++  // XD Netplay "Use my save": submit the party FROM THIS PLAYER'S OWN SAVE --
++  // real mon bytes, real trainer identity -- instead of a Showdown paste.
++  // Reads the local port-2 save (their imported or team-editor slot), extracts
++  // the fixed-size party bundle (UICommon/XDNetplay/PartyBundle.h documents
++  // the layout and why the trainer identity must travel with the party), and
++  // sends it as a "SaveBundle:" TeamData payload. No Name header is ever sent
++  // for a bundle -- the save's real trainer name wins (renaming would split
++  // the trainer from the mons' OT copies and make the party disobedient) --
++  // but the cosmetic model pick stays meaningful and rides exactly as for a
++  // Showdown submission (<= 0 means "no preference"). The host validates the
++  // bundle strictly before writing anything.
++  //
++  // Returns "" on success or a user-displayable reason on failure (the Kotlin
++  // side shows it as a local chat line; nothing was sent in that case).
++  auto* client = GetClientPointer(env, obj);
++  if (!client)
++    return ToJString(env, "not connected to a room");
++
++  const std::string save_path = OwnGbaSavePath();
++  if (save_path.empty())
++    return ToJString(env, "no GBA ROM is configured, so there is no save to read");
++  if (!File::Exists(save_path))
++  {
++    return ToJString(env,
++                     "your GBA slot has no save yet -- open the Team Editor or import a save first");
++  }
++
++  std::string error;
++  const auto save = XDNetplay::LoadSaveFile(save_path, &error);
++  if (!save)
++    return ToJString(env, error);
++
++  const auto bundle = XDNetplay::PartyBundle::Extract(*save, &error);
++  if (!bundle)
++    return ToJString(env, error);
++
++  client->SendTeamSubmission(XDNetplay::BuildBundleSubmissionPayload(
++      *bundle, jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt));
++  return ToJString(env, "");
++}
++
+ JNIEXPORT void JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSetHostInputAuthority(
+     JNIEnv* env, jobject obj, jboolean enable)
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 752aafa..914484f 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -429,6 +429,10 @@ const Info<int> MAIN_XD_STYLE_MUSIC{{System::Main, "XDNetplay", "StyleMusic"}, 0
+ const Info<int> MAIN_XD_STYLE_VENUE{{System::Main, "XDNetplay", "StyleVenue"}, 0};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_2{{System::Main, "XDNetplay", "ImportedSave2"}, ""};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_3{{System::Main, "XDNetplay", "ImportedSave3"}, ""};
++const Info<std::string> MAIN_XD_SUBMIT_TEAM_B64{{System::Main, "XDNetplay", "SubmitTeamB64"}, ""};
++const Info<std::string> MAIN_XD_SUBMIT_NAME{{System::Main, "XDNetplay", "SubmitName"}, ""};
++const Info<int> MAIN_XD_SUBMIT_MODEL{{System::Main, "XDNetplay", "SubmitModel"}, 0};
++const Info<bool> MAIN_XD_SUBMIT_USE_SAVE{{System::Main, "XDNetplay", "SubmitUseSave"}, false};
+ 
+ // Main.Network
+ 
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index e565a73..454a5b5 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -254,6 +254,23 @@ extern const Info<int> MAIN_XD_STYLE_VENUE;
+ extern const Info<std::string> MAIN_XD_IMPORTED_SAVE_2;  // GBA port 2 (device 1)
+ extern const Info<std::string> MAIN_XD_IMPORTED_SAVE_3;  // GBA port 3 (device 2)
+ 
++// Guest Submit Team dialog persistence, so a joiner does not retype the team,
++// name and model every session: prefilled into the dialog on open, stored on
++// each successful submit, on both platforms (Android reads the same keys
++// through NativeConfig). The team text is stored as BASE64 of the UTF-8
++// Showdown export (XDNetplay::PartyBundle::Base64Encode/Decode) because the
++// export is multi-line and Dolphin's INI config layer is line-based -- a raw
++// newline in a value would corrupt the file. The other three are plain
++// values. USE_SAVE remembers whether "Use my save" (submit the party from the
++// player's own save as a bundle) was chosen last time; the name field is
++// ignored for bundle submissions (the save's real trainer name wins), and the
++// UI is expected to reflect that. The host-side Battle Style selections
++// persist separately via MAIN_XD_STYLE_* above.
++extern const Info<std::string> MAIN_XD_SUBMIT_TEAM_B64;
++extern const Info<std::string> MAIN_XD_SUBMIT_NAME;
++extern const Info<int> MAIN_XD_SUBMIT_MODEL;  // 0 = no preference
++extern const Info<bool> MAIN_XD_SUBMIT_USE_SAVE;
++
+ // Main.Network
+ 
+ extern const Info<bool> MAIN_NETWORK_SSL_DUMP_READ;
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 507b655..bc8d933 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -602,6 +602,7 @@
+     <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Text.h" />
+     <ClInclude Include="UICommon\XDNetplay\MonFactory.h" />
++    <ClInclude Include="UICommon\XDNetplay\PartyBundle.h" />
+     <ClInclude Include="UICommon\XDNetplay\SaveImport.h" />
+     <ClInclude Include="UICommon\XDNetplay\ShowdownParser.h" />
+     <ClInclude Include="UICommon\XDNetplay\TeamInjector.h" />
+@@ -1316,6 +1317,7 @@
+     <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Text.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\MonFactory.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\PartyBundle.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\SaveImport.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\ShowdownParser.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\TeamInjector.cpp" />
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 0727db4..6fb1790 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -41,12 +41,14 @@
+ #endif
+ 
+ #include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/TraversalClient.h"
+ #include "Core/NetPlayCommon.h"
+ 
+ #include "Core/Boot/Boot.h"
+ #include "Core/Config/GraphicsSettings.h"
++#include "Core/Config/MainSettings.h"
+ #include "Core/Config/NetplaySettings.h"
+ #include "Core/ConfigManager.h"
+ #include "Core/Core.h"
+@@ -75,6 +77,7 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
++#include "UICommon/XDNetplay/PartyBundle.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/UICommon.h"
+ 
+@@ -891,8 +894,16 @@ std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std
+   XDNetplay::BattleCustomizer::SetGuestModel(submission.model);
+   XDNetplay::BattleCustomizer::RegenerateFromConfig(nullptr);
+ 
++  // A payload is EITHER a party bundle (the guest's own save's team and
++  // trainer identity, validated strictly before anything is written) OR
++  // Showdown text; the Name header is ignored for bundles -- the bundle's
++  // real trainer name wins (TeamInjector.h).
+   std::string status;
+-  if (!XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status))
++  const bool applied =
++      submission.save_bundle ?
++          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status) :
++          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status);
++  if (!applied)
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+ }
+@@ -970,6 +981,30 @@ void NetPlayDialog::OnSubmitTeam()
+   model_layout->addWidget(model_combo, 1);
+   dialog_layout->addLayout(model_layout);
+ 
++  // "Use my save": submit the party from the player's OWN local save (the
++  // port-2 slot the Team Editor's "Host" role edits -- their slot regardless
++  // of which side of a room they join) instead of a Showdown paste. Community
++  // design by Akiak, adapted. The real mon bytes travel as-is and the save's
++  // trainer identity travels with them; that identity match is what keeps the
++  // party obedient (see PartyBundle.h), so the in-game name field above is
++  // IGNORED in this mode and greyed out below to say so. The model pick stays
++  // meaningful either way: it rides the payload as its own header.
++  auto* use_save_check =
++      new QCheckBox(tr("Use my save (send the party from my own save file)"), &dialog);
++  dialog_layout->addWidget(use_save_check);
++
++  // Shown only while the box is ticked. The host sees the party's details by
++  // battling anyway, but sending a save-extracted bundle makes the disclosure
++  // explicit, so the dialog says it out loud before anything is sent.
++  auto* privacy_note = new QLabel(
++      tr("Your save's party is sent exactly as it is, under the save's own trainer "
++         "name — the in-game name field above is ignored. Note: this reveals the "
++         "party's details (nicknames, OT, IDs) to the host's machine; your opponent "
++         "would also see that party by battling you."),
++      &dialog);
++  privacy_note->setWordWrap(true);
++  dialog_layout->addWidget(privacy_note);
++
+   auto* team_edit = new QPlainTextEdit(&dialog);
+   team_edit->setPlaceholderText(tr("Showdown export or pokepast.es link"));
+   dialog_layout->addWidget(team_edit, 1);
+@@ -981,12 +1016,60 @@ void NetPlayDialog::OnSubmitTeam()
+   connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+   dialog_layout->addWidget(buttons);
+ 
+-  dialog.resize(500, 440);
++  // Bundle mode repurposes the dialog: the save supplies both party and
++  // identity, so the paste box and the name field would be dead text. Grey
++  // them out rather than let the user type something that will not be sent.
++  const auto apply_bundle_mode = [name_edit, team_edit, privacy_note](bool bundle_mode) {
++    name_edit->setEnabled(!bundle_mode);
++    team_edit->setEnabled(!bundle_mode);
++    privacy_note->setVisible(bundle_mode);
++  };
++  connect(use_save_check, &QCheckBox::toggled, &dialog, apply_bundle_mode);
++
++  // Prefill every field from the previous successful submission (stored on
++  // send, below) so a returning player clicks Send instead of retyping. The
++  // team text is stored base64-encoded -- Dolphin's INI config layer is
++  // line-based and a Showdown export is multi-line -- and the strict decoder
++  // rejects the never-stored "" cleanly, leaving the box empty. A stored name
++  // is re-sanitized on the way in, preserving this dialog's invariant that
++  // the field shows exactly what the opponent will see; when nothing is
++  // stored the netplay-nickname default seeded above stays. A stored model id
++  // the table no longer carries falls back to "No preference", the same idiom
++  // as the launcher's Battle Style combos.
++  if (const auto stored_team = XDNetplay::PartyBundle::Base64Decode(
++          Config::Get(Config::MAIN_XD_SUBMIT_TEAM_B64)))
++  {
++    team_edit->setPlainText(QString::fromUtf8(
++        reinterpret_cast<const char*>(stored_team->data()), static_cast<int>(stored_team->size())));
++  }
++  const std::string stored_name = Config::Get(Config::MAIN_XD_SUBMIT_NAME);
++  if (!stored_name.empty())
++  {
++    name_edit->setText(
++        QString::fromStdString(XDNetplay::EmeraldSave::SanitizeTrainerName(stored_name)));
++  }
++  const int stored_model_index = model_combo->findData(Config::Get(Config::MAIN_XD_SUBMIT_MODEL));
++  model_combo->setCurrentIndex(stored_model_index >= 0 ? stored_model_index : 0);
++  use_save_check->setChecked(Config::Get(Config::MAIN_XD_SUBMIT_USE_SAVE));
++#ifndef HAS_LIBMGBA
++  // Extracting a bundle means reading the local GBA save, and everything that
++  // knows where that lives is compiled out with libmgba. Overrides the stored
++  // preference on purpose: a checked-but-unusable box could not be honored.
++  use_save_check->setChecked(false);
++  use_save_check->setEnabled(false);
++  use_save_check->setToolTip(tr("GBA support (libmgba) is not compiled into this build."));
++#endif
++  // setChecked only signals on a CHANGE, so a false-to-false prefill would
++  // leave the privacy note visible; normalize explicitly once.
++  apply_bundle_mode(use_save_check->isChecked());
++
++  dialog.resize(500, 470);
+   if (dialog.exec() != QDialog::Accepted)
+     return;
+ 
++  const bool use_save = use_save_check->isChecked();
+   const QString text = team_edit->toPlainText().trimmed();
+-  if (text.isEmpty())
++  if (text.isEmpty() && !use_save)
+     return;
+ 
+   // Sanitize again on the way out: the field is a QLineEdit, so the user can
+@@ -994,7 +1077,9 @@ void NetPlayDialog::OnSubmitTeam()
+   // result simply means "no rename" -- the host keeps its own save's name.
+   const std::string trainer_name = XDNetplay::EmeraldSave::SanitizeTrainerName(
+       name_edit->text().toStdString());
+-  if (trainer_name.empty() && !name_edit->text().trimmed().isEmpty())
++  // The warning is meaningless in bundle mode -- the field is ignored there
++  // (and was greyed out saying so), not "sent without".
++  if (!use_save && trainer_name.empty() && !name_edit->text().trimmed().isEmpty())
+   {
+     DisplayMessage(
+         tr("That in-game name has no Gen 3 equivalent — sending the team without it."), "");
+@@ -1009,6 +1094,71 @@ void NetPlayDialog::OnSubmitTeam()
+   const std::optional<int> model =
+       model_id > 0 ? std::optional<int>(model_id) : std::nullopt;
+ 
++  // Persist what was submitted so the next open prefills (read back above).
++  // Called only once a submission actually goes out -- an empty paste or a
++  // save that would not extract leaves the previous session's values alone.
++  // Everything is captured by value: the pokepaste path calls this after the
++  // dialog's locals would otherwise be gone. Same SetBaseOrCurrent + Save()
++  // idiom as the launcher's Battle Style keys.
++  const std::string team_text = text.toStdString();
++  const auto persist_submission = [team_text, trainer_name, model_id, use_save] {
++    Config::SetBaseOrCurrent(
++        Config::MAIN_XD_SUBMIT_TEAM_B64,
++        XDNetplay::PartyBundle::Base64Encode(std::vector<u8>(team_text.begin(), team_text.end())));
++    Config::SetBaseOrCurrent(Config::MAIN_XD_SUBMIT_NAME, trainer_name);
++    Config::SetBaseOrCurrent(Config::MAIN_XD_SUBMIT_MODEL, model_id);
++    Config::SetBaseOrCurrent(Config::MAIN_XD_SUBMIT_USE_SAVE, use_save);
++    Config::Save();
++  };
++
++  if (use_save)
++  {
++#ifdef HAS_LIBMGBA
++    // Read the same save the Team Editor's "Host — GBA port 2" role edits:
++    // the player's own local slot (imported or editor-built), resolved with
++    // the editor's exact ROM-then-fallback logic. No template fallback here,
++    // unlike the editor: a fresh template holds an empty party, and Extract
++    // would only refuse it with a less helpful message than ours.
++    std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[1]);
++    if (rom.empty() || !File::Exists(rom))
++      rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[2]);
++    if (rom.empty() || !File::Exists(rom))
++    {
++      DisplayMessage(tr("No Emerald ROM configured — run the launcher checklist first."), "");
++      return;
++    }
++    const std::string save_path = HW::GBA::Core::GetSavePath(rom, 1);
++    if (!File::Exists(save_path))
++    {
++      DisplayMessage(tr("No save to send — import one or build a team in the Team Editor first."),
++                     "");
++      return;
++    }
++    std::string error;
++    const std::optional<XDNetplay::EmeraldSave> save = XDNetplay::LoadSaveFile(save_path, &error);
++    if (!save)
++    {
++      DisplayMessage(tr("Could not open your save: %1").arg(QString::fromStdString(error)), "");
++      return;
++    }
++    // Extract refuses FRLG saves and empty parties itself, with reasons meant
++    // for exactly this status line.
++    const std::optional<std::vector<u8>> bundle = XDNetplay::PartyBundle::Extract(*save, &error);
++    if (!bundle)
++    {
++      DisplayMessage(tr("Could not use your save: %1").arg(QString::fromStdString(error)), "");
++      return;
++    }
++    // No Name header rides with a bundle -- the save's own identity wins
++    // (BuildBundleSubmissionPayload never emits one). Model still does.
++    Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
++        XDNetplay::BuildBundleSubmissionPayload(*bundle, model));
++    persist_submission();
++    DisplayMessage(tr("Your save's team was sent to the host."), "");
++#endif
++    return;
++  }
++
+   const QRegularExpression pokepaste_re(
+       QStringLiteral("^https?://pokepast\\.es/[A-Za-z0-9]+"));
+   const QRegularExpressionMatch match = pokepaste_re.match(text);
+@@ -1016,12 +1166,18 @@ void NetPlayDialog::OnSubmitTeam()
+   {
+     Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
+         XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name, model));
++    persist_submission();
+     DisplayMessage(tr("Team sent to the host."), "");
+     return;
+   }
+ 
+   const std::string url = match.captured(0).toStdString() + "/raw";
+   DisplayMessage(tr("Fetching %1…").arg(match.captured(0)), "");
++  // The fetch is asynchronous and the submission is committed from the user's
++  // point of view, so persist NOW rather than in the deferred lambda: if a
++  // flaky network fails the fetch, the link prefilling on the next open is
++  // exactly what the retry wants.
++  persist_submission();
+   QPointer<NetPlayDialog> self(this);
+   std::thread([self, url, trainer_name, model] {
+     Common::HttpRequest request;
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index 5e6e551..6eed380 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -31,6 +31,8 @@ add_library(uicommon
+   XDNetplay/Gen3Text.h
+   XDNetplay/MonFactory.cpp
+   XDNetplay/MonFactory.h
++  XDNetplay/PartyBundle.cpp
++  XDNetplay/PartyBundle.h
+   XDNetplay/SaveImport.cpp
+   XDNetplay/SaveImport.h
+   XDNetplay/ShowdownParser.cpp
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 07a76e0..d552e54 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -301,13 +301,20 @@ constexpr StyleOption MUSICS[] = {
+     {1450, "Event Theme 1450", Tier::Experimental},
+     {1469, "Event Theme 1469", Tier::Experimental},
+     {1470, "Event Theme 1470", Tier::Experimental},
+-    // The low-id block (unused/leftover streams).
++    // The low-id block (unused/leftover LOOPING STREAMS -- ids 1-6 are all
++    // classified as streams in the original archive research, re-checked
++    // 2026-08). Id 7 ("Shadow Event") is deliberately ABSENT: the research
++    // classified it as a sequenced-archive CONTAINER, the excluded class
++    // (sequenced/ME/jingle data, not a looping stream), and it slipped into
++    // this tier anyway; a field report confirmed picking it plays no music at
++    // all. Excluded by omission, exactly like the jingles. The re-check found
++    // no other excluded-class entries in the experimental tier: everything
++    // above is a looping stm_* / ev_* stream per the same classification.
+     {1, "Snowfreak (unused)", Tier::Experimental},
+     {2, "Shinpi (unused)", Tier::Experimental},
+     {3, "Tretre (unused)", Tier::Experimental},
+     {5, "Latin (unused)", Tier::Experimental},
+     {6, "Keio Azuchi (unused)", Tier::Experimental},
+-    {7, "Shadow Event (unused)", Tier::Experimental},
+ };
+ 
+ // Battle locations (battlefield-table indices). tested-safe = the retail VS
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+index 984e509..b93dd29 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.cpp
+@@ -310,6 +310,19 @@ std::string EmeraldSave::SanitizeTrainerName(const std::string& name)
+   return trimmed.substr(lead);
+ }
+ 
++void EmeraldSave::SetTrainerIdentityRaw(const std::array<u8, TRAINER_NAME_FIELD_SIZE>& name_raw,
++                                        u8 gender, u32 trainer_id)
++{
++  const size_t base = m_section_offsets[0];
++  std::memcpy(m_raw.data() + base + TRAINER_NAME_OFFSET, name_raw.data(), name_raw.size());
++  // Byte 7 is the field's hard terminator; the games keep it 0xFF even for a
++  // full-length name (same rule SetTrainerName enforces).
++  m_raw[base + TRAINER_NAME_OFFSET + TRAINER_NAME_LEN] = Gen3Text::TERMINATOR;
++  WriteU8(m_raw.data(), base + TRAINER_GENDER_OFFSET, gender);
++  WriteU32(m_raw.data(), base + TRAINER_ID_OFFSET, trainer_id);
++  UpdateSectionChecksum(0);
++}
++
+ u32 EmeraldSave::GetTrainerId() const
+ {
+   return ReadU32(m_raw.data(), m_section_offsets[0] + TRAINER_ID_OFFSET);
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Save.h b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+index c3ad613..d3502ca 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Save.h
++++ b/Source/Core/UICommon/XDNetplay/Gen3Save.h
+@@ -146,6 +146,16 @@ public:
+   // "reject the request".
+   static std::string SanitizeTrainerName(const std::string& name);
+ 
++  // Overwrite the whole trainer identity -- name (RAW Gen 3 bytes), gender and
++  // TID+SID -- in one call and fix section 0's checksum. For the party-bundle
++  // path (PartyBundle.h), where the name must land byte-identical to the OT
++  // name copies inside the mons that rode along with it: a UTF-8 round trip
++  // through SetTrainerName could alter bytes ('?' fallbacks) and turn the
++  // whole party into disobedient outsiders. The terminator byte at
++  // name_raw[7] is forced to 0xFF regardless of input, matching the games.
++  void SetTrainerIdentityRaw(const std::array<u8, TRAINER_NAME_FIELD_SIZE>& name_raw, u8 gender,
++                             u32 trainer_id);
++
+   // Raw u32: low u16 = public (visible) trainer ID, high u16 = secret ID.
+   u32 GetTrainerId() const;
+   u32 GetTrainerPublicId() const { return GetTrainerId() & 0xFFFF; }
+diff --git a/Source/Core/UICommon/XDNetplay/PartyBundle.cpp b/Source/Core/UICommon/XDNetplay/PartyBundle.cpp
+new file mode 100644
+index 0000000..6b843e3
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/PartyBundle.cpp
+@@ -0,0 +1,327 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/PartyBundle.h"
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <utility>
++
++#include "UICommon/XDNetplay/Gen3Text.h"
++
++namespace XDNetplay::PartyBundle
++{
++using namespace Gen3Bytes;
++
++namespace
++{
++constexpr char BASE64_ALPHABET[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
++
++// 0..63 for alphabet bytes, -1 otherwise ('=' is handled by the caller).
++int Base64Value(char c)
++{
++  if (c >= 'A' && c <= 'Z')
++    return c - 'A';
++  if (c >= 'a' && c <= 'z')
++    return c - 'a' + 26;
++  if (c >= '0' && c <= '9')
++    return c - '0' + 52;
++  if (c == '+')
++    return 62;
++  if (c == '/')
++    return 63;
++  return -1;
++}
++
++// Copy the 8-byte raw trainer-name field with its padding normalized: the
++// terminator byte at [7] is forced (the games always keep it 0xFF, even for a
++// full-length name) and everything past the FIRST terminator becomes 0xFF too,
++// so stray bytes beyond the visible name can never ride a bundle onto another
++// machine. The visible bytes themselves are preserved verbatim -- they must
++// stay byte-identical to the OT-name copies inside the mons, or the game would
++// treat the whole party as traded outsiders (see the header).
++std::array<u8, EmeraldSave::TRAINER_NAME_FIELD_SIZE> NormalizeNameField(const u8* raw)
++{
++  std::array<u8, EmeraldSave::TRAINER_NAME_FIELD_SIZE> name{};
++  bool terminated = false;
++  for (size_t i = 0; i < EmeraldSave::TRAINER_NAME_LEN; i++)
++  {
++    terminated |= raw[i] == Gen3Text::TERMINATOR;
++    name[i] = terminated ? Gen3Text::TERMINATOR : raw[i];
++  }
++  name[EmeraldSave::TRAINER_NAME_LEN] = Gen3Text::TERMINATOR;
++  return name;
++}
++}  // namespace
++
++std::optional<std::vector<u8>> Extract(const EmeraldSave& save, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  // Emerald and Ruby/Sapphire share every offset this reads (section-0 trainer
++  // block and section-1 party area, verified); FireRed/LeafGreen does not --
++  // its party lives elsewhere in section 1, and because the section checksum
++  // lengths coincide, Emerald-offset reads from an FRLG save return plausible
++  // garbage instead of failing. Refuse loudly, same reasoning as the host-side
++  // FRLG refusal in TeamInjector.
++  if (EmeraldSave::DetectGame(save) == Gen3Game::FireRedLeafGreen)
++  {
++    return fail("this is a FireRed/LeafGreen save, which stores its party at different offsets -- "
++                "only Emerald and Ruby/Sapphire saves can be submitted directly");
++  }
++
++  // ReadParty already reads the newest valid slot (EmeraldSave::Create picked
++  // the active block) and verifies each non-empty slot's substructure
++  // checksum -- the same reader every other consumer of party data uses.
++  std::string party_error;
++  const auto party = save.ReadParty(&party_error);
++  if (!party)
++    return fail("party unreadable (" + party_error + ")");
++  if (party->empty())
++    return fail("the save's party is empty -- catch at least one Pokemon first");
++
++  const std::vector<u8> section0 = save.SectionBytes(0);
++  const auto name =
++      NormalizeNameField(section0.data() + EmeraldSave::TRAINER_NAME_OFFSET);
++  if (Gen3Text::Decode(name.data(), EmeraldSave::TRAINER_NAME_LEN).empty())
++    return fail("the save's trainer name is empty");
++
++  const u32 gender = save.GetTrainerGender();
++  if (gender > 1)
++    return fail("the save's trainer gender byte is corrupt");
++
++  std::vector<u8> bundle(BUNDLE_SIZE, 0);
++  WriteU32(bundle.data(), COUNT_OFFSET, static_cast<u32>(party->size()));
++  for (size_t i = 0; i < party->size(); i++)
++  {
++    // Encode() round-trips FromBytes() byte-identically, so the wire carries
++    // the mon's REAL bytes -- IVs, ribbons, origin data and all -- not a
++    // rebuilt approximation. Slots past the count stay all-zero.
++    const std::array<u8, Gen3Mon::SIZE> mon = (*party)[i].Encode();
++    std::memcpy(bundle.data() + PARTY_OFFSET + i * Gen3Mon::SIZE, mon.data(), mon.size());
++  }
++  std::memcpy(bundle.data() + NAME_OFFSET, name.data(), name.size());
++  WriteU8(bundle.data(), GENDER_OFFSET, gender);
++  WriteU32(bundle.data(), TRAINER_ID_OFFSET, save.GetTrainerId());
++  return bundle;
++}
++
++std::optional<Decoded> Validate(const std::vector<u8>& bundle, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  // Length EXACT: the bundle is a fixed shape, and both ends of a session run
++  // the same build (netplay refuses mismatched versions), so any other size is
++  // a malformed or hand-crafted payload, never a compatibility case.
++  if (bundle.size() != BUNDLE_SIZE)
++  {
++    return fail("wrong size: expected " + std::to_string(BUNDLE_SIZE) + " bytes, got " +
++                std::to_string(bundle.size()));
++  }
++
++  const u32 count = ReadU32(bundle.data(), COUNT_OFFSET);
++  if (count < 1 || count > MON_SLOTS)
++    return fail("party count " + std::to_string(count) + " is outside 1..6");
++
++  Decoded out;
++  for (size_t i = 0; i < MON_SLOTS; i++)
++  {
++    const u8* slot = bundle.data() + PARTY_OFFSET + i * Gen3Mon::SIZE;
++    if (i < count)
++    {
++      // The existing mon reader does the heavy lifting: substructure
++      // decryption and checksum verification. An all-zero slot decodes
++      // "successfully" as empty (FromBytes only checksums non-empty slots),
++      // so emptiness is rejected explicitly -- a counted slot must hold a
++      // real Pokemon.
++      std::string mon_error;
++      auto mon = Gen3Mon::FromBytes(slot, &mon_error);
++      if (!mon)
++        return fail("party slot " + std::to_string(i + 1) + " invalid (" + mon_error + ")");
++      if (mon->IsEmpty())
++        return fail("party slot " + std::to_string(i + 1) + " is empty but counted");
++      out.mons.push_back(std::move(*mon));
++    }
++    else
++    {
++      // Slots past the count must be ALL zero -- extraction writes them that
++      // way, so any other content is smuggled data.
++      const bool all_zero =
++          std::all_of(slot, slot + Gen3Mon::SIZE, [](u8 b) { return b == 0; });
++      if (!all_zero)
++        return fail("party slot " + std::to_string(i + 1) + " has data beyond the party count");
++    }
++  }
++
++  const u8* name_raw = bundle.data() + NAME_OFFSET;
++  // Extraction normalizes the field, so a legitimate bundle always passes:
++  // hard terminator at [7], only terminator padding after the visible name.
++  const auto normalized = NormalizeNameField(name_raw);
++  if (!std::equal(normalized.begin(), normalized.end(), name_raw))
++    return fail("trainer name field is not terminator-normalized");
++  out.name_raw = normalized;
++  out.trainer_name = Gen3Text::Decode(out.name_raw.data(), EmeraldSave::TRAINER_NAME_LEN);
++  if (out.trainer_name.empty())
++    return fail("trainer name is empty");
++
++  const u32 gender = ReadU8(bundle.data(), GENDER_OFFSET);
++  if (gender > 1)
++    return fail("trainer gender byte is out of range");
++  out.gender = static_cast<u8>(gender);
++  out.trainer_id = ReadU32(bundle.data(), TRAINER_ID_OFFSET);
++  return out;
++}
++
++std::optional<EmeraldSave> BuildSave(std::vector<u8> template_bytes,
++                                     const std::vector<u8>& bundle, std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  auto decoded = Validate(bundle, error);
++  if (!decoded)
++    return std::nullopt;
++
++  std::string parse_error;
++  auto save = EmeraldSave::Create(std::move(template_bytes), &parse_error);
++  if (!save)
++    return fail("bundled template unreadable (" + parse_error + ")");
++  // The disposable save is always built from the bundled EMERALD template;
++  // anything else here means the template file was tampered with or swapped.
++  if (EmeraldSave::DetectGame(*save) != Gen3Game::Emerald)
++    return fail("bundled template is not an Emerald save");
++
++  // Trainer identity goes in RAW: the name bytes must stay byte-identical to
++  // the OT-name copies inside the party mons (they came from the same save),
++  // and the save's TID must equal the mons' OT ID, or the game would rule the
++  // party traded outsiders. This is the whole reason bundles do NOT re-stamp
++  // OTs the way MonFactory does for Showdown teams -- with identity and party
++  // both copied from the guest's save, obedience is intrinsically correct.
++  save->SetTrainerIdentityRaw(decoded->name_raw, decoded->gender, decoded->trainer_id);
++
++  // The party bytes are the guest's own, already validated; WriteParty
++  // re-encodes them byte-identically, zeroes the unused slots and fixes
++  // section 1's checksum.
++  if (!save->WriteParty(decoded->mons))
++    return fail("party too large");  // unreachable: Validate capped it at 6
++
++  // Reconstruct BOTH rotating save slots: copy the edited active block over
++  // the inactive one, save index and all. Identical images mean whichever
++  // slot the game (or any tool) treats as newest holds the bundle's party and
++  // trainer, and the game's next in-game save rotates to the other slot with
++  // index+1 exactly as normal. Section checksums ride along with the copy, so
++  // the whole file verifies. Any bytes past the two blocks (emulator footer)
++  // are preserved untouched.
++  std::vector<u8> bytes = save->ToBytes();
++  const size_t active_off = static_cast<size_t>(save->GetActiveBlock()) * EmeraldSave::BLOCK_SIZE;
++  const size_t other_off = (save->GetActiveBlock() == 0 ? 1 : 0) * EmeraldSave::BLOCK_SIZE;
++  std::memcpy(bytes.data() + other_off, bytes.data() + active_off, EmeraldSave::BLOCK_SIZE);
++
++  auto rebuilt = EmeraldSave::Create(std::move(bytes), &parse_error);
++  if (!rebuilt)
++    return fail("rebuilt save does not re-parse (" + parse_error + ")");
++  return rebuilt;
++}
++
++std::string Base64Encode(const std::vector<u8>& data)
++{
++  std::string out;
++  out.reserve(((data.size() + 2) / 3) * 4);
++  size_t i = 0;
++  for (; i + 3 <= data.size(); i += 3)
++  {
++    const u32 n = (static_cast<u32>(data[i]) << 16) | (static_cast<u32>(data[i + 1]) << 8) |
++                  static_cast<u32>(data[i + 2]);
++    out.push_back(BASE64_ALPHABET[(n >> 18) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[(n >> 12) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[(n >> 6) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[n & 0x3F]);
++  }
++  const size_t rest = data.size() - i;
++  if (rest == 1)
++  {
++    const u32 n = static_cast<u32>(data[i]) << 16;
++    out.push_back(BASE64_ALPHABET[(n >> 18) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[(n >> 12) & 0x3F]);
++    out.push_back('=');
++    out.push_back('=');
++  }
++  else if (rest == 2)
++  {
++    const u32 n = (static_cast<u32>(data[i]) << 16) | (static_cast<u32>(data[i + 1]) << 8);
++    out.push_back(BASE64_ALPHABET[(n >> 18) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[(n >> 12) & 0x3F]);
++    out.push_back(BASE64_ALPHABET[(n >> 6) & 0x3F]);
++    out.push_back('=');
++  }
++  return out;
++}
++
++std::optional<std::vector<u8>> Base64Decode(std::string_view text)
++{
++  // Strict: a positive multiple of 4 characters, '=' only as the final one or
++  // two, everything else from the alphabet. No whitespace, no line wrapping --
++  // the encoder never emits any, and this only ever decodes our own format.
++  if (text.empty() || text.size() % 4 != 0)
++    return std::nullopt;
++
++  std::vector<u8> out;
++  out.reserve((text.size() / 4) * 3);
++  for (size_t i = 0; i < text.size(); i += 4)
++  {
++    u32 n = 0;
++    size_t chars = 0;
++    for (size_t j = 0; j < 4; j++)
++    {
++      const char c = text[i + j];
++      if (c == '=')
++      {
++        // Padding is only legal in the final quantum, in the last two spots,
++        // and never followed by a non-'=' character.
++        if (i + 4 != text.size() || j < 2 || (j == 2 && text[i + 3] != '='))
++          return std::nullopt;
++        break;
++      }
++      const int value = Base64Value(c);
++      if (value < 0)
++        return std::nullopt;
++      n = (n << 6) | static_cast<u32>(value);
++      chars++;
++    }
++    if (chars == 4)
++    {
++      out.push_back(static_cast<u8>((n >> 16) & 0xFF));
++      out.push_back(static_cast<u8>((n >> 8) & 0xFF));
++      out.push_back(static_cast<u8>(n & 0xFF));
++    }
++    else if (chars == 3)
++    {
++      n <<= 6;
++      out.push_back(static_cast<u8>((n >> 16) & 0xFF));
++      out.push_back(static_cast<u8>((n >> 8) & 0xFF));
++    }
++    else if (chars == 2)
++    {
++      n <<= 12;
++      out.push_back(static_cast<u8>((n >> 16) & 0xFF));
++    }
++    else
++    {
++      return std::nullopt;  // "====" or "x===": not a valid final quantum
++    }
++  }
++  return out;
++}
++}  // namespace XDNetplay::PartyBundle
+diff --git a/Source/Core/UICommon/XDNetplay/PartyBundle.h b/Source/Core/UICommon/XDNetplay/PartyBundle.h
+new file mode 100644
+index 0000000..75e4502
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/PartyBundle.h
+@@ -0,0 +1,99 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <optional>
++#include <string>
++#include <string_view>
++#include <vector>
++
++#include "Common/CommonTypes.h"
++
++#include "UICommon/XDNetplay/Gen3Mon.h"
++#include "UICommon/XDNetplay/Gen3Save.h"
++
++// Guest save submission via party bundle (community design by Akiak, adapted).
++//
++// A joiner can bring the team FROM THEIR OWN SAVE instead of a Showdown paste:
++// the guest extracts a small fixed-size "party bundle" from their local save,
++// ships it to the host inside the TeamData payload (as a "SaveBundle:" header,
++// see TeamInjector.h), and the host builds a DISPOSABLE save from the bundled
++// EMERALD-3 template with the bundle's party and trainer identity written in.
++//
++// Why identity travels with the party: every Gen 3 Pokemon carries its own OT
++// name/ID copy, and the game treats a mon as a traded outsider (disobedience
++// above the badge cap) whenever those differ from the save's trainer. Because
++// the bundle's trainer IS the save's trainer the mons came from, writing both
++// verbatim keeps OT and trainer byte-identical -- obedience is intrinsically
++// correct, and nothing here may ever re-stamp OTs the way MonFactory does for
++// Showdown-built teams.
++//
++// Bundle layout (fixed BUNDLE_SIZE bytes, all integers little-endian):
++//   +0                  u32  party count (1..6 on the wire; validated)
++//   +4                  600B six 100-byte party mon structures (Gen3Mon
++//                            layout, slots >= count all-zero)
++//   +604                8B   trainer name, raw Gen 3 bytes (7 usable + the
++//                            0xFF terminator byte the games always keep)
++//   +612                u8   trainer gender (0 male, 1 female)
++//   +613                u32  trainer ID (low u16 public, high u16 secret)
++//
++// The bundle carries no game-id ambiguity: extraction normalizes everything to
++// the Emerald-template layout. The GUEST's source save may be Emerald or
++// Ruby/Sapphire (identical section-1 party layout, verified); FireRed/
++// LeafGreen is refused at extraction for the same reason team submission
++// refuses FRLG hosts -- its party lives at different section offsets, so the
++// shared readers would hand back garbage that happens to checksum.
++namespace XDNetplay::PartyBundle
++{
++// -- layout ------------------------------------------------------------------
++constexpr size_t MON_SLOTS = EmeraldSave::PARTY_MAX;  // 6
++constexpr size_t COUNT_OFFSET = 0;
++constexpr size_t PARTY_OFFSET = 4;
++constexpr size_t NAME_OFFSET = PARTY_OFFSET + MON_SLOTS * Gen3Mon::SIZE;  // 604
++constexpr size_t GENDER_OFFSET = NAME_OFFSET + EmeraldSave::TRAINER_NAME_FIELD_SIZE;  // 612
++constexpr size_t TRAINER_ID_OFFSET = GENDER_OFFSET + 1;  // 613
++constexpr size_t BUNDLE_SIZE = TRAINER_ID_OFFSET + 4;    // 617
++
++// What strict validation learned about a byte-exact bundle. Every field has
++// been bounds- and checksum-checked; mons holds count fully decoded Pokemon.
++struct Decoded
++{
++  std::vector<Gen3Mon> mons;  // size == the wire party count, 1..6
++  std::array<u8, EmeraldSave::TRAINER_NAME_FIELD_SIZE> name_raw{};
++  std::string trainer_name;  // decoded for display/status lines
++  u8 gender = 0;
++  u32 trainer_id = 0;
++};
++
++// GUEST side: extract a bundle from the player's OWN save (their local slot,
++// imported or team-editor). Fails (with *error) on an FRLG save, an empty
++// party, a party slot that does not decode, or an unreadable trainer name.
++// The name field is normalized on the way out (terminator byte forced, bytes
++// past the first terminator padded to 0xFF) so a legitimate save always
++// produces a bundle the host-side validator accepts.
++std::optional<std::vector<u8>> Extract(const EmeraldSave& save, std::string* error = nullptr);
++
++// HOST side: strict validation of an untrusted remote bundle. Rejects any
++// deviation -- wrong length, party count outside 1..6, a counted slot that is
++// empty or fails Gen3Mon's substructure checksum, a supposedly-empty slot with
++// nonzero bytes, a malformed name field, an out-of-range gender. Returns the
++// decoded contents on success.
++std::optional<Decoded> Validate(const std::vector<u8>& bundle, std::string* error = nullptr);
++
++// HOST side: build the disposable guest save -- the bundled Emerald template
++// with the bundle's party AND trainer identity written into BOTH rotating save
++// slots (identical images, so whichever slot the game treats as newest holds
++// the guest's data) and every section checksum recalculated. Validates the
++// bundle itself; the caller only supplies the raw template file bytes.
++std::optional<EmeraldSave> BuildSave(std::vector<u8> template_bytes, const std::vector<u8>& bundle,
++                                     std::string* error = nullptr);
++
++// Standard base64 (RFC 4648, '+'/'/' alphabet, '=' padding), used to put the
++// binary bundle on the line-oriented TeamData payload and to store multi-line
++// dialog text in Dolphin's line-based config INI. Decode is strict: length a
++// positive multiple of 4, padding only at the end, any byte outside the
++// alphabet rejects the whole string (untrusted remote input never half-parses).
++std::string Base64Encode(const std::vector<u8>& data);
++std::optional<std::vector<u8>> Base64Decode(std::string_view text);
++}  // namespace XDNetplay::PartyBundle
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index 86664c9..637c536 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -36,6 +36,7 @@
+ #include "UICommon/XDNetplay/Gen3Mon.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/MonFactory.h"
++#include "UICommon/XDNetplay/PartyBundle.h"
+ #include "UICommon/XDNetplay/ShowdownParser.h"
+ 
+ namespace XDNetplay
+@@ -57,9 +58,13 @@ constexpr const char* TMP_SUFFIX = ".tmp";
+ // See TeamInjector.h for the payload grammar.
+ constexpr std::string_view NAME_HEADER_KEY = "Name";
+ constexpr std::string_view MODEL_HEADER_KEY = "Model";
+-// Headers are framing, not a payload channel: both value lines stay bounded.
++constexpr std::string_view SAVE_BUNDLE_HEADER_KEY = "SaveBundle";
++// Headers are framing, not a payload channel: every value line stays bounded.
+ constexpr size_t MAX_NAME_LINE = 64;
+ constexpr size_t MAX_MODEL_VALUE = 32;
++// base64 of the 617-byte bundle is 824 characters; anything past a round
++// 1024 is not a bundle this build could have produced.
++constexpr size_t MAX_BUNDLE_VALUE = 1024;
+ 
+ // A line containing only spaces/tabs/CR (or nothing) terminates the header
+ // block. Same blank test the original single-header grammar used.
+@@ -125,6 +130,15 @@ std::string SavePathForDevice(int device)
+ #endif
+ }
+ 
++// The bundled template save that seeds a socket with no save of its own and
++// re-seeds it after cleanup. EMERALD-2 is the player's side, EMERALD-3 the
++// guest slot.
++std::string GuestTemplatePath(int device)
++{
++  return File::GetSysDirectory() +
++         (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++}
++
+ // Zero a file's bytes before unlinking it, so an opponent's spread is not left
+ // sitting in freed disk blocks. Best effort: a failed scrub never stops the
+ // delete, and the return value reports only whether a file was there to remove.
+@@ -225,9 +239,7 @@ void PurgeNow(int device)
+       // left where they started instead of one step behind it.
+       if (ScrubAndDelete(save_path))
+       {
+-        const std::string template_path =
+-            File::GetSysDirectory() +
+-            (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++        const std::string template_path = GuestTemplatePath(device);
+         if (File::Exists(template_path) && File::CopyRegularFile(template_path, save_path))
+           notes.emplace_back("reset=template");
+         else
+@@ -290,6 +302,81 @@ bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
+   out->resize(file.GetSize());
+   return out->empty() || file.ReadBytes(out->data(), out->size());
+ }
++
++// ---------------------------------------------------------------------------
++// Injection lifecycle steps shared by BOTH TeamData payload forms (Showdown
++// text and party bundle). The stash/marker/cleanup flow is one lifecycle: a
++// bundle-built disposable save is just another injected guest team from its
++// point of view, so these run identically for both.
++// ---------------------------------------------------------------------------
++
++// The save path netplay will read for this socket -- the same ROM resolution
++// the team editors use (the socket's own ROM, falling back to the other
++// socket's; a launcher-made setup points both at one dump). Empty (with
++// *error) when no ROM is configured. GetSavePath is exactly what SyncSaveData
++// reads at start, so writing there is guaranteed to be the file the guest
++// receives.
++std::string ResolveGuestSavePath(int device, std::string* error)
++{
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++  {
++    if (error)
++      *error = "no Emerald ROM configured on the host";
++    return {};
++  }
++  return HW::GBA::Core::GetSavePath(rom, device);
++}
++
++// Self-heal: if a previous session was killed before its cleanup ran, the
++// save still holds THAT guest's party and .bak/.guestteam are still lying
++// around. Finish that cleanup now, before this injection stashes anything --
++// otherwise the stale party would be preserved as if it were the host's own.
++// Only safe with emulation fully down, which is the case at injection time:
++// the server refuses team submissions while a battle is running.
++void SelfHealStaleGuestState(const std::string& save_path, int device)
++{
++  if (File::Exists(save_path + GUEST_MARK_SUFFIX) &&
++      Core::IsUninitialized(Core::System::GetInstance()))
++  {
++    std::lock_guard lock(s_purge_mutex);
++    PurgeNow(device);
++  }
++}
++
++// Stash the host's own team once per session, so it can be put back when the
++// room closes. Only the FIRST injection stashes: a second submission must not
++// overwrite the stash with the first guest's team. A failed stash REFUSES the
++// injection (false, with *error): proceeding would leave the cleanup's
++// no-stash branch to scrub the host's save afterwards -- with a user-imported
++// save in the slot, that is real data on the line, not just a template
++// reseed.
++bool StashHostTeamOnce(const std::string& save_path, std::string* error)
++{
++  if (File::Exists(save_path) && !File::Exists(save_path + HOST_STASH_SUFFIX) &&
++      !File::CopyRegularFile(save_path, save_path + HOST_STASH_SUFFIX))
++  {
++    if (error)
++      *error = "could not back up the host's own team; submission not applied";
++    return false;
++  }
++  return true;
++}
++
++// From the moment an injection has been written, this save, its fresh .bak
++// (the pre-injection image) and any stray .tmp are opponent data. Mark them
++// so the end-of-session purge knows to take them, even if this process never
++// gets to run it.
++void WriteGuestMark(const std::string& save_path)
++{
++  if (File::Exists(save_path + GUEST_MARK_SUFFIX))
++    return;
++  File::IOFile mark(save_path + GUEST_MARK_SUFFIX, "wb");
++  if (mark)
++    mark.WriteString("A guest's team is in this socket's save. Removed when the room closes.\n");
++}
+ }  // namespace
+ #endif
+ 
+@@ -322,6 +409,20 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+   return headers + "\n" + showdown_text;
+ }
+ 
++std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle, std::optional<int> model)
++{
++  // A bundle payload is headers plus an EMPTY body: SaveBundle (base64 never
++  // contains a newline, so it cannot forge framing), the optional Model pick
++  // (same line the Showdown path emits), the terminating blank line. No Name
++  // header ever -- the bundle's own trainer identity is authoritative
++  // (TeamInjector.h).
++  std::string headers =
++      std::string(SAVE_BUNDLE_HEADER_KEY) + ": " + PartyBundle::Base64Encode(bundle) + "\n";
++  if (model && *model > 0)
++    headers += std::string(MODEL_HEADER_KEY) + ": " + std::to_string(*model) + "\n";
++  return headers + "\n";
++}
++
+ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+ {
+   TeamSubmission out;
+@@ -331,6 +432,7 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+ 
+   std::string name;
+   std::optional<int> model;
++  std::optional<std::vector<u8>> bundle;
+   bool any_header = false;
+   size_t pos = 0;
+   while (pos < payload.size())
+@@ -346,6 +448,7 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+         return out;  // a blank FIRST line is not a header block
+       out.trainer_name = std::move(name);  // trimmed/sanitized by the caller
+       out.model = model;
++      out.save_bundle = std::move(bundle);
+       out.showdown_text = payload.substr(eol + 1);
+       return out;
+     }
+@@ -360,6 +463,16 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+       name = std::string(value);
+     else if (key == MODEL_HEADER_KEY)
+       model = ParseModelValue(value);
++    else if (key == SAVE_BUNDLE_HEADER_KEY)
++    {
++      // Untrusted remote text: bounded, and it must base64-decode cleanly or
++      // save_bundle stays unset (the payload then reads as an empty team and
++      // is refused downstream). The decoded bytes are validated field-by-field
++      // by InjectGuestBundle, which is the only consumer.
++      const std::string_view b64 = StripWhitespace(value);
++      if (!b64.empty() && b64.size() <= MAX_BUNDLE_VALUE)
++        bundle = PartyBundle::Base64Decode(b64);
++    }
+ 
+     any_header = true;
+     pos = eol + 1;
+@@ -384,52 +497,21 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+   if (!data)
+     return fail(fmt::format("game data unavailable ({})", error));
+ 
+-  // Same ROM resolution the team editor uses: the socket's own ROM, falling
+-  // back to the other socket's (a launcher-made setup points both at one dump).
+-  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
+-  if (rom.empty() || !File::Exists(rom))
+-    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
+-  if (rom.empty() || !File::Exists(rom))
+-    return fail("no Emerald ROM configured on the host");
+-
+-  // GetSavePath is exactly what SyncSaveData reads at start, so writing here
+-  // is guaranteed to be the file the guest receives.
+-  const std::string save_path = HW::GBA::Core::GetSavePath(rom, device);
+-
+-  // Self-heal: if a previous session was killed before its cleanup ran, the
+-  // save still holds THAT guest's party and .bak/.guestteam are still lying
+-  // around. Finish that cleanup now, before this injection stashes anything --
+-  // otherwise the stale party would be preserved as if it were the host's own.
+-  // Only safe with emulation fully down, which is the case here: the server
+-  // refuses team submissions while a battle is running.
+-  if (File::Exists(save_path + GUEST_MARK_SUFFIX) &&
+-      Core::IsUninitialized(Core::System::GetInstance()))
+-  {
+-    std::lock_guard lock(s_purge_mutex);
+-    PurgeNow(device);
+-  }
++  const std::string save_path = ResolveGuestSavePath(device, &error);
++  if (save_path.empty())
++    return fail(std::move(error));
++
++  SelfHealStaleGuestState(save_path, device);
+ 
+   std::vector<u8> bytes;
+   if (!(File::Exists(save_path) && ReadFileBytes(save_path, &bytes)))
+   {
+-    const std::string template_path =
+-        File::GetSysDirectory() +
+-        (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
+-    if (!ReadFileBytes(template_path, &bytes))
++    if (!ReadFileBytes(GuestTemplatePath(device), &bytes))
+       return fail("host has no save for that socket and no bundled template");
+   }
+ 
+-  // Stash the host's own team once per session, so it can be put back when the
+-  // room closes. Only the FIRST injection stashes: a second submission must not
+-  // overwrite the stash with the first guest's team. A failed stash REFUSES the
+-  // injection: proceeding would leave the cleanup's no-stash branch to scrub
+-  // the host's save afterwards -- with a user-imported save in the slot, that
+-  // is real data on the line, not just a template reseed.
+-  if (File::Exists(save_path) && !File::Exists(save_path + HOST_STASH_SUFFIX) &&
+-      !File::CopyRegularFile(save_path, save_path + HOST_STASH_SUFFIX))
+-  {
+-    return fail("could not back up the host's own team; submission not applied");
+-  }
++  if (!StashHostTeamOnce(save_path, &error))
++    return fail(std::move(error));
+ 
+   auto save = EmeraldSave::Create(std::move(bytes), &error);
+   if (!save)
+@@ -514,15 +596,7 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+   if (!VerifiedWriteSaveFile(save_path, *save, &error))
+     return fail(fmt::format("save NOT written ({})", error));
+ 
+-  // From here on this save, its fresh .bak (the pre-injection image) and any
+-  // stray .tmp are opponent data. Mark them so the end-of-session purge knows
+-  // to take them, even if this process never gets to run it.
+-  if (!File::Exists(save_path + GUEST_MARK_SUFFIX))
+-  {
+-    File::IOFile mark(save_path + GUEST_MARK_SUFFIX, "wb");
+-    if (mark)
+-      mark.WriteString("A guest's team is in this socket's save. Removed when the room closes.\n");
+-  }
++  WriteGuestMark(save_path);
+ 
+   if (status)
+   {
+@@ -541,6 +615,89 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+ #endif
+ }
+ 
++bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status)
++{
++  const auto fail = [status](std::string message) {
++    if (status)
++      *status = std::move(message);
++    return false;
++  };
++
++#ifndef HAS_LIBMGBA
++  return fail("this build has no GBA support");
++#else
++  // Strict validation FIRST, before the slot's stash/marker lifecycle is
++  // touched at all: a malformed bundle (wrong length, bad count, a mon that
++  // fails its substructure checksum, junk in a supposedly-empty slot, an
++  // unterminated name, an out-of-range gender) is refused outright and leaves
++  // no trace. The bytes are untrusted remote input; PartyBundle::Validate is
++  // the gate.
++  std::string error;
++  const auto decoded = PartyBundle::Validate(bundle, &error);
++  if (!decoded)
++    return fail(fmt::format("save bundle rejected ({})", error));
++
++  const std::string save_path = ResolveGuestSavePath(device, &error);
++  if (save_path.empty())
++    return fail(std::move(error));
++
++  SelfHealStaleGuestState(save_path, device);
++
++  // Same refusal as the Showdown path, for the mirror-image reason: this
++  // socket's save being FRLG means its ROM is FRLG, and the Emerald-template
++  // disposable save about to replace it could never boot there -- the guest
++  // would silently play nothing. (The GUEST's game was already policed at
++  // extraction: bundles only come from Emerald or Ruby/Sapphire saves.)
++  {
++    std::vector<u8> existing;
++    if (File::Exists(save_path) && ReadFileBytes(save_path, &existing))
++    {
++      const auto existing_save = EmeraldSave::Create(std::move(existing));
++      if (existing_save && EmeraldSave::DetectGame(*existing_save) == Gen3Game::FireRedLeafGreen)
++      {
++        return fail("the guest slot holds a FireRed/LeafGreen save, which team submission cannot "
++                    "write to -- restore the default team save to host with submissions");
++      }
++    }
++  }
++
++  if (!StashHostTeamOnce(save_path, &error))
++    return fail(std::move(error));
++
++  // Unlike the Showdown path, the current socket save's CONTENT is irrelevant
++  // here: the disposable save is always built fresh from the bundled EMERALD
++  // template, with the bundle's party and trainer identity written into both
++  // rotating slots. No OT re-stamping happens anywhere on this path -- the
++  // save's trainer IS the bundle's trainer, so obedience is intrinsically
++  // correct (PartyBundle.h).
++  std::vector<u8> template_bytes;
++  if (!ReadFileBytes(GuestTemplatePath(device), &template_bytes))
++    return fail("bundled template missing on the host");
++
++  const auto save = PartyBundle::BuildSave(std::move(template_bytes), bundle, &error);
++  if (!save)
++    return fail(fmt::format("save bundle rejected ({})", error));
++
++  // The same verified-write path as every other injection; from the
++  // stash/marker lifecycle's point of view this is just another injected
++  // guest team, and RestoreHostTeam takes it back out identically.
++  if (!VerifiedWriteSaveFile(save_path, *save, &error))
++    return fail(fmt::format("save NOT written ({})", error));
++
++  WriteGuestMark(save_path);
++
++  if (status)
++  {
++    // The name reported is the bundle's own -- the guest's real in-game
++    // trainer -- which is what the opponent will see across the link.
++    *status = fmt::format("{} Pokemon from the guest's own save written to the guest slot, "
++                          "playing as {}",
++                          decoded->mons.size(), decoded->trainer_name);
++  }
++  return true;
++#endif
++}
++
+ void RestoreHostTeam(int device)
+ {
+   // THE ORDERING THIS EXISTS TO FIX
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 25acfe1..168a0c5 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -5,6 +5,9 @@
+ 
+ #include <optional>
+ #include <string>
++#include <vector>
++
++#include "Common/CommonTypes.h"
+ 
+ namespace XDNetplay
+ {
+@@ -47,6 +50,20 @@ namespace XDNetplay
+ //                 or unparseable means "no preference" (the host's fallback
+ //                 dropdown wins) and MUST NOT reject the team; an unknown id
+ //                 is dropped, never clamped.
++//      "SaveBundle" -- base64 of a fixed-size party bundle extracted from the
++//                 guest's OWN save (PartyBundle.h documents the byte layout
++//                 and both endpoints). A payload is EITHER a bundle OR
++//                 Showdown text: a bundle payload is the SaveBundle header
++//                 (plus optionally Model), the blank line, and an EMPTY body.
++//                 The Name header is IGNORED for bundles -- the bundle's real
++//                 trainer name wins, because renaming would split the save's
++//                 trainer from the mons' OT copies and make the whole party
++//                 disobedient. Model remains meaningful: it rides as its own
++//                 header exactly as for Showdown submissions. The value is
++//                 untrusted remote text: it must base64-decode cleanly
++//                 (bounded, strict) to populate save_bundle below, and the
++//                 decoded bytes are then validated field-by-field host-side
++//                 (PartyBundle::Validate) before anything touches a save.
+ //    Unknown keys are skipped harmlessly. Netplay refuses mismatched builds,
+ //    so both ends of a session always speak the same grammar -- the skipping
+ //    is robustness, not a compatibility channel.
+@@ -65,6 +82,13 @@ struct TeamSubmission
+   std::string trainer_name;  // "" when the payload carried no Name header
+   std::optional<int> model;  // "Model:" header; nullopt = no preference
+   std::string showdown_text;
++  // Decoded "SaveBundle:" bytes; nullopt when the payload carried no such
++  // header or its base64 was malformed. When set, this payload is a bundle
++  // submission: showdown_text is empty by construction and trainer_name is
++  // ignored (the bundle's own trainer identity wins). The bytes are decoded
++  // but NOT yet validated -- hand them to InjectGuestBundle, which runs
++  // PartyBundle::Validate before anything else.
++  std::optional<std::vector<u8>> save_bundle;
+ };
+ 
+ // Joiner side: wrap showdown_text with the header block. An empty (or
+@@ -75,6 +99,14 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+                                        const std::string& trainer_name,
+                                        std::optional<int> model = std::nullopt);
+ 
++// Joiner side, "Use my save": wrap a party bundle (PartyBundle::Extract's
++// output) as a bundle payload -- the SaveBundle header, an optional Model
++// header, the blank line, an empty body. No Name header is ever emitted: the
++// bundle's own trainer identity is authoritative. Base64 contains no newline,
++// so a bundle cannot forge framing.
++std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle,
++                                         std::optional<int> model = std::nullopt);
++
+ // Host side: split a received payload. Never fails -- an unparseable header
+ // block is simply treated as part of the team text.
+ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload);
+@@ -106,6 +138,20 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload);
+ bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
+                      std::string* status);
+ 
++// Host side, bundle counterpart of InjectGuestTeam: validate an untrusted
++// remote party bundle strictly (PartyBundle::Validate -- exact length, party
++// count 1..6, every mon through the existing checksum-verifying reader, name
++// field normalized), build the disposable save from the bundled EMERALD
++// template with the bundle's party AND trainer identity (PartyBundle::
++// BuildSave; no OT re-stamping -- see PartyBundle.h), and write it through
++// the same verified-write path. The .hostteam stash / .guestteam marker /
++// cleanup lifecycle is IDENTICAL to InjectGuestTeam's: from the lifecycle's
++// point of view the disposable save is just another injected guest team, and
++// RestoreHostTeam takes it back out the same way. Refuses when the guest
++// slot currently holds an FRLG save, for the same reason InjectGuestTeam
++// does: that socket's ROM cannot run the Emerald-template disposable save.
++bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status);
++
+ // End-of-session cleanup: give the host their own team back AND leave no file
+ // on this machine holding the opponent's party. Call it whenever a room ends,
+ // from either side of the connection -- it works out for itself what is there.
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 42cdfa3..53713b4 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.3.0";
++constexpr char VERSION[] = "1.3.1";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
