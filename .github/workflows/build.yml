@@ -241,9 +241,11 @@ jobs:
         run: cmake --build build --target dolphin-emu
       - name: Package .app
         run: |
-          # On macOS the DolphinQt target sets OUTPUT_NAME "DolphinQt", so the
-          # bundle is DolphinQt.app (at build/Binaries/), not Dolphin.app.
-          APP="$(find build -name 'DolphinQt.app' -type d 2>/dev/null | head -1)"
+          # The bundle is OrreLink.app since the patch-106 rename (older
+          # patch stacks produced DolphinQt.app; both spellings searched so a
+          # bisect build still packages).
+          APP="$(find build -name 'OrreLink.app' -type d 2>/dev/null | head -1)"
+          if [ -z "$APP" ]; then APP="$(find build -name 'DolphinQt.app' -type d 2>/dev/null | head -1)"; fi
           if [ -z "$APP" ]; then APP="$(find build -name '*.app' -type d 2>/dev/null | head -1)"; fi
           if [ -z "$APP" ]; then echo "no .app produced; build/Binaries:" >&2; ls -la build/Binaries >&2 || true; exit 1; fi
           echo "Packaging $APP"

@@ -1,0 +1,1146 @@
+From ee6ad8ce2e8dd5e02ef4d7fe2e94ca3cbc06d5e8 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 16 Aug 2026 12:26:20 -0700
+Subject: [PATCH] Hosted sessions never sync an imported save
+
+Netplay ships the host's GBA saves to every client -- privacy-neutral for a
+year of bundled templates, and a complete-save disclosure the moment 1.3.0 let
+hosts import real files: boxes, inventory, progress, secret ID, all of it, on
+the joiner's disk for the session. Community review caught it precisely.
+
+Now, when a session starts on a machine whose port save is a user import, that
+save is stashed and a DISPOSABLE stands in for it, built by the same party-
+bundle machinery guests submit through: the bundled template plus exactly the
+import's party and trainer identity -- what a battle reveals anyway. The
+originals return when the session ends, restore rides the same deferred
+crash-safe pattern as the team cleanup, first-stash-wins protects the import
+if a session dies halfway, and a failed stash refuses hosting rather than
+leaving a truncated copy a later heal would spread. Solo boots still play the
+real save; that is what importing is for.
+
+The team editor now locks whole while a room is open: its host-slot save was a
+side door that would have written the full import back over the disposable
+mid-room, and the next start would have synced exactly the file this patch
+exists to keep off the wire.
+
+Wording made honest on both platforms: importing shares a rebuilt party-and-
+identity save when hosting, never the full file; and the guest bundle note
+says what it actually discloses partner-side, down to the secret trainer ID.
+
+This completes Akiak's disposable-save design on the host side.
+
+Riding along, because it touches the same window code: the desktop app now
+calls itself OrreLink everywhere a user can see -- OrreLink.app on macOS,
+OrreLink.exe on Windows, an OrreLink binary on Linux, and a window title of
+"OrreLink <version>" instead of a git revision string.
+---
+ .../features/xdnetplay/SaveImportBridge.kt    |   5 +
+ .../features/xdnetplay/gen3/SaveImport.kt     |   2 +-
+ .../xdnetplay/ui/TeamEditorActivity.kt        |  14 +-
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |   7 +-
+ .../app/src/main/res/values/strings.xml       |   4 +-
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        |   8 +
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |   9 +
+ Source/Android/jni/NetPlay/Netplay.cpp        |  18 +
+ Source/Core/DolphinLib.props                  |   2 +
+ Source/Core/DolphinQt/CMakeLists.txt          |   4 +-
+ Source/Core/DolphinQt/DolphinQt.vcxproj       |   5 +
+ Source/Core/DolphinQt/MainWindow.cpp          |  22 +-
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  31 +-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  20 +-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  14 +-
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |   7 +
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ .../UICommon/XDNetplay/DisposableSave.cpp     | 397 ++++++++++++++++++
+ .../Core/UICommon/XDNetplay/DisposableSave.h  |  92 ++++
+ Source/Core/UICommon/XDNetplay/SaveImport.cpp |  35 +-
+ Source/Core/UICommon/XDNetplay/SaveImport.h   |   6 +-
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 22 files changed, 671 insertions(+), 35 deletions(-)
+ create mode 100644 Source/Core/UICommon/XDNetplay/DisposableSave.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/DisposableSave.h
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+index c57fb99..a92e157 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+@@ -36,6 +36,11 @@ object SaveImportBridge {
+      * held is backed up once to `<save>.preimport`, which no cleanup path ever
+      * deletes. On success [Outcome.message] carries the summary (game, trainer,
+      * backup name, host-saves note); on refusal it says exactly why.
++     *
++     * Network side (shared core, DisposableSave): hosting a netplay session
++     * never syncs the imported file itself — the session runs on a rebuilt
++     * save carrying only the party and trainer identity, and the import
++     * returns when the room closes. Solo play uses the import as-is.
+      */
+     fun importUserSave(sourcePath: String, deviceNumber: Int): Outcome =
+         parseOutcome(nativeImportUserSave(sourcePath, deviceNumber))
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
+index ceb95fd..c6df5a0 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/SaveImport.kt
+@@ -55,7 +55,7 @@ object SaveImport {
+      * leave a joiner believing their file reaches a host's room.
+      */
+     private const val HOST_SAVES_NOTE =
+-        "Netplay rooms always use the HOST's saves. An imported save applies when you play " +
++        "Solo play uses this save as-is. Hosting a netplay room shares only a rebuilt save carrying its party and trainer identity - never the full file." +
+             "solo or host; when you join someone's room, use Submit Team instead."
+ 
+     private const val RS_REVISION_NOTE =
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index 92bddb5..5f03260 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -85,13 +85,17 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         // save stays editable, and the end-of-session cleanup puts the host's team back in
+         // socket 3, so this unlocks on its own when the room closes. Joiners are unaffected:
+         // their local socket-3 save is their own team; netplay runs them from NetPlayTemp copies.
+-        if (role == TeamRole.GUEST && NetplayManager.activeSession?.isHosting == true) {
++        if (NetplayManager.activeSession?.isHosting == true) {
++            // Both roles lock while a room is open: the guest slot may hold the opponent's
++            // submitted team, and the host slot holds the session's privacy DISPOSABLE when the
++            // save is an import — an editor save would write the full import back over it and
++            // the next Start would sync exactly the file the disposable keeps off the wire.
+             uiState = TeamEditorState(
+                 role = role,
+                 ready = false,
+                 messages = listOf(
+-                    "The guest slot is hidden while you are hosting — it holds your opponent's " +
+-                        "submitted team. Close the room to see your own team here again."
++                    "The team editor is locked while a netplay room is open. Close the room " +
++                        "to edit teams."
+                 )
+             )
+             return
+@@ -154,12 +158,12 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+     // reload() covers opening it; this covers an editor that was already open on the guest slot
+     // when the room started, and is reached again from the back stack.
+     private fun guestSlotLocked() =
+-        uiState.role == TeamRole.GUEST && NetplayManager.activeSession?.isHosting == true
++        NetplayManager.activeSession?.isHosting == true
+ 
+     private fun saveTeam() {
+         if (guestSlotLocked()) {
+             uiState = uiState.copy(
+-                messages = listOf("Not saved — the guest slot is your opponent's while you host")
++                messages = listOf("Not saved — the team editor is locked while a netplay room is open")
+             )
+             return
+         }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 76fe29d..d36a43b 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -384,9 +384,10 @@ private fun ReadinessCard(
+  * (the shared SaveImport core does the validation and the no-destruction
+  * bookkeeping — see SaveImportBridge). The caption is a permanent fixture
+  * rather than a popup because it is the one fact every importer must know
+- * BEFORE picking a file: netplay syncs the HOST's saves, so a joiner's import
+- * never reaches the room — joiners submit their team instead. Mirrors the
+- * desktop launcher's "Save Files" box (XDLauncherDialog).
++ * BEFORE picking a file: netplay shares only a rebuilt save carrying the
++ * host's party and trainer identity (never the full import), and a joiner's
++ * import never reaches the room at all — joiners submit their team instead.
++ * Mirrors the desktop launcher's "Save Files" box (XDLauncherDialog).
+  */
+ @Composable
+ private fun SaveFilesCard(
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index c90e909..7589bcd 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1133,7 +1133,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+          from the shared core and are not duplicated here. -->
+     <string name="xd_submit_use_save">Use my save</string>
+     <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID.</string>
+-    <string name="xd_submit_privacy_note">Sending your save\'s party reveals its details — nicknames, OT, IDs — to the host\'s machine. (They battle you and see the party anyway.)</string>
++    <string name="xd_submit_privacy_note">Your save\'s party is sent exactly as it is, and the host\'s machine receives everything in those bytes: exact moves, held items, stats, EVs, IVs, natures, nicknames, met information, ribbons, and your OT name and BOTH trainer IDs, including the secret one. Your opponent would see most of this by battling you — but not the secret ID, so only send your save to hosts you trust.</string>
+     <string name="xd_submit_name_ignored">Your save\'s real trainer name is used instead.</string>
+ 
+     <!-- XD Netplay launcher: per-GBA-port save import (Save Files card).
+@@ -1142,7 +1142,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+          from the shared core (UICommon/XDNetplay/SaveImport) and are not
+          duplicated here. -->
+     <string name="xd_saves_section_title">Save Files</string>
+-    <string name="xd_saves_host_note">Netplay rooms always use the HOST\'s saves. An imported save applies when you play solo or host; when you join someone\'s room, use Submit Team instead.</string>
++    <string name="xd_saves_host_note">Solo play uses an imported save exactly as it is. Hosting a netplay room does NOT share the file: the session runs on a rebuilt save carrying only your party and trainer identity, and your own save returns when the room closes. When you join someone else\'s room, use Submit Team instead.</string>
+     <string name="xd_saves_port2_label">Your save (GBA port 2)</string>
+     <string name="xd_saves_port3_label">Guest-slot save (GBA port 3)</string>
+     <string name="xd_saves_import_button">Import my save…</string>
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index fa281f0..8e3d565 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -47,6 +47,7 @@
+ #include "Core/Config/MainSettings.h"
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/SaveImport.h"
+ #include "UICommon/XDNetplay/UpdateCheck.h"
+ #include "UICommon/XDNetplay/Version.h"
+@@ -370,6 +371,13 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativePrepar
+   // the Battle Style block at all (the first field test found exactly that).
+   // Cleanup rides the core-state hook PrepareForStart registers.
+   XDNetplay::BattleCustomizer::PrepareForStart();
++
++  // Crash self-heal for the disposable netplay saves (mirrors the desktop
++  // EnsureGbaConfig hook): if a crashed hosted session left a
++  // <save>.netplayorig stash behind, the socket save still holds the session's
++  // disposable -- put the real import back so this solo boot plays the user's
++  // own save again (DisposableSave.h). No-op while a room is open.
++  XDNetplay::DisposableSave::HealLeftoverSession();
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index ec174c9..f1d6656 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -15,6 +15,7 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/UICommon.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "jni/AndroidCommon/AndroidCommon.h"
+ #include "jni/AndroidCommon/IDCache.h"
+@@ -213,6 +214,14 @@ void NetPlayUICallbacks::OnRoomClosed()
+   // local GXXE01.ini, and give the cheats flag back if the pre-start hook
+   // forced it on for a cosmetics-only session.
+   XDNetplay::BattleCustomizer::EndSession();
++  // Finally, give a hosting machine its imported saves back: the session ran
++  // on disposables (party + trainer identity only) that nativeHost swapped in
++  // so the full imports never entered the synced save path. MUST stay after
++  // RestoreHostTeam -- the ordering is what guarantees the outer import
++  // restore runs after the inner .hostteam restore on the same deferred-until-
++  // Uninitialized event (DisposableSave.h). Idempotent and harmless on joiners
++  // and non-imported hosts.
++  XDNetplay::DisposableSave::EndNetplaySession();
+ }
+ 
+ void NetPlayUICallbacks::OnMsgChangeGame(const NetPlay::SyncIdentifier& sync_identifier,
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index 057f0fd..aa55a52 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -24,6 +24,7 @@
+ #endif
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/PartyBundle.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+@@ -256,6 +257,23 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeHost(JNIEnv
+   const u16 host_port = is_traversal ? Config::Get(Config::NETPLAY_LISTEN_PORT) :
+                                        Config::Get(Config::NETPLAY_HOST_PORT);
+ 
++  // Disposable host saves (mirrors the desktop MainWindow::NetPlayHost hook):
++  // if a GBA port holds a user-imported save, swap in a rebuilt save carrying
++  // only its party and trainer identity BEFORE the server exists -- netplay
++  // syncs the host's GBA socket saves to every client, and a guest can join
++  // (and submit a team into port 3) the moment the room is up, so this must
++  // precede both. The original returns when the room closes
++  // (NetPlayUICallbacks::OnRoomClosed). Refusal -- e.g. a FireRed/LeafGreen
++  // import no disposable can be built from -- aborts hosting loudly through
++  // the existing connection-error surface rather than silently syncing the
++  // complete save file.
++  if (std::string swap_error; !XDNetplay::DisposableSave::PrepareForHosting(&swap_error))
++  {
++    if (ui)
++      ui->OnConnectionError("Cannot host: " + swap_error);
++    return 0;
++  }
++
+   auto server = std::make_unique<NetPlay::NetPlayServer>(
+       host_port, use_upnp, ui,
+       NetPlay::NetTraversalConfig{is_traversal, traversal_host, traversal_port,
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index bc8d933..90f1cf1 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -597,6 +597,7 @@
+     <ClInclude Include="UICommon\ResourcePack\ResourcePack.h" />
+     <ClInclude Include="UICommon\UICommon.h" />
+     <ClInclude Include="UICommon\XDNetplay\BattleCustomizer.h" />
++    <ClInclude Include="UICommon\XDNetplay\DisposableSave.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Data.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Mon.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
+@@ -1312,6 +1313,7 @@
+     <ClCompile Include="UICommon\ResourcePack\ResourcePack.cpp" />
+     <ClCompile Include="UICommon\UICommon.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\BattleCustomizer.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\DisposableSave.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Data.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Mon.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
+diff --git a/Source/Core/DolphinQt/CMakeLists.txt b/Source/Core/DolphinQt/CMakeLists.txt
+index dde0b9d..846ed8e 100644
+--- a/Source/Core/DolphinQt/CMakeLists.txt
++++ b/Source/Core/DolphinQt/CMakeLists.txt
+@@ -510,7 +510,7 @@ if(WIN32)
+ 
+   set_target_properties(dolphin-emu PROPERTIES
+     DEBUG_POSTFIX    D
+-    OUTPUT_NAME      Dolphin
++    OUTPUT_NAME      OrreLink
+     WIN32_EXECUTABLE TRUE
+   )
+ 
+@@ -634,7 +634,7 @@ if(APPLE)
+     MACOSX_BUNDLE true
+     MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
+     XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY ""
+-    OUTPUT_NAME DolphinQt
++    OUTPUT_NAME OrreLink
+     )
+ 
+   # Copy qt.conf into the bundle
+diff --git a/Source/Core/DolphinQt/DolphinQt.vcxproj b/Source/Core/DolphinQt/DolphinQt.vcxproj
+index 8d641de..6681eb0 100644
+--- a/Source/Core/DolphinQt/DolphinQt.vcxproj
++++ b/Source/Core/DolphinQt/DolphinQt.vcxproj
+@@ -16,6 +16,11 @@
+     <Import Project="$(VSPropsDir)Base.Dolphin.props" />
+     <Import Project="$(VSPropsDir)QtCompile.props" />
+   </ImportGroup>
++  <PropertyGroup>
++    <!-- After Base.Dolphin.props, which sets TargetName to $(ProjectName): the
++         shipped executable is OrreLink.exe, not Dolphin.exe. -->
++    <TargetName>OrreLink</TargetName>
++  </PropertyGroup>
+   <PropertyGroup Label="UserMacros" />
+   <ItemDefinitionGroup>
+     <ClCompile>
+diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
+index c82df57..79a5df1 100644
+--- a/Source/Core/DolphinQt/MainWindow.cpp
++++ b/Source/Core/DolphinQt/MainWindow.cpp
+@@ -132,6 +132,8 @@
+ 
+ #include "UICommon/DiscordPresence.h"
+ #include "UICommon/GameFile.h"
++#include "UICommon/XDNetplay/Version.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/ResourcePack/Manager.h"
+ #include "UICommon/ResourcePack/ResourcePack.h"
+ 
+@@ -221,7 +223,7 @@ MainWindow::MainWindow(Core::System& system, std::unique_ptr<BootParameters> boo
+                        const std::string& movie_path)
+     : QMainWindow(nullptr), m_system(system)
+ {
+-  setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
++  setWindowTitle(QStringLiteral("OrreLink %1").arg(QString::fromUtf8(XDNetplay::VERSION)));
+   setWindowIcon(Resources::GetAppIcon());
+   setUnifiedTitleAndToolBarOnMac(true);
+   setAcceptDrops(true);
+@@ -1322,7 +1324,7 @@ void MainWindow::HideRenderWidget(bool reinit, bool is_exit)
+     m_rendering_to_main = false;
+     m_stack->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
+     disconnect(Host::GetInstance(), &Host::RequestTitle, this, &MainWindow::setWindowTitle);
+-    setWindowTitle(QString::fromStdString(Common::GetScmRevStr()));
++    setWindowTitle(QStringLiteral("OrreLink %1").arg(QString::fromUtf8(XDNetplay::VERSION)));
+   }
+ 
+   // The following code works around a driver bug that would lead to Dolphin crashing when changing
+@@ -1809,6 +1811,22 @@ bool MainWindow::NetPlayHost(const UICommon::GameFile& game)
+   if (is_traversal)
+     host_port = Config::Get(Config::NETPLAY_LISTEN_PORT);
+ 
++  // Disposable host saves: if a GBA port holds a user-imported save, swap in a
++  // rebuilt save carrying only its party and trainer identity BEFORE the
++  // server exists -- netplay syncs the host's GBA socket saves to every
++  // client, and a guest can join (and submit a team into port 3) the moment
++  // the room is up, so this must precede both. The original returns when the
++  // room closes (NetPlayDialog::OnRoomClosed). Refusal -- e.g. a FireRed/
++  // LeafGreen import no disposable can be built from -- aborts hosting loudly
++  // rather than silently syncing the complete save file.
++  if (std::string swap_error; !XDNetplay::DisposableSave::PrepareForHosting(&swap_error))
++  {
++    ModalMessageBox::critical(
++        nullptr, tr("OrreLink"),
++        tr("Cannot host: %1").arg(QString::fromStdString(swap_error)));
++    return false;
++  }
++
+   // Create Server
+   Settings::Instance().ResetNetPlayServer(
+       new NetPlay::NetPlayServer(host_port, use_upnp, m_netplay_dialog,
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 6fb1790..6b571e0 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -76,6 +76,7 @@
+ #include "UICommon/DiscordPresence.h"
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/PartyBundle.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+@@ -920,6 +921,14 @@ void NetPlayDialog::OnRoomClosed()
+   // local GXXE01.ini, and give the cheats flag back if the pre-start hook
+   // forced it on for a cosmetics-only session.
+   XDNetplay::BattleCustomizer::EndSession();
++  // Finally, give a hosting machine its imported saves back: the session ran
++  // on disposables (party + trainer identity only) that MainWindow::
++  // NetPlayHost swapped in so the full imports never entered the synced save
++  // path. MUST stay after RestoreHostTeam -- the ordering is what guarantees
++  // the outer import restore runs after the inner .hostteam restore on the
++  // same deferred-until-Uninitialized event (DisposableSave.h). Idempotent
++  // and harmless on joiners and non-imported hosts.
++  XDNetplay::DisposableSave::EndNetplaySession();
+ }
+ 
+ void NetPlayDialog::OnSubmitTeam()
+@@ -993,14 +1002,19 @@ void NetPlayDialog::OnSubmitTeam()
+       new QCheckBox(tr("Use my save (send the party from my own save file)"), &dialog);
+   dialog_layout->addWidget(use_save_check);
+ 
+-  // Shown only while the box is ticked. The host sees the party's details by
+-  // battling anyway, but sending a save-extracted bundle makes the disclosure
+-  // explicit, so the dialog says it out loud before anything is sent.
++  // Shown only while the box is ticked. The disclosure list is deliberately
++  // exhaustive (community review): the bundle carries the real party bytes and
++  // the save's trainer identity, so everything in them lands on the host's
++  // machine -- including the secret trainer ID, which nothing in a battle ever
++  // shows. Saying "nicknames, OT, IDs" and stopping there would undersell it.
+   auto* privacy_note = new QLabel(
+       tr("Your save's party is sent exactly as it is, under the save's own trainer "
+-         "name — the in-game name field above is ignored. Note: this reveals the "
+-         "party's details (nicknames, OT, IDs) to the host's machine; your opponent "
+-         "would also see that party by battling you."),
++         "identity — the in-game name field above is ignored. The host's machine "
++         "receives everything in those party bytes: exact moves, held items, stats, "
++         "EVs, IVs, natures, nicknames, met information, ribbons, and your OT name "
++         "and BOTH trainer IDs, including the secret one. Your opponent would see "
++         "most of this by battling you — but not the secret ID, so only send your "
++         "save to hosts you trust."),
+       &dialog);
+   privacy_note->setWordWrap(true);
+   dialog_layout->addWidget(privacy_note);
+@@ -1063,7 +1077,10 @@ void NetPlayDialog::OnSubmitTeam()
+   // leave the privacy note visible; normalize explicitly once.
+   apply_bundle_mode(use_save_check->isChecked());
+ 
+-  dialog.resize(500, 470);
++  // Sized for the (longer, deliberately exhaustive) privacy note when bundle
++  // mode is on; the note is hidden otherwise and the paste box absorbs the
++  // extra height.
++  dialog.resize(500, 520);
+   if (dialog.exec() != QDialog::Accepted)
+     return;
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index e5ce66a..8a6b8b3 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -203,6 +203,18 @@ void TeamEditorDialog::ReloadForRole()
+     RefreshPartyList();
+     return;
+   }
++  // The host's own slot locks while a room is open too. With an imported save,
++  // the file on disk is the privacy DISPOSABLE for the session's duration; an
++  // editor save here would write the full import back over it, and the next
++  // Start would sync exactly the file the disposable exists to keep off the
++  // wire. (Any edit would also be silently reverted by the room-close restore.)
++  if (Settings::Instance().GetNetPlayServer())
++  {
++    SetMessages({tr("The team editor is locked while a netplay room is open. Close the room to "
++                    "edit teams.")});
++    RefreshPartyList();
++    return;
++  }
+ 
+   std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
+   if (rom.empty() || !File::Exists(rom))
+@@ -514,10 +526,12 @@ void TeamEditorDialog::OnSave()
+   // only reload). Writing the guest slot now would overwrite the opponent's
+   // submitted party with whatever was loaded before they sent it -- and leave
+   // a .bak of their team behind.
+-  if (DeviceNumber() == 2 && Settings::Instance().GetNetPlayServer())
++  if (Settings::Instance().GetNetPlayServer())
+   {
+-    SetMessages({tr("NOT saved — the guest slot holds your opponent's team while you are "
+-                    "hosting.")});
++    // Both ports: the guest slot may hold the opponent's submitted team, and
++    // the host slot holds the session's privacy disposable when the save is an
++    // import -- writing either mid-room is wrong in a different way.
++    SetMessages({tr("NOT saved — the team editor is locked while a netplay room is open.")});
+     return;
+   }
+   // Name before party: WriteParty serializes the mons as they stand, and
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 902cc7b..be35fd7 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -294,14 +294,18 @@ void XDLauncherDialog::CreateMainLayout()
+   // team-editor save stays the default; importing your own cartridge save is
+   // opt-in and per port (SaveImport does the validation and the no-destruction
+   // bookkeeping). The caption is a permanent fixture rather than a popup
+-  // because it is the one fact every importer must know BEFORE picking a
+-  // file: netplay syncs the HOST's saves, so a joiner's import never reaches
+-  // the room -- joiners submit their team instead.
++  // because it is the two facts every importer must know BEFORE picking a
++  // file: netplay syncs the HOST's saves (so a joiner's import never reaches
++  // the room -- joiners submit their team instead), and a hosting session
++  // never syncs the import itself, only the rebuilt party-and-identity save
++  // DisposableSave swaps in for the room's duration.
+   auto* saves_box = new QGroupBox(tr("Save Files"));
+   auto* saves_layout = new QGridLayout;
+   auto* saves_caption = new QLabel(
+-      tr("Netplay rooms always use the HOST's saves. An imported save applies when you play solo "
+-         "or host; when you join someone's room, use Submit Team instead."));
++      tr("Solo play uses an imported save exactly as it is. Hosting a netplay room does NOT "
++         "share the file: the session runs on a rebuilt save carrying only your party and "
++         "trainer identity, and your own save returns when the room closes. When you join "
++         "someone else's room, use Submit Team instead."));
+   saves_caption->setWordWrap(true);
+   saves_layout->addWidget(saves_caption, 0, 0, 1, 4);
+   int save_row = 1;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 0f8d027..79a3bb5 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -30,6 +30,7 @@
+ #include "Core/NetPlayServer.h"
+ 
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ 
+ namespace XDNetplay
+ {
+@@ -111,6 +112,12 @@ bool EnsureGbaConfig()
+   // room is open), which is exactly the boundary BeginSession wants.
+   BattleCustomizer::BeginSession();
+ 
++  // Same boundary, same reason, for the disposable netplay saves: if a crashed
++  // hosted session left a <save>.netplayorig stash behind, the socket save
++  // still holds the session's disposable -- put the real import back so a solo
++  // boot plays the user's own save again (DisposableSave.h).
++  DisposableSave::HealLeftoverSession();
++
+   // Netplay tuned for the XD link: fixed delay, no UPnP noise.
+   //
+   // The buffer is only re-seeded while automatic sizing is on, where 5 is just
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index 6eed380..26287b2 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -21,6 +21,8 @@ add_library(uicommon
+   UICommon.h
+   XDNetplay/BattleCustomizer.cpp
+   XDNetplay/BattleCustomizer.h
++  XDNetplay/DisposableSave.cpp
++  XDNetplay/DisposableSave.h
+   XDNetplay/Gen3Data.cpp
+   XDNetplay/Gen3Data.h
+   XDNetplay/Gen3Mon.cpp
+diff --git a/Source/Core/UICommon/XDNetplay/DisposableSave.cpp b/Source/Core/UICommon/XDNetplay/DisposableSave.cpp
+new file mode 100644
+index 0000000..f7c1c2d
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/DisposableSave.cpp
+@@ -0,0 +1,397 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/DisposableSave.h"
++
++#include <atomic>
++#include <mutex>
++#include <optional>
++#include <string>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include "Common/Config/Config.h"
++#include "Common/FileUtil.h"
++#include "Common/HookableEvent.h"
++#include "Common/IOFile.h"
++
++#include "Core/Config/MainSettings.h"
++#include "Core/Core.h"
++#include "Core/HW/GBADetectLog.h"
++#include "Core/NetPlayProto.h"
++#include "Core/System.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBACore.h"
++#endif
++
++#include "UICommon/XDNetplay/Gen3Save.h"
++#include "UICommon/XDNetplay/PartyBundle.h"
++#include "UICommon/XDNetplay/TeamInjector.h"
++
++namespace XDNetplay::DisposableSave
++{
++namespace
++{
++#ifdef HAS_LIBMGBA
++// TeamInjector's session bookkeeping suffixes. Their presence next to the
++// port-3 save means that layer's injection round trip owns the file right now;
++// this layer must never restore OVER a pending inner cleanup (the inner retry
++// would later copy its stash -- the disposable -- straight back over the
++// restored import). MUST stay in step with TeamInjector.cpp.
++constexpr const char* HOST_STASH_SUFFIX = ".hostteam";
++constexpr const char* GUEST_MARK_SUFFIX = ".guestteam";
++
++// Same ROM resolution as TeamInjector / SaveImport: the socket's own ROM,
++// falling back to the other socket's (a launcher-made setup points both at one
++// dump). This matches what SyncSaveData reads at start in every configured
++// setup, so the file swapped here is provably the file that would be synced.
++std::string SavePathForDevice(int device)
++{
++  std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device]);
++  if (rom.empty() || !File::Exists(rom))
++    rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[device == 1 ? 2 : 1]);
++  if (rom.empty() || !File::Exists(rom))
++    return {};
++  return HW::GBA::Core::GetSavePath(rom, device);
++}
++
++const Config::Info<std::string>& ImportedSaveKey(int device)
++{
++  return device == 1 ? Config::MAIN_XD_IMPORTED_SAVE_2 : Config::MAIN_XD_IMPORTED_SAVE_3;
++}
++
++// The bundled Emerald template the disposable is built from -- the same file
++// the guest-bundle injection path uses for its disposable saves.
++std::string TemplatePath(int device)
++{
++  return File::GetSysDirectory() +
++         (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
++}
++
++bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
++{
++  File::IOFile file(path, "rb");
++  if (!file)
++    return false;
++  out->resize(file.GetSize());
++  return out->empty() || file.ReadBytes(out->data(), out->size());
++}
++
++void Log(const std::string& detail)
++{
++  GBADetectLog::LogPostSession("disposable " + detail);
++}
++
++// Whether TeamInjector's injection lifecycle currently owns this save.
++bool InnerLifecyclePending(const std::string& save_path)
++{
++  return File::Exists(save_path + HOST_STASH_SUFFIX) ||
++         File::Exists(save_path + GUEST_MARK_SUFFIX);
++}
++
++std::mutex s_restore_mutex;
++// True while a room's end-of-session restore is armed but not yet run.
++std::atomic<bool> s_restore_pending{false};
++// Registered once, kept for the life of the process (same idiom as
++// TeamInjector's purge hook).
++Common::EventHook s_state_hook;
++
++// Put the original import back for one port. Idempotent; a no-op when nothing
++// is stashed. MUST NOT run while the emulated GBAs are alive -- the live mGBA
++// core rewrites the socket save at teardown, so anything done earlier is
++// simply overwritten. EndNetplaySession/HealLeftoverSession enforce that.
++void RestoreNow(int device)
++{
++  const std::string save_path = SavePathForDevice(device);
++  if (save_path.empty())
++    return;
++  const std::string orig = save_path + NETPLAY_ORIG_SUFFIX;
++  if (!File::Exists(orig))
++    return;
++
++  if (device == 2 && InnerLifecyclePending(save_path))
++  {
++    // TeamInjector's cleanup has not finished for this socket (its own restore
++    // failed and kept .hostteam for a retry, or its purge never ran). Restoring
++    // the import now and deleting the stash would let that retry later copy the
++    // disposable straight over the restored import -- data loss. Keep the stash;
++    // the next session boundary's HealLeftoverSession finishes the inner
++    // lifecycle first and then restores this.
++    Log(fmt::format("sock={} restore=deferred-inner-pending", device));
++    return;
++  }
++
++  if (File::CopyRegularFile(orig, save_path))
++  {
++    File::Delete(orig);
++    Log(fmt::format("sock={} restored=import", device));
++  }
++  else
++  {
++    // Keep the stash so a later boundary can retry, rather than destroying the
++    // only copy of the import's session-start state because one copy failed.
++    Log(fmt::format("sock={} restore=FAILED", device));
++  }
++}
++
++void RunPendingRestore()
++{
++  if (!s_restore_pending.exchange(false, std::memory_order_acq_rel))
++    return;
++  std::lock_guard lock(s_restore_mutex);
++  RestoreNow(1);
++  RestoreNow(2);
++}
++
++// Build the disposable image for one imported port from `source_bytes` (the
++// imported save). Returns std::nullopt with *error on any failure; the FRLG
++// case gets a hosting-specific message (Extract's own text explains submission,
++// not hosting).
++std::optional<EmeraldSave> BuildDisposable(int device, std::vector<u8> source_bytes,
++                                           std::string* error)
++{
++  const auto fail = [error](std::string message) {
++    if (error)
++      *error = std::move(message);
++    return std::nullopt;
++  };
++
++  std::string parse_error;
++  const auto imported = EmeraldSave::Create(std::move(source_bytes), &parse_error);
++  if (!imported)
++    return fail(fmt::format("the imported save on GBA port {} is unreadable ({})", device + 1,
++                            parse_error));
++
++  // Mirror of the FRLG submission refusal, for the mirror-image reason: the
++  // party-bundle extractor cannot read a FireRed/LeafGreen save (its party
++  // lives at different section offsets), so no disposable can be built -- and
++  // hosting without one would sync the complete FRLG save to the guest, the
++  // exact leak this module exists to close. Refuse hosting loudly instead.
++  if (EmeraldSave::DetectGame(*imported) == Gen3Game::FireRedLeafGreen)
++  {
++    return fail(fmt::format(
++        "the imported save on GBA port {} is FireRed/LeafGreen. Hosting shares a rebuilt save "
++        "carrying only your party and trainer identity, and that rebuild cannot read a "
++        "FireRed/LeafGreen save -- so hosting would send your complete save file instead. "
++        "Restore the default save for that port (or import an Emerald or Ruby/Sapphire save), "
++        "then host.",
++        device + 1));
++  }
++
++  std::string extract_error;
++  const auto bundle = PartyBundle::Extract(*imported, &extract_error);
++  if (!bundle)
++  {
++    return fail(fmt::format(
++        "cannot build the netplay save for GBA port {}: {}. Hosting would otherwise send your "
++        "complete save file, so it was refused.",
++        device + 1, extract_error));
++  }
++
++  std::vector<u8> template_bytes;
++  if (!ReadFileBytes(TemplatePath(device), &template_bytes))
++    return fail("bundled template missing: " + TemplatePath(device));
++
++  std::string build_error;
++  auto disposable = PartyBundle::BuildSave(std::move(template_bytes), *bundle, &build_error);
++  if (!disposable)
++    return fail(fmt::format("could not build the netplay save for GBA port {} ({})", device + 1,
++                            build_error));
++  return disposable;
++}
++
++// Crash self-heal, part 1: if the crashed session ALSO left TeamInjector's
++// lifecycle unfinished on the port-3 slot (a guest's party may still be in the
++// save and its .bak/.tmp), finish that first: RestoreHostTeam runs its purge
++// inline when emulation is down, restoring the disposable from .hostteam and
++// scrubbing the guest copies; part 2 (RestoreNow) then puts the import back
++// over the disposable. Calling RestoreHostTeam here also registers
++// TeamInjector's Core-state hook before this module ever registers its own,
++// preserving the restore-after-purge callback order.
++//
++// MUST be called with s_restore_mutex NOT held: RestoreHostTeam's first call
++// registers a Core-state callback (HookableEvent's own lock), and this
++// module's callback takes s_restore_mutex under that same lock -- taking the
++// two in the opposite order here could deadlock (same note as TeamInjector's
++// out-of-lock registration).
++void FinishInnerLifecycleIfLeftover()
++{
++  const std::string save_path = SavePathForDevice(2);
++  if (!save_path.empty() && File::Exists(save_path + NETPLAY_ORIG_SUFFIX) &&
++      InnerLifecyclePending(save_path))
++  {
++    XDNetplay::RestoreHostTeam(2);
++  }
++}
++
++// Crash self-heal, part 2, for one port. First-stash-wins: the leftover
++// .netplayorig IS the import; it is restored, never re-stashed over (a
++// re-stash would capture the disposable and lose the import for good -- the
++// same rule .preimport follows). Inline-only: the callers guarantee emulation
++// is down (all the session-boundary hooks run with no game booted; if one
++// ever does not, the heal simply waits for the next boundary).
++void HealDeviceNow(int device)
++{
++  const std::string save_path = SavePathForDevice(device);
++  if (save_path.empty() || !File::Exists(save_path + NETPLAY_ORIG_SUFFIX))
++    return;
++  RestoreNow(device);
++}
++#endif  // HAS_LIBMGBA
++}  // namespace
++
++void HealLeftoverSession()
++{
++#ifdef HAS_LIBMGBA
++  // While a room is open, a .netplayorig stash is not a leftover -- it is the
++  // LIVE session's stash, and "healing" it would put the full import back into
++  // the very save path the room is about to sync. Same guard for a running
++  // game: the mGBA cores own the socket saves.
++  if (NetPlay::IsNetPlayRunning() || !Core::IsUninitialized(Core::System::GetInstance()))
++    return;
++  FinishInnerLifecycleIfLeftover();
++  std::lock_guard lock(s_restore_mutex);
++  HealDeviceNow(1);
++  HealDeviceNow(2);
++#endif
++}
++
++bool PrepareForHosting(std::string* error)
++{
++#ifndef HAS_LIBMGBA
++  return true;  // no GBA support: nothing is synced, nothing to protect
++#else
++  if (!Core::IsUninitialized(Core::System::GetInstance()))
++  {
++    if (error)
++    {
++      *error = "A game is running — the emulated GBA owns its save file, so the netplay save "
++               "swap cannot run. Stop emulation first.";
++    }
++    return false;
++  }
++
++  // A previous session's restore may still be ARMED but not yet run (the
++  // Uninitialized notification races the UI thread by a hair). Run it now so
++  // it can never fire after this session's swap and put the imports back into
++  // the synced path mid-room.
++  RunPendingRestore();
++
++  // A crashed previous session next: restore before anything is rebuilt, so
++  // the extraction below always reads the real import, never a stale
++  // disposable. The inner-lifecycle finish runs before the lock (see
++  // FinishInnerLifecycleIfLeftover's deadlock note).
++  FinishInnerLifecycleIfLeftover();
++
++  std::lock_guard lock(s_restore_mutex);
++  HealDeviceNow(1);
++  HealDeviceNow(2);
++
++  std::vector<int> swapped;
++  const auto unwind = [&swapped] {
++    for (const int device : swapped)
++      RestoreNow(device);
++  };
++
++  for (const int device : {1, 2})
++  {
++    // The per-port import key is the "this socket holds a user import" signal:
++    // set by ImportUserSave, cleared by RestoreDefaultSave. Bundled/team-editor
++    // saves leave it empty and are deliberately untouched -- syncing those is
++    // privacy-neutral, and zero behavior change is the requirement.
++    if (Config::Get(ImportedSaveKey(device)).empty())
++      continue;
++
++    const std::string save_path = SavePathForDevice(device);
++    if (save_path.empty() || !File::Exists(save_path))
++      continue;  // nothing on disk to leak
++
++    std::vector<u8> import_bytes;
++    if (!ReadFileBytes(save_path, &import_bytes))
++    {
++      if (error)
++        *error = "could not read " + save_path;
++      unwind();
++      return false;
++    }
++
++    auto disposable = BuildDisposable(device, std::move(import_bytes), error);
++    if (!disposable)
++    {
++      unwind();
++      return false;
++    }
++
++    // Stash the import ONCE (first-stash-wins; after the heal above a stash
++    // should never pre-exist, but never overwrite one regardless).
++    const std::string orig = save_path + NETPLAY_ORIG_SUFFIX;
++    if (!File::Exists(orig) && !File::CopyRegularFile(save_path, orig))
++    {
++      // Remove whatever the failed copy left: a truncated stash is worse than
++      // none, because every later boundary's heal would blindly copy it back
++      // over the intact import. No stash means the heal has nothing to do.
++      File::Delete(orig);
++      if (error)
++        *error = "could not back up the imported save to " + orig + " — hosting refused";
++      unwind();
++      return false;
++    }
++
++    // The same verified-write path as every injection: re-parse, checksum
++    // check, tmp write, readback compare, .bak, rename.
++    std::string write_error;
++    if (!VerifiedWriteSaveFile(save_path, *disposable, &write_error))
++    {
++      if (error)
++        *error = fmt::format("netplay save NOT written ({})", write_error);
++      // The stash for THIS port already exists (same bytes as the untouched
++      // save); include it in the unwind so no .netplayorig lingers after a
++      // refusal.
++      swapped.push_back(device);
++      unwind();
++      return false;
++    }
++
++    swapped.push_back(device);
++    Log(fmt::format("sock={} swapped=disposable", device));
++  }
++  return true;
++#endif
++}
++
++void EndNetplaySession()
++{
++#ifdef HAS_LIBMGBA
++  // Deferred exactly like TeamInjector's purge, and for the same reason: when
++  // a room closes mid-battle, Core::Stop is asynchronous and the mGBA cores
++  // rewrite the socket saves from memory at teardown -- a restore done now
++  // would be overwritten moments later. Arm the restore and run it once
++  // emulation reaches Uninitialized (inline immediately in the common
++  // stopped-first case).
++  //
++  // ORDERING vs the inner .hostteam restore: the OnRoomClosed hooks call
++  // RestoreHostTeam(2) before this function, so TeamInjector's Uninitialized
++  // callback is registered before this one and HookableEvent triggers them in
++  // registration order -- the inner purge puts the disposable back and scrubs
++  // the guest copies, THEN this restore replaces the disposable with the
++  // original import. RestoreNow additionally refuses to run over a pending
++  // inner lifecycle, so even a failed inner restore cannot be clobbered.
++  static std::once_flag hook_once;
++  std::call_once(hook_once, [] {
++    // Registered outside s_restore_mutex: Register() takes the event's own
++    // lock and the callback takes s_restore_mutex under it, so taking them in
++    // the other order here could deadlock (same note as TeamInjector).
++    s_state_hook = Core::AddOnStateChangedCallback([](Core::State state) {
++      if (state == Core::State::Uninitialized)
++        RunPendingRestore();
++    });
++  });
++
++  s_restore_pending.store(true, std::memory_order_release);
++
++  if (Core::IsUninitialized(Core::System::GetInstance()))
++    RunPendingRestore();
++#endif
++}
++}  // namespace XDNetplay::DisposableSave
+diff --git a/Source/Core/UICommon/XDNetplay/DisposableSave.h b/Source/Core/UICommon/XDNetplay/DisposableSave.h
+new file mode 100644
+index 0000000..b4e2cb6
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/DisposableSave.h
+@@ -0,0 +1,92 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <string>
++
++// Disposable host saves for netplay (completes the community privacy review's
++// original design).
++//
++// THE GAP THIS CLOSES: Dolphin netplay syncs the HOST's GBA saves to every
++// client byte-for-byte (NetPlayServer::SyncSaveData reads the socket save
++// files at start). With the bundled template saves that was privacy-neutral;
++// since "Import my save" a host's COMPLETE real save -- boxes, inventory,
++// progress, secret ID -- was copied to every joiner's machine for the session.
++//
++// THE FIX: when a hosting flow begins on a machine whose port-2 and/or port-3
++// save is a USER IMPORT (the MAIN_XD_IMPORTED_SAVE_2/3 config keys), that
++// port's save is replaced FOR THE SESSION by a disposable save built with the
++// existing party-bundle machinery: PartyBundle::Extract(imported save) ->
++// PartyBundle::BuildSave(bundled Emerald template, bundle). The disposable
++// carries exactly the party and trainer identity -- what a battle reveals
++// anyway -- and the full save never enters the synced save path. The import is
++// stashed as <save>.netplayorig and put back when the room closes.
++//
++// LAYERING: strictly OUTSIDE TeamInjector's guest-team stash/restore, which is
++// untouched. A guest submission during the session injects into the port-3
++// DISPOSABLE: TeamInjector stashes the disposable as <save>.hostteam and its
++// end-of-session purge restores it; this layer then restores the ORIGINAL
++// import over that. Ordering is guaranteed by construction: the OnRoomClosed
++// hooks call RestoreHostTeam(2) first and EndNetplaySession() second, so this
++// layer's deferred-restore callback is registered after TeamInjector's on the
++// same Core-state event and always runs after it (Common::HookableEvent
++// triggers listeners in registration order).
++//
++// SOLO boots keep playing the real imported save -- that is the point of
++// importing. Only hosting flows swap in disposables. Non-imported ports
++// (bundled/team-editor saves) are never touched.
++//
++// The ".netplayorig" name is PROVABLY outside every cleanup set, verified the
++// same way ".preimport" was: TeamInjector's purge deletes only .hostteam /
++// .guestteam / .bak / .tmp / NetPlayTemp*.sav (TeamInjector.cpp PurgeNow),
++// SaveImport writes .preimport and never deletes anything else, the verified
++// writers touch only .tmp / .bak, and netplay's own temp handling deletes only
++// its NetPlayTemp*.sav staging copies. No code path in the tree globs or
++// deletes *.netplayorig except this module's own restore.
++namespace XDNetplay::DisposableSave
++{
++// Stash of the imported save for the duration of one hosted netplay session.
++constexpr const char* NETPLAY_ORIG_SUFFIX = ".netplayorig";
++
++// Crash self-heal: if a previous session died before its restore ran, a
++// <save>.netplayorig is still on disk and the socket save still holds the
++// disposable. Restore the original (first-stash-wins: the leftover stash is
++// restored, never re-stashed over). Call at every session boundary that could
++// precede a boot -- the same hooks BattleCustomizer::BeginSession uses
++// (desktop: EnsureGbaConfig; Android: nativeHost and the solo-boot
++// nativePrepareForBoot) -- so a solo boot after a crash plays the real import
++// again. For the port-3 slot a leftover TeamInjector lifecycle (.guestteam /
++// .hostteam) is finished first via RestoreHostTeam, then the import goes back
++// over its result. No-op when emulation is running or nothing is stashed.
++void HealLeftoverSession();
++
++// HOST side, called when a hosting flow begins -- BEFORE the NetPlayServer
++// exists, so the disposable is on disk before any guest can join, before any
++// TeamData submission can inject into port 3 (the injection then stashes the
++// DISPOSABLE, not the import), and long before CollectSaveSyncInfo /
++// SyncSaveData read the socket saves at start. Desktop: MainWindow::
++// NetPlayHost; Android: nativeHost.
++//
++// For each imported port: heal any leftover stash, extract the party bundle
++// from the import, build the disposable from the bundled Emerald template,
++// stash the import ONCE as <save>.netplayorig (first-stash-wins), and write
++// the disposable through the verified-write path.
++//
++// Returns false (with *error user-displayable) and unwinds any port already
++// swapped when a disposable cannot be built -- notably for a FireRed/LeafGreen
++// import, which PartyBundle::Extract refuses (its party lives at different
++// section offsets): hosting is refused loudly rather than silently syncing the
++// full FRLG save. Ports without an import are untouched and never fail.
++bool PrepareForHosting(std::string* error);
++
++// End-of-session restore: put the original imports back and delete the
++// stashes. Call from the OnRoomClosed hooks on BOTH platforms, strictly AFTER
++// XDNetplay::RestoreHostTeam(2) (see the layering note above). Idempotent and
++// harmless on machines that never swapped (joiners, non-imported hosts).
++//
++// Rides the same deferred-until-Uninitialized pattern as the team cleanup: the
++// live mGBA cores rewrite the socket saves at teardown, so when a room closes
++// mid-battle the work waits for Core::State::Uninitialized and runs then.
++void EndNetplaySession();
++}  // namespace XDNetplay::DisposableSave
+diff --git a/Source/Core/UICommon/XDNetplay/SaveImport.cpp b/Source/Core/UICommon/XDNetplay/SaveImport.cpp
+index 3d0f9ec..d42e4dd 100644
+--- a/Source/Core/UICommon/XDNetplay/SaveImport.cpp
++++ b/Source/Core/UICommon/XDNetplay/SaveImport.cpp
+@@ -7,6 +7,8 @@
+ #include <string_view>
+ #include <utility>
+ 
++#include "UICommon/XDNetplay/DisposableSave.h"
++
+ #include <fmt/format.h>
+ 
+ #include "Common/Config/Config.h"
+@@ -154,14 +156,30 @@ bool RefuseIfSaveIsLive(int device, const std::string& save_path, std::string* e
+     }
+     return true;
+   }
++  // No port may change hands while a room is open: a hosted room swapped every
++  // imported port to a disposable save at creation (DisposableSave.h), and an
++  // import landing NOW would bypass that swap -- the next Start would sync the
++  // complete file to the guest, the exact leak the disposable exists to close.
++  if (NetPlay::IsNetPlayRunning())
++  {
++    if (error)
++      *error = "A netplay room is open — close it first, then import.";
++    return true;
++  }
+   return false;
+ }
+ 
+ // Requirement 5, appended to every success status: an import must never leave
+-// a joiner believing their file reaches a host's room.
++// a joiner believing their file reaches a host's room -- and, since the
++// disposable-save fix (DisposableSave.h), never leave a HOST believing their
++// full save is shared either. The picked file itself is only ever read; what
++// a hosted session syncs is a rebuilt save carrying only party + trainer
++// identity.
+ constexpr const char* HOST_SAVES_NOTE =
+-    "Netplay rooms always use the HOST's saves. An imported save applies when you play solo or "
+-    "host; when you join someone's room, use Submit Team instead.";
++    "Solo play uses your imported save exactly as it is. Hosting a netplay room does NOT share "
++    "the save file: the session runs on a rebuilt save carrying only your party and trainer "
++    "identity, and your own save returns when the room closes. When you join someone else's "
++    "room, use Submit Team instead.";
+ 
+ constexpr const char* RS_REVISION_NOTE =
+     "Note: Ruby/Sapphire revisions (1.0/1.1/1.2) also differ — use a save from your exact ROM "
+@@ -285,6 +303,13 @@ bool ImportUserSave(const std::string& source_path, int device, std::string* sta
+   if (RefuseIfSaveIsLive(device, save_path, error))
+     return false;
+ 
++  // A crashed netplay session may have left the socket holding its disposable
++  // save with the real import stashed as <save>.netplayorig. Heal BEFORE
++  // writing: importing over the disposable now would otherwise be silently
++  // undone when the stash is restored at the next session boundary. Safe here:
++  // the refusals above guarantee no room is open and emulation is down.
++  DisposableSave::HealLeftoverSession();
++
+   // The chosen file is read once, fully, and never opened for writing.
+   std::vector<u8> bytes;
+   if (!ReadFileBytes(source_path, &bytes))
+@@ -372,6 +397,10 @@ bool RestoreDefaultSave(int device, std::string* error)
+   if (RefuseIfSaveIsLive(device, save_path, error))
+     return false;
+ 
++  // Same crashed-session heal as ImportUserSave, same reasoning: never write
++  // over a disposable that a leftover .netplayorig would later restore over.
++  DisposableSave::HealLeftoverSession();
++
+   const std::string template_path =
+       File::GetSysDirectory() +
+       (device == 1 ? "XDNetplay/EMERALD-2.sav" : "XDNetplay/EMERALD-3.sav");
+diff --git a/Source/Core/UICommon/XDNetplay/SaveImport.h b/Source/Core/UICommon/XDNetplay/SaveImport.h
+index 7979613..a286279 100644
+--- a/Source/Core/UICommon/XDNetplay/SaveImport.h
++++ b/Source/Core/UICommon/XDNetplay/SaveImport.h
+@@ -13,7 +13,11 @@
+ 
+ // Opt-in import of a user's own Gen 3 save into a GBA socket, replacing the
+ // bundled team-editor save. Guarantees, in order of importance:
+-//  - the file the user picked is only ever READ;
++//  - the file the user picked is only ever READ. (That is a statement about
++//    the LOCAL file only. What a hosted netplay session shares is governed by
++//    DisposableSave: the imported socket save itself never enters the synced
++//    save path -- a rebuilt party-and-identity save stands in for it, and the
++//    user-facing wording everywhere says so.);
+ //  - whatever occupied the socket is backed up ONCE to <save>.preimport, a
+ //    name no cleanup path (TeamInjector's purge included) ever deletes, and a
+ //    re-import never overwrites that first backup;
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 53713b4..23bda9a 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.3.1";
++constexpr char VERSION[] = "1.3.2";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+

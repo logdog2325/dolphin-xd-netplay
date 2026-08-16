@@ -138,7 +138,7 @@ something is wrong with your setup.
   Select=Backspace, D-pad=T/G/F/H, L/R=Q/W. The launcher's *GBA controls* row
   applies these in one click.
 - **macOS**: the app needs **Input Monitoring** permission to read the keyboard
-  at all. It asks on first launch; if it was denied, enable *DolphinQt* under
+  at all. It asks on first launch; if it was denied, enable *OrreLink* under
   System Settings → Privacy & Security → Input Monitoring and relaunch.
 - **Lag**: netplay uses almost no bandwidth, so only latency matters — close
   downloads and uploads during a match. The **buffer now sets itself** from
