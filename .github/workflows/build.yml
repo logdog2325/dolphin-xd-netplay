@@ -13,6 +13,10 @@ on:
         description: "Also build the macOS (arm64) desktop client"
         type: boolean
         default: false
+      build_linux:
+        description: "Also build the Linux (x86_64) desktop client"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -250,3 +254,84 @@ jobs:
         with:
           name: dolphin-xd-netplay-macos
           path: out/*.zip
+
+  linux:
+    # Same prepare/reconstruct as the others in the same run -- release as a
+    # matched set or netplay's build-hash gate keeps platforms apart.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_linux }}
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build cmake pkg-config libfuse2 \
+            libasound2-dev libpulse-dev libbluetooth-dev libevdev-dev \
+            libudev-dev libusb-1.0-0-dev libgl1-mesa-dev libxi-dev \
+            libxrandr-dev libxkbcommon-x11-dev libxcb-cursor-dev \
+            libgtk-3-dev
+          pipx install aqtinstall
+          aqt install-qt linux desktop 6.7.3 linux_gcc_64 -O "$HOME/qt"
+          echo "QT_ROOT=$HOME/qt/6.7.3/gcc_64" >> "$GITHUB_ENV"
+      - name: Configure
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT" \
+            -DLINUX_LOCAL_DEV=ON \
+            -DENABLE_AUTOUPDATE=OFF \
+            -DENABLE_TESTS=OFF \
+            -DUSE_MGBA=ON \
+            -DDISTRIBUTOR=xd-netplay
+      - name: Build
+        run: cmake --build build --target dolphin-emu
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          BIN="$(find build/Binaries -maxdepth 1 -type f -perm -111 | head -1)"
+          if [ -z "$BIN" ]; then echo "no binary produced" >&2; ls -la build/Binaries >&2; exit 1; fi
+          BINNAME="$(basename "$BIN")"
+          mkdir -p AppDir/usr/bin
+          cp "$BIN" AppDir/usr/bin/
+          # LINUX_LOCAL_DEV makes data lookups executable-relative: Sys rides
+          # beside the binary inside the image.
+          cp -r Data/Sys AppDir/usr/bin/Sys
+          # Icon comes from the CI repo's main branch (this checkout is the
+          # reconstructed Dolphin tree, which has no OrreLink art).
+          curl -fsSL -o orrelink-icon.png \
+            "https://raw.githubusercontent.com/${{ github.repository }}/main/configs/orrelink-icon.png"
+          cat > orrelink.desktop <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=OrreLink
+          Exec=$BINNAME
+          Icon=orrelink-icon
+          Categories=Game;Emulator;
+          DESKTOP
+          curl -fsSL -o linuxdeploy \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -fsSL -o linuxdeploy-plugin-qt \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          chmod +x linuxdeploy linuxdeploy-plugin-qt
+          export QMAKE="$QT_ROOT/bin/qmake"
+          export APPIMAGE_EXTRACT_AND_RUN=1
+          ./linuxdeploy --appdir AppDir \
+            -e "AppDir/usr/bin/$BINNAME" \
+            -d orrelink.desktop \
+            -i orrelink-icon.png \
+            --plugin qt \
+            --output appimage
+          mkdir -p out
+          mv OrreLink*.AppImage out/ 2>/dev/null || mv *.AppImage out/
+          ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-linux
+          path: out/
