@@ -1,4 +1,4 @@
-From ee6ad8ce2e8dd5e02ef4d7fe2e94ca3cbc06d5e8 Mon Sep 17 00:00:00 2001
+From 11df14c662504ca0e7c9b29b690ddfd641b49e3c Mon Sep 17 00:00:00 2001
 From: logdog2325 <loganjayfisher@gmail.com>
 Date: Sun, 16 Aug 2026 12:26:20 -0700
 Subject: [PATCH] Hosted sessions never sync an imported save
@@ -45,6 +45,7 @@ OrreLink.exe on Windows, an OrreLink binary on Linux, and a window title of
  Source/Core/DolphinLib.props                  |   2 +
  Source/Core/DolphinQt/CMakeLists.txt          |   4 +-
  Source/Core/DolphinQt/DolphinQt.vcxproj       |   5 +
+ Source/Core/DolphinQt/Info.plist.in           |   6 +-
  Source/Core/DolphinQt/MainWindow.cpp          |  22 +-
  .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  31 +-
  .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  20 +-
@@ -56,7 +57,7 @@ OrreLink.exe on Windows, an OrreLink binary on Linux, and a window title of
  Source/Core/UICommon/XDNetplay/SaveImport.cpp |  35 +-
  Source/Core/UICommon/XDNetplay/SaveImport.h   |   6 +-
  Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
- 22 files changed, 671 insertions(+), 35 deletions(-)
+ 23 files changed, 676 insertions(+), 36 deletions(-)
  create mode 100644 Source/Core/UICommon/XDNetplay/DisposableSave.cpp
  create mode 100644 Source/Core/UICommon/XDNetplay/DisposableSave.h
 
@@ -316,6 +317,23 @@ index 8d641de..6681eb0 100644
    <PropertyGroup Label="UserMacros" />
    <ItemDefinitionGroup>
      <ClCompile>
+diff --git a/Source/Core/DolphinQt/Info.plist.in b/Source/Core/DolphinQt/Info.plist.in
+index 96137af..3b681b7 100644
+--- a/Source/Core/DolphinQt/Info.plist.in
++++ b/Source/Core/DolphinQt/Info.plist.in
+@@ -33,7 +33,11 @@
+     <key>NSInputMonitoringUsageDescription</key>
+     <string>Dolphin reads the keyboard directly so it can be used as a game controller. Without this permission keyboard controls do nothing.</string>
+     <key>CFBundleExecutable</key>
+-    <string>DolphinQt</string>
++    <string>OrreLink</string>
++    <key>CFBundleName</key>
++    <string>OrreLink</string>
++    <key>CFBundleDisplayName</key>
++    <string>OrreLink</string>
+     <key>CFBundleIconFile</key>
+     <string>Dolphin.icns</string>
+     <key>CFBundleIdentifier</key>
 diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
 index c82df57..79a5df1 100644
 --- a/Source/Core/DolphinQt/MainWindow.cpp
