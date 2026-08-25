@@ -1,0 +1,110 @@
+From b5c8db20afe6bae780dd9d374a094cafc2e46666 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 25 Aug 2026 14:25:17 -0700
+Subject: [PATCH] Never build a mon with an empty nickname
+
+Gen 3 has no encoding for most of the world's scripts, and the Showdown
+importer's sanitizer drops what it cannot encode -- so a nickname written in
+Devanagari, Hangul, kanji or combining-mark noise collapsed to an empty
+string, and the builder wrote it into the mon. An empty nickname field is
+illegal in Gen 3: the games always fill it, species name by default, and the
+doubles battle engine refuses to offer such a mon as a target. In the field
+that read as "I can only target one of my opponents" in a netplay doubles
+battle, while every solo battle with editor-built teams was fine -- the guest
+had submitted a team whose nicknames spanned four scripts.
+
+The fix is the vanilla rule: a nickname that sanitizes to nothing becomes the
+species name, on both platforms' builders. Save-bundle submissions were never
+affected -- real saves cannot hold empty nicknames.
+
+Also, the session log now says when a stored Battle Style pick is no longer in
+the catalog instead of printing it as if it were live -- a curated-out music
+id logged as "music=7" cost this very investigation a detour.
+
+Version 1.3.3.
+---
+ .../dolphinemu/features/xdnetplay/gen3/MonFactory.kt  |  9 ++++++++-
+ Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp   | 11 +++++++++--
+ Source/Core/UICommon/XDNetplay/MonFactory.cpp         | 11 ++++++++++-
+ Source/Core/UICommon/XDNetplay/Version.h              |  2 +-
+ 4 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+index 55cfd15..7dfa7f3 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+@@ -106,8 +106,15 @@ object MonFactory {
+         val mon = Gen3Mon()
+         mon.pid = pid
+         mon.otId = trainerId
++        // Sanitize drops what Gen 3 cannot encode, so a nickname written entirely in another
++        // script collapses to NOTHING — and an empty nickname field is illegal in Gen 3 (the
++        // games always fill it, species name by default). The doubles battle engine refuses to
++        // offer such a mon as a target; found in the field by exactly that symptom. The fallback
++        // is the vanilla rule: no usable nickname means the species name.
+         mon.nicknameRaw = Gen3Text.encode(
+-            sanitizeText(set.nickname ?: set.species.uppercase()), 10
++            sanitizeText(set.nickname ?: set.species.uppercase())
++                .ifEmpty { sanitizeText(set.species.uppercase()) },
++            10
+         )
+         mon.language = LANGUAGE_ENGLISH
+         mon.otNameRaw = Gen3Text.encode(sanitizeText(trainerName), 7)
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index d552e54..f809396 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -653,8 +653,15 @@ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
+         "battlestyle sel host_model={} guest_model={}{} music={} venue={} -> block={} ou_disable={}",
+         id_or(sel.host_model > 0 ? std::optional<int>(sel.host_model) : std::nullopt),
+         id_or(guest_model), guest_submitted ? " (guest pick)" : "",
+-        sel.music > 0 ? fmt::format("{}", sel.music) : std::string{"default"},
+-        sel.venue > 0 ? fmt::format("{}", sel.venue) : std::string{"default"},
++        // Validity, not just non-zero: a stored pick that left the catalog
++        // (curated-out music, say) generates NO lines, and the log claiming it
++        // was live sent a whole debugging session sideways once.
++        IsValidMusicId(sel.music) ? fmt::format("{}", sel.music) :
++        sel.music > 0             ? fmt::format("default (stored {} not offered)", sel.music) :
++                                    std::string{"default"},
++        IsValidVenueId(sel.venue) ? fmt::format("{}", sel.venue) :
++        sel.venue > 0             ? fmt::format("default (stored {} not offered)", sel.venue) :
++                                    std::string{"default"},
+         active ? "active" : "empty", active && !ou_enabled ? 1 : 0));
+     if (active)
+       for (const std::string& op : SplitString(block, '\n'))
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.cpp b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+index 3d1f8ff..7701cd9 100644
+--- a/Source/Core/UICommon/XDNetplay/MonFactory.cpp
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+@@ -257,7 +257,16 @@ std::optional<Gen3Mon> Build(const ShowdownSet& set, const Gen3Data& data,
+ 
+   const std::array<int, 6> stats = ComputeStats(*species, level, ivs, evs, nature);
+ 
+-  const std::string nickname = SanitizeText(set.nickname ? *set.nickname : Upper(set.species));
++  // Sanitize drops what Gen 3 cannot encode, so a nickname written entirely in
++  // another script -- or pure zalgo -- collapses to NOTHING. An empty nickname
++  // field is illegal in Gen 3 (the games always fill it, species name by
++  // default), and the doubles battle engine refuses to offer such a mon as a
++  // target: one opponent becomes unselectable while everything else looks
++  // normal. Found in the field by exactly that symptom. The fallback is the
++  // vanilla rule: no usable nickname means the species name.
++  std::string nickname = SanitizeText(set.nickname ? *set.nickname : Upper(set.species));
++  if (nickname.empty())
++    nickname = SanitizeText(Upper(set.species));
+   const auto nickname_bytes = Gen3Text::Encode(nickname, 10, error);
+   if (!nickname_bytes)
+     return std::nullopt;
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 23bda9a..c7eb43f 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.3.2";
++constexpr char VERSION[] = "1.3.3";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
