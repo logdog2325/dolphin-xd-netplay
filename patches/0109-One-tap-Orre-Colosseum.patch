@@ -1,0 +1,1910 @@
+From bbd98ebee769a510ff7ab134758eb2ce9236823c Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 25 Aug 2026 18:24:07 -0700
+Subject: [PATCH] One tap: Orre Colosseum
+
+A Format selector joins the launcher -- Free, the default, changes nothing at
+all; Orre Colosseum makes the whole ruleset happen with no further clicks.
+
+In-game rules, pinned. Instead of guessing at clause bytes whose meanings are
+not all mapped, the preset writes the game's OWN stock LV100 tournament
+ruleset -- all 144 bytes, read from a clean main.dol -- into the Custom 1
+slot, changing exactly one value: entries becomes 4, for bring-6-pick-4. The
+menu globals pin to Double / Custom 1, and since the rules screen renders from
+those globals, it shows the truth. The venue stays on the field-proven record
+pin; the do-not-pin findings (the getter's rebuilt working buffer, the venue
+context field that races a random roll) are honored.
+
+Clauses the game cannot enforce, enforced where teams travel. Submissions --
+pastes and save bundles alike -- and the host's own two parties are validated:
+Gen 1-3 only, restricted legendaries and mythicals refused by name, no
+duplicate items, no duplicate species, no Soul Dew. Guests get the reason in
+room chat; a non-compliant host is blocked from opening the room at all; and
+anyone pasting a non-compliant team with the format on is told at paste time,
+long before any gate. Sleep, Freeze and Self-KO remain what they have always
+been -- honor rules -- and the UI says so rather than pretending.
+
+Rooms announce the format: hosted session names carry an [Orre] prefix.
+
+And the bundled default teams are now format-legal themselves: all six
+template mons held Leftovers, so a fresh install with the format on would have
+been refused by its own gate before hosting a single room -- the audit's
+sharpest catch. Each template mon now holds a distinct item, rewritten through
+the fork's own save library and validated by the fork's own rules code.
+
+Version 1.4.0.
+---
+ Data/Sys/XDNetplay/EMERALD-2.sav              | Bin 131088 -> 131088 bytes
+ Data/Sys/XDNetplay/EMERALD-3.sav              | Bin 131088 -> 131088 bytes
+ .../features/netplay/ui/NetplayActivity.kt    |  10 +
+ .../features/netplay/ui/NetplayScreen.kt      |  34 +++
+ .../features/settings/model/IntSetting.kt     |  12 +
+ .../features/xdnetplay/FormatBridge.kt        |  68 +++++
+ .../features/xdnetplay/XdMatchmaker.kt        |  25 +-
+ .../xdnetplay/ui/FindBattlesActivity.kt       |  18 +-
+ .../xdnetplay/ui/TeamEditorActivity.kt        |  22 ++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  15 ++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  55 +++-
+ .../app/src/main/res/values/strings.xml       |  12 +
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        |  99 ++++++-
+ Source/Android/jni/NetPlay/Netplay.cpp        |  17 ++
+ Source/Core/Core/Config/MainSettings.cpp      |   1 +
+ Source/Core/Core/Config/MainSettings.h        |  10 +
+ Source/Core/DolphinLib.props                  |   2 +
+ Source/Core/DolphinQt/MainWindow.cpp          |  18 ++
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  87 +++++++
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  35 ++-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.h    |   9 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  66 ++++-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |   5 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  10 +-
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |  10 +-
+ Source/Core/UICommon/CMakeLists.txt           |   2 +
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   |  59 ++++-
+ .../UICommon/XDNetplay/BattleCustomizer.h     |  14 +
+ .../Core/UICommon/XDNetplay/FormatRules.cpp   | 242 ++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/FormatRules.h  | 100 ++++++++
+ Source/Core/UICommon/XDNetplay/Gen3Data.h     |   3 +
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 105 ++++++++
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  21 ++
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 34 files changed, 1152 insertions(+), 36 deletions(-)
+ create mode 100644 Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+ create mode 100644 Source/Core/UICommon/XDNetplay/FormatRules.cpp
+ create mode 100644 Source/Core/UICommon/XDNetplay/FormatRules.h
+
+diff --git a/Data/Sys/XDNetplay/EMERALD-2.sav b/Data/Sys/XDNetplay/EMERALD-2.sav
+index dd99f2dabf32266cc3df90ea0ab3f463653f9e96..fd70e7c0058203b38cc636ecd84d1b2587659a10 100644
+GIT binary patch
+delta 123
+zcmV->0EGXLfC!L)2!ON!xS|11m${+=9Rbak*P;PM2MC)00Fe}6mm{MAT>-I|fujK(
+z0oa$HqX9)91%?0s2779bn0q>p8Dlq=`FjiQ4Ie*_0ee4=Uwey}1Ec{(0ZNxiqyZ@b
+d6}NMw0fP$&Vvi*t0SF}old%Cyw@I)8$4{RxDntMP
+
+delta 123
+zcmV->0EGXLfC!L)2!ON!xS|1ym${+=9RY}!*P;PM2R)kr0Fe|smm{MAT>-zBfujK(
+z0jiguqX9)98HNA=2779bn0q>p8Dlq=`FjiQ4Ie*_0ee4=UwikL1Ec{(0gabQqyZ@b
+dShsVe0fP$&PLL%a0SF}old%Cyw@I)8$4|cAD;)p;
+
+diff --git a/Data/Sys/XDNetplay/EMERALD-3.sav b/Data/Sys/XDNetplay/EMERALD-3.sav
+index c7e29edd9b86e86548dbabfd5c02e4e9e24a2658..349f1e701a011430a2ec7e259d070b69473a3dcb 100644
+GIT binary patch
+delta 123
+zcmV->0EGXLfC!L)2!ON!xS|11m${+=9Rbak*P;PM2MC)00Fe}6mm{MAT>-I|fujK(
+z0oa$HqX9)91%?0s2779bn0q>p8Dlq=`FjiQ4Ie*_0ee4=Uwey}1Ec{(0ZNxiqyZ@b
+d6}NMw0fP$&Vvi*t0SF}old%Cyw@I)8$4{RxDntMP
+
+delta 123
+zcmV->0EGXLfC!L)2!ON!xS|1ym${+=9RY}!*P;PM2R)kr0Fe|smm{MAT>-zBfujK(
+z0jiguqX9)98HNA=2779bn0q>p8Dlq=`FjiQ4Ie*_0ee4=UwikL1Ec{(0gabQqyZ@b
+dShsVe0fP$&PLL%a0SF}old%Cyw@I)8$4|cAD;)p;
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index 54a207e..1634c84 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -18,7 +18,9 @@ import kotlinx.coroutines.flow.onEach
+ import org.dolphinemu.dolphinemu.activities.EmulationActivity
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.model.NetplayViewModel
++import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.FormatBridge
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
+ import org.dolphinemu.dolphinemu.utils.NetworkHelper
+@@ -55,6 +57,12 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+         // lives, the sheet's own drafts already hold anything newer.
+         val submitPrefill = viewModel.submitPrefill()
+ 
++        // THIS device's Format pick, read once for the sheet's non-blocking
++        // paste-time note. Only advisory here: the room is governed by the
++        // HOST's key, enforced host-side in shared core (TeamInjector).
++        val orreFormatLocal =
++            FormatBridge.isOrreColosseum(IntSetting.MAIN_XD_FORMAT.int)
++
+         setContent {
+             DolphinTheme {
+                 NetplayScreen(
+@@ -71,6 +79,8 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     initialModelId = submitPrefill.modelId,
+                     initialUseMySave = submitPrefill.useMySave,
+                     modelOptions = modelOptions,
++                    orreFormatLocal = orreFormatLocal,
++                    validateTeamForFormat = FormatBridge::validateShowdown,
+                     game = viewModel.game.collectAsState().value,
+                     onStartGame = viewModel::startGame,
+                     onGameSelected = viewModel::changeGame,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 6fe26b1..d2ef0b8 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -155,6 +155,18 @@ fun NetplayScreen(
+     initialModelId: Int,
+     initialUseMySave: Boolean,
+     modelOptions: List<BattleStyleBridge.StyleOption>,
++    /**
++     * True when THIS device's Format pick is Orre Colosseum. Drives only the
++     * non-blocking paste-time note in the Submit Team sheet — the room is
++     * governed by the HOST's key, enforced host-side in shared core.
++     */
++    orreFormatLocal: Boolean,
++    /**
++     * Shared core's Orre Colosseum check of a Showdown draft
++     * (FormatBridge.validateShowdown): "" = no complaint, else one reason.
++     * Injected so previews need no native library.
++     */
++    validateTeamForFormat: (String) -> String,
+ ) {
+     val scrollState = rememberScrollState()
+     // XD Netplay: joiner's "Submit Team" sheet. Every field opens pre-filled
+@@ -247,6 +259,26 @@ fun NetplayScreen(
+                         enabled = !useMySave,
+                         modifier = Modifier.fillMaxWidth().height(220.dp)
+                     )
++                    // Paste-time Orre Colosseum note, shown immediately while
++                    // the local Format pick is Orre. NEVER blocking: Send
++                    // stays enabled — the note exists so a refusal from the
++                    // host's gate is no surprise. (A pokepast.es link parses
++                    // to nothing and gets no note; the host still enforces on
++                    // the fetched text. The bundle path has no draft to check
++                    // here — the host's gate judges the sent party.)
++                    if (orreFormatLocal && !useMySave) {
++                        val formatReason = remember(teamDraft) {
++                            validateTeamForFormat(teamDraft)
++                        }
++                        if (formatReason.isNotEmpty()) {
++                            Spacer(Modifier.height(4.dp))
++                            Text(
++                                stringResource(R.string.xd_format_note, formatReason),
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.error
++                            )
++                        }
++                    }
+                 }
+             },
+             confirmButton = {
+@@ -1554,6 +1586,8 @@ private fun PreviewNetplayScreen() {
+         initialModelId = 0,
+         initialUseMySave = false,
+         modelOptions = emptyList(),
++        orreFormatLocal = false,
++        validateTeamForFormat = { "" },
+ //        saveTransferProgress = SaveTransferProgress(
+ //            title = "Title",
+ //            totalSize = 1024L,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+index afd714d..e26324e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+@@ -197,6 +197,18 @@ enum class IntSetting(
+         Settings.SECTION_INI_XD_NETPLAY,
+         "SubmitModel",
+         0
++    ),
++
++    // The one-tap battle FORMAT pick, persisted like the Battle Style keys.
++    // Same key as the C++ MAIN_XD_FORMAT; values are FormatBridge.FORMAT_*:
++    // 0 = Free (default — no validation runs anywhere), 1 = Orre Colosseum.
++    // The HOST's value governs a room; a joiner's own value only drives local
++    // paste-time notes. Unknown values behave as Free, never clamped.
++    MAIN_XD_FORMAT(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "Format",
++        0
+     );
+ 
+     override val isOverridden: Boolean
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+new file mode 100644
+index 0000000..b060393
+--- /dev/null
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+@@ -0,0 +1,68 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++package org.dolphinemu.dolphinemu.features.xdnetplay
++
++import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
++
++/**
++ * Kotlin side of the battle-FORMAT bridge in
++ * Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp — the one-tap Format pick
++ * (Free / Orre Colosseum) for XD GBA-vs-GBA netplay.
++ *
++ * This exposes VALIDATION only, and validation is deliberately not duplicated
++ * in Kotlin: the ruleset — the restricted-species ban list, Species Clause,
++ * Item Clause, the Soul Dew ban — lives ONLY in shared core
++ * (UICommon/XDNetplay/FormatRules), which is also what the two enforcing gates
++ * run: the host gate inside nativeHost and the guest-submission gate inside
++ * the host's TeamInjector. Everything returned here is a NON-BLOCKING
++ * paste-time note; the gates never consult this bridge.
++ *
++ * The Format key itself is plain config (Main / XDNetplay / Format), persisted
++ * through the settings model as [IntSetting.MAIN_XD_FORMAT]
++ * (org.dolphinemu.dolphinemu.features.settings.model.IntSetting) exactly like
++ * the Battle Style picks — no native setter lives here.
++ *
++ * The HOST's key governs a room; a joiner's own key only drives their local
++ * paste-time notes.
++ */
++object FormatBridge {
++    /** Values of the Format config key, matching FormatRules::FORMAT_* in C++. */
++    const val FORMAT_FREE = 0
++    const val FORMAT_ORRE_COLOSSEUM = 1
++
++    /**
++     * True only for the exact Orre Colosseum value, matching
++     * FormatRules::IsOrreColosseum: an unknown/garbage key value behaves as
++     * Free (no notes, no enforcement), never as a surprise lockout.
++     */
++    fun isOrreColosseum(formatKeyValue: Int): Boolean =
++        formatKeyValue == FORMAT_ORRE_COLOSSEUM
++
++    /**
++     * Orre Colosseum check of a Showdown team export, using shared core's own
++     * parser and name resolution (so "KYOGRE", "Mr. Mime" and "soul dew"
++     * resolve exactly as they will at build time, and a set the builder would
++     * refuse anyway is skipped rather than misreported). Returns "" when the
++     * paste is legal — or unparseable, e.g. a pokepast.es LINK, which cannot
++     * be inspected without fetching; the host's gate still enforces on the
++     * fetched text. Otherwise one human-readable reason, e.g.
++     * "banned species: Kyogre" or "duplicate item: Leftovers (x2)".
++     */
++    fun validateShowdown(text: String): String = nativeValidateShowdown(text)
++
++    /**
++     * Orre Colosseum check of built party mons (the team editor's in-memory
++     * party). Species travel as INTERNAL (Hoenn) ids exactly as [Gen3Mon]
++     * holds them; shared core maps them to National dex numbers before the ban
++     * list applies. Returns "" when legal, else one human-readable reason
++     * naming the mon or item.
++     */
++    fun validateParty(party: List<Gen3Mon>): String = nativeValidateParty(
++        party.map { it.species }.toIntArray(),
++        party.map { it.heldItem }.toIntArray()
++    )
++
++    private external fun nativeValidateShowdown(text: String): String
++
++    private external fun nativeValidateParty(species: IntArray, items: IntArray): String
++}
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+index 96dd7cd..c1a7fcb 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+@@ -28,15 +28,21 @@ object XdMatchmaker {
+      * Dolphin's public session index:
+      *
+      *     XD [OC] <nickname>            ("OC" = Open Challenge)
++     *     [Orre] XD [OC] <nickname>     when the host's Format pick is
++     *                                   Orre Colosseum
+      *
+      * The IDENTICAL format lives in XDNetplayConfig.cpp::MakeOpenSessionName on
+      * desktop. Keep the two in sync — it is the only thing that lets a human
+      * scanning the lobby and the auto-matcher agree on what an XD room is.
+      *
+-     * Matching itself never keys off the name (see [pickMatch]); the tag is for
+-     * people, so a differently named open room is still joinable.
++     * Matching itself never keys off the name (see [pickMatch]); the tags are
++     * for people, so a differently named open room is still joinable. The
++     * "[Orre] " prefix in particular is a human-readable label only — this
++     * patch adds no matchmaking filter for it, and a Free room's name is
++     * byte-identical to before the Format feature existed.
+      */
+     const val SESSION_NAME_PREFIX = "XD [OC] "
++    const val ORRE_TAG = "[Orre] "
+ 
+     const val FILE = Settings.FILE_DOLPHIN
+     const val SECTION = Settings.SECTION_INI_NETPLAY
+@@ -48,8 +54,19 @@ object XdMatchmaker {
+     /** Default publish region. Only ever a browser filter — [pickMatch] ignores it. */
+     const val DEFAULT_REGION = "NA"
+ 
+-    fun sessionName(nickname: String): String =
+-        SESSION_NAME_PREFIX + nickname.ifEmpty { "Player" }
++    /**
++     * The name a room this device hosts should publish under. [orreFormat]
++     * defaults to the device's own Format pick — the caller IS the host on
++     * every publish path — and is overridable so [FindBattlesActivity] can
++     * recognize both auto-name shapes regardless of the current pick.
++     */
++    fun sessionName(
++        nickname: String,
++        orreFormat: Boolean = FormatBridge.isOrreColosseum(IntSetting.MAIN_XD_FORMAT.int)
++    ): String {
++        val base = SESSION_NAME_PREFIX + nickname.ifEmpty { "Player" }
++        return if (orreFormat) ORRE_TAG + base else base
++    }
+ 
+     /**
+      * Picks the room "Search for Match" should join, or null to host instead.
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+index c0fe186..b12cc39 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+@@ -203,15 +203,27 @@ class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
+ 
+     private fun loadPublishPrefs() {
+         // Same "XD [OC] <nickname>" shape the auto-matcher publishes, so a
+-        // hand-published room reads identically in the lobby.
+-        val defaultName = XdMatchmaker.sessionName(StringSetting.NETPLAY_NICKNAME.string)
++        // hand-published room reads identically in the lobby. sessionName()
++        // reads the Format pick, so the prefill carries the "[Orre] " tag
++        // exactly when a room hosted right now would.
++        val nickname = StringSetting.NETPLAY_NICKNAME.string
++        val defaultName = XdMatchmaker.sessionName(nickname)
++        // A stored name matching EITHER auto-shape is an auto-name from an
++        // earlier publish, not something the user typed — recompute it, so a
++        // "[Orre] " tag stuck in config from a previous pick can never
++        // mislabel a Free room (or vice versa). Hand-typed names pass through
++        // untouched.
++        val autoNames = setOf(
++            XdMatchmaker.sessionName(nickname, orreFormat = false),
++            XdMatchmaker.sessionName(nickname, orreFormat = true)
++        )
+         uiState = uiState.copy(
+             publishEnabled = NativeConfig.getBoolean(
+                 NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_USE_INDEX, false
+             ),
+             publishName = NativeConfig.getString(
+                 NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_INDEX_NAME, ""
+-            ).ifEmpty { defaultName },
++            ).let { if (it.isEmpty() || it in autoNames) defaultName else it },
+             publishRegion = NativeConfig.getString(
+                 NativeConfig.LAYER_ACTIVE, FILE, SECTION, KEY_INDEX_REGION, ""
+             ).ifEmpty { "NA" },
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index 5f03260..7dfabdb 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -18,7 +18,9 @@ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+ import org.dolphinemu.dolphinemu.R
+ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
++import org.dolphinemu.dolphinemu.features.settings.model.IntSetting
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
++import org.dolphinemu.dolphinemu.features.xdnetplay.FormatBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.EmeraldSave
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Data
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Game
+@@ -378,9 +380,27 @@ class TeamRepo(private val context: Context) {
+             party = built
+             messages.add(0, "Imported ${built.size} Pokémon (replaced party)")
+         }
++        orreFormatNote()?.let { messages += it }
+         return messages
+     }
+ 
++    /**
++     * Non-blocking Orre Colosseum note for the CURRENT party, or null when
++     * there is nothing to say — including whenever this device's Format pick
++     * is Free, where no validation call is made at all. Shown after imports
++     * and saves so a later refusal from a host's gate is no surprise; the
++     * ruleset itself lives only in shared core (FormatRules, via
++     * [FormatBridge]), so this note and that refusal can never disagree.
++     * Importing and saving are deliberately never blocked by it: the pick may
++     * be for a room someone else will host, and Free rooms take any team.
++     */
++    private fun orreFormatNote(): String? {
++        if (!FormatBridge.isOrreColosseum(IntSetting.MAIN_XD_FORMAT.int)) return null
++        val reason = FormatBridge.validateParty(party)
++        if (reason.isEmpty()) return null
++        return context.getString(R.string.xd_format_note, reason)
++    }
++
+     fun removeAt(index: Int) {
+         if (index in party.indices) party.removeAt(index)
+     }
+@@ -424,6 +444,8 @@ class TeamRepo(private val context: Context) {
+             tmp.writeBytes(out)
+             check(tmp.renameTo(path)) { "could not replace ${path.name}" }
+             messages.add(0, "Saved ${party.size} Pokémon as ${s.trainerName} to ${path.name} ✓ verified")
++            // The save went through regardless — the format note never blocks.
++            orreFormatNote()?.let { messages += it }
+             messages
+         } catch (e: Exception) {
+             listOf("NOT saved — ${e.message ?: "verification failed"}")
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 0a1d767..a0a4ca1 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -27,6 +27,7 @@ import org.dolphinemu.dolphinemu.features.netplay.NetplayManager
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplayActivity
+ import org.dolphinemu.dolphinemu.features.netplay.ui.NetplaySetupActivity
+ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.FormatBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
+ import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.SaveImportBridge
+@@ -78,6 +79,13 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var musicId by mutableStateOf(0)
+     private var venueId by mutableStateOf(0)
+ 
++    // The one-tap battle FORMAT pick (Free / Orre Colosseum), persisted in the
++    // native Main/XDNetplay/Format key via the settings model, exactly like
++    // the Battle Style picks above. The key's value is what the enforcing
++    // gates in shared core read when this device hosts; a pick here is
++    // already "applied".
++    private var formatId by mutableStateOf(FormatBridge.FORMAT_FREE)
++
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+     private var searching by mutableStateOf(false)
+ 
+@@ -338,6 +346,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                         venueId = id
+                         BattleStyleBridge.setSelection(BattleStyleBridge.SELECTION_VENUE, id)
+                     },
++                    formatId = formatId,
++                    onFormatChanged = { id ->
++                        formatId = id
++                        IntSetting.MAIN_XD_FORMAT.setInt(NativeConfig.LAYER_BASE, id)
++                        NativeConfig.save(NativeConfig.LAYER_BASE)
++                    },
+                     onBattle = { NetplaySetupActivity.launch(this) },
+                     onSearchForMatch = { searchForMatch() },
+                     searching = searching,
+@@ -545,6 +559,7 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+             BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_GUEST_MODEL_FALLBACK)
+         musicId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_MUSIC)
+         venueId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_VENUE)
++        formatId = IntSetting.MAIN_XD_FORMAT.int
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index d36a43b..8e5e21d 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -36,6 +36,7 @@ import androidx.compose.ui.text.font.FontWeight
+ import androidx.compose.ui.unit.dp
+ import org.dolphinemu.dolphinemu.R
+ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.FormatBridge
+ 
+ /**
+  * What the Save Files card shows for one GBA socket. Assembled by
+@@ -84,6 +85,8 @@ fun XDLauncherScreen(
+     onGuestModelChanged: (Int) -> Unit,
+     onMusicChanged: (Int) -> Unit,
+     onVenueChanged: (Int) -> Unit,
++    formatId: Int,
++    onFormatChanged: (Int) -> Unit,
+     onSearchForMatch: () -> Unit,
+     searching: Boolean,
+     onFindBattles: () -> Unit,
+@@ -178,12 +181,14 @@ fun XDLauncherScreen(
+                     Switch(checked = cheatsEnabled, onCheckedChange = onCheatsChanged)
+                 }
+                 Spacer(Modifier.height(12.dp))
+-                // Cosmetic battle-style selectors, host-side. The guest picks
+-                // its OWN model in the room's Submit Team sheet; the "Guest
+-                // model" dropdown here is only the fallback when they never do
+-                // (mirroring the socket-3 team fallback). All of it is
+-                // assembled into one synced AR code by shared core at Start —
+-                // "Game default" means the code is genuinely absent.
++                // The battle Format pick plus the cosmetic battle-style
++                // selectors, host-side. The guest picks its OWN model in the
++                // room's Submit Team sheet; the "Guest model" dropdown here is
++                // only the fallback when they never do (mirroring the socket-3
++                // team fallback). The cosmetics are assembled into one synced
++                // AR code by shared core at Start — "Game default" means the
++                // code is genuinely absent — while the Format key is read by
++                // the enforcing gates when this device hosts.
+                 BattleStyleCard(
+                     modelOptions = modelOptions,
+                     musicOptions = musicOptions,
+@@ -195,7 +200,9 @@ fun XDLauncherScreen(
+                     onHostModelChanged = onHostModelChanged,
+                     onGuestModelChanged = onGuestModelChanged,
+                     onMusicChanged = onMusicChanged,
+-                    onVenueChanged = onVenueChanged
++                    onVenueChanged = onVenueChanged,
++                    formatId = formatId,
++                    onFormatChanged = onFormatChanged
+                 )
+                 Spacer(Modifier.height(12.dp))
+                 // The headline action: no codes to trade, no lobby to read.
+@@ -259,7 +266,9 @@ private fun BattleStyleCard(
+     onHostModelChanged: (Int) -> Unit,
+     onGuestModelChanged: (Int) -> Unit,
+     onMusicChanged: (Int) -> Unit,
+-    onVenueChanged: (Int) -> Unit
++    onVenueChanged: (Int) -> Unit,
++    formatId: Int,
++    onFormatChanged: (Int) -> Unit
+ ) {
+     Card(modifier = Modifier.fillMaxWidth()) {
+         Column(
+@@ -271,6 +280,36 @@ private fun BattleStyleCard(
+                 style = MaterialTheme.typography.titleMedium,
+                 fontWeight = FontWeight.SemiBold
+             )
++            // The one-tap battle FORMAT pick. Unlike everything below it is
++            // NOT cosmetic — with Orre Colosseum picked, hosting validates
++            // both host-side parties, and guest submissions are gated (shared
++            // core's FormatRules; the honor clauses in the hint stay
++            // unenforced by design). It therefore sits above the
++            // "Cosmetic only" hint, which introduces the style dropdowns.
++            // The dropdown reuses BattleStyleDropdown: the default entry
++            // (id 0) is Free, so an unknown key value renders as Free —
++            // matching how the core treats it (no enforcement, no clamp).
++            BattleStyleDropdown(
++                label = stringResource(R.string.xd_format_label),
++                options = listOf(
++                    BattleStyleBridge.StyleOption(
++                        id = FormatBridge.FORMAT_ORRE_COLOSSEUM,
++                        name = stringResource(R.string.xd_format_orre),
++                        experimental = false
++                    )
++                ),
++                selectedId = formatId,
++                defaultLabel = stringResource(R.string.xd_format_free),
++                onSelected = onFormatChanged,
++                modifier = Modifier.fillMaxWidth(),
++                supportingText = stringResource(
++                    if (formatId == FormatBridge.FORMAT_ORRE_COLOSSEUM) {
++                        R.string.xd_format_hint_orre
++                    } else {
++                        R.string.xd_format_hint_free
++                    }
++                )
++            )
+             Text(
+                 text = stringResource(R.string.xd_style_section_hint),
+                 style = MaterialTheme.typography.bodySmall,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 7589bcd..58937fb 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1128,6 +1128,18 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_style_submit_model_label">Trainer model</string>
+     <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
+ 
++    <!-- One-tap battle Format pick (Free / Orre Colosseum). The option names
++         match FormatRules::FormatDisplayName in shared core so dropdowns and
++         refusal messages agree across platforms. -->
++    <string name="xd_format_label">Format</string>
++    <string name="xd_format_free">Free</string>
++    <string name="xd_format_orre">Orre Colosseum</string>
++    <string name="xd_format_hint_free">No team rules — anything a Gen 3 save can hold.</string>
++    <string name="xd_format_hint_orre">Applies to rooms you host (listed with an [Orre] tag): no Mewtwo, Mew, Lugia, Ho-Oh, Celebi, Kyogre, Groudon, Rayquaza, Jirachi, or Deoxys; no duplicate species; no duplicate held items; Soul Dew banned. Sleep, Freeze, and Self-KO clauses are honor rules — not enforced.</string>
++    <!-- Non-blocking paste-time note; %1$s is a reason from shared core,
++         e.g. "banned species: Kyogre". -->
++    <string name="xd_format_note">note: this team is not Orre Colosseum legal - %1$s</string>
++
+     <!-- XD Netplay: joiner's Submit Team sheet, "Use my save" (party-bundle)
+          mode. Refusal messages (FireRed/LeafGreen save, empty party, ...) come
+          from the shared core and are not duplicated here. -->
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index 8e3d565..f236c9e 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -5,8 +5,10 @@
+ // default https://lobby.dolphin-emu.org), plus the three other small xdnetplay-package bridges
+ // that share this file: the XD Netplay release check (second extern "C" group; Kotlin
+ // counterpart features/xdnetplay/UpdateCheckBridge), the cosmetic battle-style selectors
+-// (third group; Kotlin counterpart features/xdnetplay/BattleStyleBridge), and the per-port
+-// user-save import (fourth group; Kotlin counterpart features/xdnetplay/SaveImportBridge).
++// (third group; Kotlin counterpart features/xdnetplay/BattleStyleBridge), the per-port
++// user-save import (fourth group; Kotlin counterpart features/xdnetplay/SaveImportBridge), and the
++// battle-format paste-time validation (fifth group; Kotlin counterpart
++// features/xdnetplay/FormatBridge).
+ //
+ // Listing only. Publishing is deliberately NOT exposed here: Core's NetPlayServer
+ // already owns a NetPlayIndex (NetPlayServer::m_index) and publishes automatically
+@@ -35,6 +37,7 @@
+ 
+ #include <jni.h>
+ 
++#include <algorithm>
+ #include <map>
+ #include <mutex>
+ #include <optional>
+@@ -48,7 +51,11 @@
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/DisposableSave.h"
++#include "UICommon/XDNetplay/FormatRules.h"
++#include "UICommon/XDNetplay/Gen3Data.h"
++#include "UICommon/XDNetplay/Gen3Mon.h"
+ #include "UICommon/XDNetplay/SaveImport.h"
++#include "UICommon/XDNetplay/ShowdownParser.h"
+ #include "UICommon/XDNetplay/UpdateCheck.h"
+ #include "UICommon/XDNetplay/Version.h"
+ 
+@@ -90,6 +97,19 @@ jobjectArray StyleTableToJava(JNIEnv* env,
+   }
+   return SpanToJStringArray(env, flat);
+ }
++
++// Format-bridge helper: the bundled gen3data.json, parsed once and cached for
++// the process (the file is static data, and the Submit Team sheet revalidates
++// on every draft edit -- reparsing 70 KB of JSON per keystroke would be
++// wasteful). Returns nullptr when the file is unreadable, in which case the
++// validators below report "legal": a paste-time note must NEVER block, and the
++// enforcing gates in shared core (TeamInjector) do their own loud refusals in
++// that state.
++const XDNetplay::Gen3Data* CachedGen3Data()
++{
++  static const std::optional<XDNetplay::Gen3Data> s_data = XDNetplay::Gen3Data::LoadBundled();
++  return s_data ? &*s_data : nullptr;
++}
+ }  // namespace
+ 
+ extern "C" {
+@@ -424,4 +444,79 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_SaveImportBridge_nativeRestore
+   return SpanToJStringArray(env, outcome);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Format bridge (Kotlin counterpart: features/xdnetplay/FormatBridge)
++// ---------------------------------------------------------------------------
++//
++// PASTE-TIME validation for the one-tap FORMAT pick (Free / Orre Colosseum).
++// The ruleset lives ONLY in UICommon/XDNetplay/FormatRules -- the same code
++// the enforcing gates run (the host gate in nativeHost, the guest-submission
++// gate in the host's TeamInjector) -- so a note shown here and a refusal shown
++// there can never disagree. These entry points are advisory by contract: the
++// Kotlin callers render the result as a non-blocking "note:" and still allow
++// saving/pasting; only the gates block. The callers also check the local
++// Format key BEFORE calling, so with Format = Free no validation call is ever
++// made.
++//
++// Both return "" for "no complaint" (legal, or nothing parseable/readable to
++// judge) and otherwise one human-readable reason from FormatRules, e.g.
++// "banned species: Kyogre" / "duplicate item: Leftovers (x2)".
++
++// Showdown-text form (the Submit Team sheet's draft). Shared core's own
++// parser + Gen3Data resolution, so names resolve exactly as MonFactory will
++// resolve them at build time. A pokepast.es LINK parses to no sets and gets no
++// note -- it cannot be inspected without fetching; the host's gate still
++// enforces on the fetched text.
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_FormatBridge_nativeValidateShowdown(
++    JNIEnv* env, jobject, jstring jtext)
++{
++  const XDNetplay::Gen3Data* data = CachedGen3Data();
++  if (data == nullptr)
++    return ToJString(env, "");
++
++  const XDNetplay::FormatRules::Verdict verdict = XDNetplay::FormatRules::ValidateSets(
++      XDNetplay::ShowdownParser::ParseTeam(GetJString(env, jtext)), *data);
++  return ToJString(env, verdict.ok ? std::string{} : verdict.reason);
++}
++
++// Built-mon form (the team editor's in-memory party): parallel arrays of
++// INTERNAL (Hoenn) species ids and held-item ids, exactly as Kotlin's Gen3Mon
++// carries them; FormatRules maps internal ids to National dex numbers before
++// the ban list applies, and item/species display names in the reason come
++// from Gen3Data.
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_FormatBridge_nativeValidateParty(
++    JNIEnv* env, jobject, jintArray jspecies, jintArray jitems)
++{
++  const XDNetplay::Gen3Data* data = CachedGen3Data();
++  if (data == nullptr)
++    return ToJString(env, "");
++
++  const jsize species_len = env->GetArrayLength(jspecies);
++  const jsize items_len = env->GetArrayLength(jitems);
++  const jsize count = std::min(species_len, items_len);
++  std::vector<jint> species(static_cast<size_t>(std::max<jsize>(count, 0)));
++  std::vector<jint> items(species.size());
++  if (count > 0)
++  {
++    env->GetIntArrayRegion(jspecies, 0, count, species.data());
++    env->GetIntArrayRegion(jitems, 0, count, items.data());
++  }
++
++  // Only the two FormatRules inputs are populated; pid stays 0, so a
++  // species-0 entry reads as an empty slot (Gen3Mon::IsEmpty) and is skipped
++  // rather than misjudged.
++  std::vector<XDNetplay::Gen3Mon> party(species.size());
++  for (size_t i = 0; i < species.size(); i++)
++  {
++    party[i].species = static_cast<u32>(species[i]);
++    party[i].held_item = static_cast<u32>(items[i]);
++  }
++
++  const XDNetplay::FormatRules::Verdict verdict =
++      XDNetplay::FormatRules::ValidateParty(party, *data);
++  return ToJString(env, verdict.ok ? std::string{} : verdict.reason);
++}
++
+ }  // extern "C"
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index aa55a52..8849467 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -257,6 +257,23 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeHost(JNIEnv
+   const u16 host_port = is_traversal ? Config::Get(Config::NETPLAY_LISTEN_PORT) :
+                                        Config::Get(Config::NETPLAY_HOST_PORT);
+ 
++  // FORMAT host gate (mirrors the desktop MainWindow::NetPlayHost hook): with
++  // the Format pick on Orre Colosseum, the host's port-2 party and port-3
++  // guest-fallback party must both be legal before a room can open. Runs
++  // BEFORE the disposable-save swap so a refusal leaves nothing swapped, and
++  // ships its reason through the same connection-error surface the FRLG/
++  // disposable hosting refusal uses. Format = Free: one int compare, hosting
++  // untouched.
++  if (std::string format_reason; !XDNetplay::ValidateHostPartiesForFormat(&format_reason))
++  {
++    if (ui)
++    {
++      ui->OnConnectionError("Cannot host an Orre Colosseum room: " + format_reason +
++                            " - fix the team, or switch the Format back to Free");
++    }
++    return 0;
++  }
++
+   // Disposable host saves (mirrors the desktop MainWindow::NetPlayHost hook):
+   // if a GBA port holds a user-imported save, swap in a rebuilt save carrying
+   // only its party and trainer identity BEFORE the server exists -- netplay
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index 914484f..f390b9a 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -427,6 +427,7 @@ const Info<int> MAIN_XD_STYLE_HOST_MODEL{{System::Main, "XDNetplay", "StyleHostM
+ const Info<int> MAIN_XD_STYLE_GUEST_MODEL{{System::Main, "XDNetplay", "StyleGuestModel"}, 0};
+ const Info<int> MAIN_XD_STYLE_MUSIC{{System::Main, "XDNetplay", "StyleMusic"}, 0};
+ const Info<int> MAIN_XD_STYLE_VENUE{{System::Main, "XDNetplay", "StyleVenue"}, 0};
++const Info<int> MAIN_XD_FORMAT{{System::Main, "XDNetplay", "Format"}, 0};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_2{{System::Main, "XDNetplay", "ImportedSave2"}, ""};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_3{{System::Main, "XDNetplay", "ImportedSave3"}, ""};
+ const Info<std::string> MAIN_XD_SUBMIT_TEAM_B64{{System::Main, "XDNetplay", "SubmitTeamB64"}, ""};
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index 454a5b5..de79601 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -247,6 +247,16 @@ extern const Info<int> MAIN_XD_STYLE_GUEST_MODEL;  // fallback only; the guest's
+ extern const Info<int> MAIN_XD_STYLE_MUSIC;
+ extern const Info<int> MAIN_XD_STYLE_VENUE;
+ 
++// The one-tap battle FORMAT pick, persisted like the Battle Style keys and
++// offered by the same launcher area on both platforms. Values are
++// XDNetplay::FormatRules::FORMAT_*: 0 = Free (default -- no validation runs
++// anywhere, sessions stay byte-identical to a build without the feature),
++// 1 = Orre Colosseum (species ban list, Species Clause, Item Clause, Soul Dew
++// ban; see UICommon/XDNetplay/FormatRules.h). The HOST's value governs a room;
++// a joiner's own value is irrelevant while joining. Unknown values behave as
++// Free, never clamped.
++extern const Info<int> MAIN_XD_FORMAT;
++
+ // Display filename of the user save imported over a GBA socket's team save by
+ // UICommon/XDNetplay/SaveImport; "" = the bundled team-editor save. Display
+ // only: the authoritative "was imported" signal is SaveImport::HasImportBackup
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 90f1cf1..7c8a7bc 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -598,6 +598,7 @@
+     <ClInclude Include="UICommon\UICommon.h" />
+     <ClInclude Include="UICommon\XDNetplay\BattleCustomizer.h" />
+     <ClInclude Include="UICommon\XDNetplay\DisposableSave.h" />
++    <ClInclude Include="UICommon\XDNetplay\FormatRules.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Data.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Mon.h" />
+     <ClInclude Include="UICommon\XDNetplay\Gen3Save.h" />
+@@ -1314,6 +1315,7 @@
+     <ClCompile Include="UICommon\UICommon.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\BattleCustomizer.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\DisposableSave.cpp" />
++    <ClCompile Include="UICommon\XDNetplay\FormatRules.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Data.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Mon.cpp" />
+     <ClCompile Include="UICommon\XDNetplay\Gen3Save.cpp" />
+diff --git a/Source/Core/DolphinQt/MainWindow.cpp b/Source/Core/DolphinQt/MainWindow.cpp
+index 79a5df1..afe2d36 100644
+--- a/Source/Core/DolphinQt/MainWindow.cpp
++++ b/Source/Core/DolphinQt/MainWindow.cpp
+@@ -134,6 +134,7 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/Version.h"
+ #include "UICommon/XDNetplay/DisposableSave.h"
++#include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/ResourcePack/Manager.h"
+ #include "UICommon/ResourcePack/ResourcePack.h"
+ 
+@@ -1811,6 +1812,23 @@ bool MainWindow::NetPlayHost(const UICommon::GameFile& game)
+   if (is_traversal)
+     host_port = Config::Get(Config::NETPLAY_LISTEN_PORT);
+ 
++  // FORMAT host gate: with the launcher's Format pick on Orre Colosseum, the
++  // host's own port-2 party and the port-3 guest-fallback party must both be
++  // legal (both will be played under the room's rules). Runs BEFORE the
++  // disposable-save swap below so a refusal leaves nothing swapped -- and the
++  // verdict is identical either way, since the disposable carries exactly the
++  // import's party. With Format = Free this is one int compare and hosting is
++  // untouched. The reason names the offending mon/item and which slot.
++  if (std::string format_reason; !XDNetplay::ValidateHostPartiesForFormat(&format_reason))
++  {
++    ModalMessageBox::critical(
++        nullptr, tr("OrreLink"),
++        tr("Cannot host an Orre Colosseum room: %1\n\nFix the team in the Team Editor, or "
++           "switch the Format back to Free.")
++            .arg(QString::fromStdString(format_reason)));
++    return false;
++  }
++
+   // Disposable host saves: if a GBA port holds a user-imported save, swap in a
+   // rebuilt save carrying only its party and trainer identity BEFORE the
+   // server exists -- netplay syncs the host's GBA socket saves to every
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 6b571e0..3db720c 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -30,6 +30,7 @@
+ #include <QVBoxLayout>
+ 
+ #include <algorithm>
++#include <memory>
+ #include <optional>
+ #include <thread>
+ #include <utility>
+@@ -77,8 +78,11 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/DisposableSave.h"
++#include "UICommon/XDNetplay/FormatRules.h"
++#include "UICommon/XDNetplay/Gen3Data.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/PartyBundle.h"
++#include "UICommon/XDNetplay/ShowdownParser.h"
+ #include "UICommon/XDNetplay/TeamInjector.h"
+ #include "UICommon/UICommon.h"
+ 
+@@ -1023,6 +1027,89 @@ void NetPlayDialog::OnSubmitTeam()
+   team_edit->setPlaceholderText(tr("Showdown export or pokepast.es link"));
+   dialog_layout->addWidget(team_edit, 1);
+ 
++  // Paste-time FORMAT feedback (FormatRules.h): with the LOCAL Format pick on
++  // Orre Colosseum, a live note under the paste box says when the team about
++  // to be sent breaks that ruleset -- the same wording the Team Editor uses --
++  // so a violation is learned here, not from the host's refusal arriving in
++  // room chat. NEVER blocking: Send stays enabled whatever the note says,
++  // because only the HOST's format governs a room and this host may well be
++  // running Free. Nothing here can check what the host runs; the note is
++  // keyed off the local pick as agreed feedback, not enforcement. A
++  // pokepast.es link parses to no sets, so it draws no note (checking it
++  // would mean fetching it -- the send path resolves links later anyway).
++  // With the local pick on Free none of this exists: no label in the layout,
++  // no parse, no validation call, ever.
++  if (XDNetplay::FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT)))
++  {
++    // Game data loads once per dialog open; on failure (broken install) the
++    // note simply never appears -- feedback is a courtesy, never a judge.
++    std::shared_ptr<const XDNetplay::Gen3Data> format_data;
++    if (auto loaded = XDNetplay::Gen3Data::LoadBundled())
++      format_data = std::make_shared<const XDNetplay::Gen3Data>(std::move(*loaded));
++    if (format_data)
++    {
++      auto* format_note = new QLabel(&dialog);
++      format_note->setWordWrap(true);
++      format_note->hide();
++      dialog_layout->addWidget(format_note);
++
++      // Everything is captured by value (widget pointers parented to the
++      // stack dialog, plus the shared_ptr); the connections die with the
++      // dialog, so nothing here outlives what it touches.
++      const auto update_format_note = [format_note, team_edit, use_save_check, format_data] {
++        QString reason;
++        if (use_save_check->isChecked())
++        {
++#ifdef HAS_LIBMGBA
++          // Bundle mode sends the port-2 save's party: validate those actual
++          // bytes, resolved exactly as the send path below resolves them.
++          // Any read problem stays silent here -- the send path owns those
++          // errors and words them better.
++          std::string rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[1]);
++          if (rom.empty() || !File::Exists(rom))
++            rom = Config::Get(Config::MAIN_GBA_ROM_PATHS[2]);
++          if (!rom.empty() && File::Exists(rom))
++          {
++            const std::string save_path = HW::GBA::Core::GetSavePath(rom, 1);
++            if (File::Exists(save_path))
++            {
++              if (const auto save = XDNetplay::LoadSaveFile(save_path))
++              {
++                if (const auto party = save->ReadParty())
++                {
++                  const XDNetplay::FormatRules::Verdict verdict =
++                      XDNetplay::FormatRules::ValidateParty(*party, *format_data);
++                  if (!verdict.ok)
++                    reason = QString::fromStdString(verdict.reason);
++                }
++              }
++            }
++          }
++#endif
++        }
++        else
++        {
++          const XDNetplay::FormatRules::Verdict verdict = XDNetplay::FormatRules::ValidateSets(
++              XDNetplay::ShowdownParser::ParseTeam(team_edit->toPlainText().toStdString()),
++              *format_data);
++          if (!verdict.ok)
++            reason = QString::fromStdString(verdict.reason);
++        }
++        if (!reason.isEmpty())
++        {
++          format_note->setText(tr("note: this team is not Orre Colosseum legal - %1").arg(reason));
++        }
++        format_note->setVisible(!reason.isEmpty());
++      };
++      // No initial call needed: right now the box is empty and unchecked (the
++      // no-note state), and the prefill below fires these same signals for
++      // anything it restores -- textChanged on the stored paste, toggled on a
++      // stored bundle preference.
++      connect(team_edit, &QPlainTextEdit::textChanged, &dialog, update_format_note);
++      connect(use_save_check, &QCheckBox::toggled, &dialog, update_format_note);
++    }
++  }
++
+   auto* buttons =
+       new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dialog);
+   buttons->button(QDialogButtonBox::Ok)->setText(tr("Send"));
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 8a6b8b3..4e821e7 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -36,6 +36,7 @@
+ #include "DolphinQt/QtUtils/QueueOnObject.h"
+ #include "DolphinQt/Settings.h"
+ 
++#include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Text.h"
+ #include "UICommon/XDNetplay/MonFactory.h"
+ #include "UICommon/XDNetplay/ShowdownParser.h"
+@@ -409,6 +410,22 @@ void TeamEditorDialog::OnImport()
+   }).detach();
+ }
+ 
++QString TeamEditorDialog::FormatComplianceNote() const
++{
++  // Free (or an unknown key value): one int compare, no validation observable.
++  if (!FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT)))
++    return {};
++  // Without game data the editor could not have built a party to check anyway
++  // (and the note is a courtesy, never a judge -- when in doubt, stay quiet).
++  if (!m_data)
++    return {};
++  const FormatRules::Verdict verdict = FormatRules::ValidateParty(m_party, *m_data);
++  if (verdict.ok)
++    return {};
++  return tr("note: this team is not Orre Colosseum legal - %1")
++      .arg(QString::fromStdString(verdict.reason));
++}
++
+ bool TeamEditorDialog::ApplyTrainerName(std::string* error)
+ {
+   if (!m_save)
+@@ -500,6 +517,10 @@ void TeamEditorDialog::ApplyImportText(const std::string& text)
+     m_party = std::move(built);
+     messages.prepend(
+         tr("Imported %1 Pokémon (replaced party)").arg(static_cast<int>(m_party.size())));
++    // Paste-time FORMAT feedback: a heads-up, never a refusal -- the import
++    // above went through regardless of what the note says.
++    if (const QString note = FormatComplianceNote(); !note.isEmpty())
++      messages << note;
+   }
+   SetMessages(messages);
+   RefreshPartyList();
+@@ -552,10 +573,16 @@ void TeamEditorDialog::OnSave()
+     SetMessages({tr("NOT saved — %1").arg(QString::fromStdString(error))});
+     return;
+   }
+-  SetMessages({tr("Saved %1 Pokémon as %2 to %3 (verified; previous save backed up as .bak)")
+-                   .arg(static_cast<int>(m_party.size()))
+-                   .arg(QString::fromStdString(m_save->GetTrainerName()))
+-                   .arg(QString::fromStdString(m_save_path))});
++  QStringList messages{
++      tr("Saved %1 Pokémon as %2 to %3 (verified; previous save backed up as .bak)")
++          .arg(static_cast<int>(m_party.size()))
++          .arg(QString::fromStdString(m_save->GetTrainerName()))
++          .arg(QString::fromStdString(m_save_path))};
++  // Paste-time FORMAT feedback: the save above went through regardless -- only
++  // the hosting/submission gates ever refuse an illegal team.
++  if (const QString note = FormatComplianceNote(); !note.isEmpty())
++    messages << note;
++  SetMessages(messages);
+ }
+ 
+ void TeamEditorDialog::OnShowInFolder()
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+index 200e077..08f65f8 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+@@ -67,6 +67,15 @@ private:
+   // as Gen 3 text; nothing is modified in that case.
+   bool ApplyTrainerName(std::string* error);
+ 
++  // Paste-time FORMAT feedback (FormatRules.h): when the local Format pick is
++  // Orre Colosseum and the current party breaks its rules, the non-blocking
++  // "note: this team is not Orre Colosseum legal - ..." line to append to the
++  // log; empty otherwise. NEVER blocks anything -- importing and saving an
++  // illegal team stays allowed (only the hosting/submission gates refuse), the
++  // note just says it here first. With the pick on Free this is one int
++  // compare: no validation runs at all.
++  QString FormatComplianceNote() const;
++
+   std::optional<XDNetplay::Gen3Data> m_data;
+   std::optional<XDNetplay::EmeraldSave> m_save;
+   std::vector<XDNetplay::Gen3Mon> m_party;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index be35fd7..d01e5fa 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -48,6 +48,7 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/SaveImport.h"
+ 
+@@ -193,8 +194,14 @@ void PrepareNetplayConfig()
+ void PreparePublishConfig(bool open_challenge)
+ {
+   Config::SetBaseOrCurrent(Config::NETPLAY_USE_INDEX, true);
+-  Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_NAME,
+-                           XDNetplay::MakeOpenSessionName(Config::Get(Config::NETPLAY_NICKNAME)));
++  // The "[Orre] " room tag rides the published name when the host's Format
++  // pick is Orre Colosseum -- label only, no matchmaking filter change; with
++  // Format = Free the name is byte-identical to before the feature.
++  Config::SetBaseOrCurrent(
++      Config::NETPLAY_INDEX_NAME,
++      XDNetplay::MakeOpenSessionName(
++          Config::Get(Config::NETPLAY_NICKNAME),
++          XDNetplay::FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT))));
+   if (Config::Get(Config::NETPLAY_INDEX_REGION).empty())
+     Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_REGION, "NA");
+   if (open_challenge)
+@@ -364,12 +371,18 @@ void XDLauncherDialog::CreateMainLayout()
+   battle_box->setLayout(battle_layout);
+   layout->addWidget(battle_box);
+ 
+-  // Battle Style: purely cosmetic picks the HOST makes. BattleCustomizer turns
+-  // them into one synced AR code at Start, so both players always see the same
+-  // thing; "Game default" genuinely emits nothing and an all-default session
+-  // stays byte-for-byte stock. Entries after each list's separator are valid
+-  // but untested in battle -- their labels say so; venues whose terrain
+-  // changes a few moves carry that in the label too, no extra dialogs.
++  // Battle Style: picks the HOST makes. All but the first are purely cosmetic:
++  // BattleCustomizer turns them into one synced AR code at Start, so both
++  // players always see the same thing; "Game default" genuinely emits nothing
++  // and an all-default session stays byte-for-byte stock. Entries after each
++  // list's separator are valid but untested in battle -- their labels say so;
++  // venues whose terrain changes a few moves carry that in the label too, no
++  // extra dialogs.
++  //
++  // The first row is the battle FORMAT (v1.4.0) -- the one pick that is not
++  // cosmetic. It is persisted in MAIN_XD_FORMAT exactly like the style keys;
++  // FormatRules' gates (host-party check before a room opens, guest-submission
++  // check on arrival) do the enforcing, never this dropdown.
+   auto* style_box = new QGroupBox(tr("Battle Style"));
+   auto* style_layout = new QGridLayout;
+   int style_row = 0;
+@@ -386,6 +399,33 @@ void XDLauncherDialog::CreateMainLayout()
+     style_row++;
+     return combo;
+   };
++  m_format_combo = add_style_combo(
++      tr("Format:"),
++      tr("Applies when you host: your room plays under this ruleset.\n\n"
++         "Orre Colosseum — the canon in-game ruleset. Enforced before a room\n"
++         "opens (your team and the port-3 fallback team) and on every guest\n"
++         "submission:\n"
++         "  • Gen 1–3 species, except Mewtwo, Mew, Lugia, Ho-Oh, Celebi,\n"
++         "    Kyogre, Groudon, Rayquaza, Jirachi and Deoxys\n"
++         "  • Species Clause — no duplicate species on a team\n"
++         "  • Item Clause — no duplicate held items on a team\n"
++         "  • Soul Dew is banned\n"
++         "Sleep, Freeze and Self-KO clauses are honor rules: please follow\n"
++         "them yourselves — OrreLink never enforces them.\n\n"
++         "Free — no restrictions; sessions are exactly as before this option\n"
++         "existed. When you JOIN a room, the host's Format applies, not yours;\n"
++         "your own pick still gives you legality notes in the Team Editor and\n"
++         "the Submit Team dialog."));
++  // The entry labels come from FormatRules so the dropdown, the refusal
++  // dialogs and the room-chat messages all name the formats identically.
++  m_format_combo->addItem(
++      QString::fromUtf8(
++          XDNetplay::FormatRules::FormatDisplayName(XDNetplay::FormatRules::FORMAT_FREE)),
++      XDNetplay::FormatRules::FORMAT_FREE);
++  m_format_combo->addItem(
++      QString::fromUtf8(XDNetplay::FormatRules::FormatDisplayName(
++          XDNetplay::FormatRules::FORMAT_ORRE_COLOSSEUM)),
++      XDNetplay::FormatRules::FORMAT_ORRE_COLOSSEUM);
+   const auto populate_style_combo =
+       [this](QComboBox* combo, std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
+              bool terrain_suffix) {
+@@ -508,6 +548,11 @@ void XDLauncherDialog::ConnectWidgets()
+       Config::Save();
+     });
+   };
++  // The Format pick persists through the identical idiom: only the config key
++  // is written here. Everything that enforces a format (the host gate, the
++  // guest-submission gates, the "[Orre] " session tag) reads MAIN_XD_FORMAT
++  // for itself at its own moment -- the dropdown never enforces anything.
++  connect_style_combo(m_format_combo, Config::MAIN_XD_FORMAT);
+   connect_style_combo(m_style_host_model_combo, Config::MAIN_XD_STYLE_HOST_MODEL);
+   connect_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
+   connect_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
+@@ -547,6 +592,11 @@ void XDLauncherDialog::showEvent(QShowEvent* event)
+     const int index = combo->findData(Config::Get(setting));
+     combo->setCurrentIndex(index >= 0 ? index : 0);
+   };
++  // Same story for the Format pick: findData on a value the dropdown does not
++  // carry lands on index 0 -- Free -- which is precisely how FormatRules::
++  // IsOrreColosseum treats an unknown key value (no enforcement, never a
++  // surprise lockout), so here too the UI and the code cannot disagree.
++  refresh_style_combo(m_format_combo, Config::MAIN_XD_FORMAT);
+   refresh_style_combo(m_style_host_model_combo, Config::MAIN_XD_STYLE_HOST_MODEL);
+   refresh_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
+   refresh_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 3066fe2..35326f0 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -121,6 +121,11 @@ private:
+   // assembled into the synced "$OrreLink Battle Style" AR block by
+   // BattleCustomizer when a session starts. Every combo's first entry is
+   // "Game default", which genuinely emits nothing.
++  //
++  // m_format_combo is the one non-cosmetic pick in that group: the battle
++  // FORMAT (Free / Orre Colosseum), persisted in MAIN_XD_FORMAT and enforced
++  // by FormatRules' gates -- see the tooltip built in CreateMainLayout.
++  QComboBox* m_format_combo;
+   QComboBox* m_style_host_model_combo;
+   QComboBox* m_style_guest_model_combo;
+   QComboBox* m_style_music_combo;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 79a3bb5..3b1c351 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -60,10 +60,14 @@ bool IsXdGameId(const std::string& game_id)
+   return game_id.rfind(XD_GAME_ID, 0) == 0;
+ }
+ 
+-std::string MakeOpenSessionName(const std::string& nickname)
++std::string MakeOpenSessionName(const std::string& nickname, bool orre_format)
+ {
+-  // Mirrors XdMatchmaker.sessionName() on Android, byte for byte.
+-  return "XD [OC] " + (nickname.empty() ? std::string("Player") : nickname);
++  // Mirrors XdMatchmaker.sessionName() on Android, byte for byte. The
++  // "[Orre] " room tag is a purely human-readable label (no matchmaking
++  // filter keys off it in this patch); with the Format pick on Free the name
++  // is byte-identical to the pre-Format builds.
++  const std::string base = "XD [OC] " + (nickname.empty() ? std::string("Player") : nickname);
++  return orre_format ? "[Orre] " + base : base;
+ }
+ 
+ bool LooksLikeXdSession(const std::string& published_game_name)
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index 406e319..efe0617 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -31,6 +31,9 @@ bool IsXdGameId(const std::string& game_id);
+ // public session index:
+ //
+ //     XD [OC] <nickname>            ("OC" = Open Challenge)
++//     [Orre] XD [OC] <nickname>     when the host's Format pick is Orre
++//                                   Colosseum (orre_format = the caller's read
++//                                   of Config::MAIN_XD_FORMAT)
+ //
+ // The IDENTICAL format lives on the Android side in XdMatchmaker.kt
+ // (SESSION_NAME_PREFIX). Keep the two in sync -- it is the only thing that
+@@ -39,8 +42,11 @@ bool IsXdGameId(const std::string& game_id);
+ //
+ // Matching itself never keys off the name: it keys off player_count /
+ // in_game / has_password, so a room named anything else is still joinable.
+-// The tag exists purely so the lobby reads sensibly to people.
+-std::string MakeOpenSessionName(const std::string& nickname);
++// The tag exists purely so the lobby reads sensibly to people -- including the
++// "[Orre] " prefix, which is a human-readable label only; this patch adds no
++// matchmaking filter for it, and a Free room's name is byte-identical to
++// before the Format feature existed.
++std::string MakeOpenSessionName(const std::string& nickname, bool orre_format);
+ 
+ // True when an index entry's published "game" string looks like Pokemon XD.
+ //
+diff --git a/Source/Core/UICommon/CMakeLists.txt b/Source/Core/UICommon/CMakeLists.txt
+index 26287b2..e0fd905 100644
+--- a/Source/Core/UICommon/CMakeLists.txt
++++ b/Source/Core/UICommon/CMakeLists.txt
+@@ -23,6 +23,8 @@ add_library(uicommon
+   XDNetplay/BattleCustomizer.h
+   XDNetplay/DisposableSave.cpp
+   XDNetplay/DisposableSave.h
++  XDNetplay/FormatRules.cpp
++  XDNetplay/FormatRules.h
+   XDNetplay/Gen3Data.cpp
+   XDNetplay/Gen3Data.h
+   XDNetplay/Gen3Mon.cpp
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 6a0e14f..8e60554 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -28,6 +28,7 @@
+ 
+ #include "Common/IOFile.h"
+ 
++#include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ 
+ namespace XDNetplay::BattleCustomizer
+@@ -643,6 +644,52 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+   return block;
+ }
+ 
++// The Orre Colosseum in-game ruleset, pinned into Custom 1. Design: instead of
++// pinning individual clause bytes -- several of whose meanings are unverified
++// -- the WHOLE 144-byte slot is written with the game's own stock LV100
++// tournament preset (main.dol file 0x2E7C08 + 3*0x90; min 1 / max 100 / total
++// 600 / species-clause encoding 00,06 / tournament marker at +0x08, all-zero
++// tail), with exactly one change: the u16 at +0x1A (entries) set to 4 for
++// bring-6-pick-4. Every byte is the game's own tournament value, so no
++// unverified meaning is ever guessed at. The rules screen's menu globals are
++// pinned alongside so the selection is Double / Custom 1 and enforcement
++// (GameCube-side entry validator, lha ruleset+0/+2) routes through the pinned
++// slot. Do-not-pin findings from the field map are respected: never the
++// getter's working buffer (rebuilt in-call), never ctx+0x10 (races the random
++// venue roll); the venue stays on the field-proven record +0x06 pin.
++constexpr u32 ORRE_MENU_GLOBAL_LINES[][2] = {
++    {0x044349EC, 0x00000000},  // player layout = 2P (layout >= 2 would force tag mode)
++    {0x044349F0, 0x00000001},  // battle type = Double -> ctx+8 = 1 -> record 7
++    {0x044349FC, 0x00000003},  // rules choice = Custom 1 (save-backed slot the getter
++                               // returns DIRECTLY for selections 3..5 -- the pin holds)
++};
++constexpr u32 ORRE_RULESET_BASE = 0x044334C0;  // Custom 1: 0x80433310 + 3*144
++constexpr u32 ORRE_RULESET_WORDS[36] = {
++    0x00010064, 0x02580006, 0x00000002, 0x00000000, 0x01010001, 0xFFC4FFEC,
++    0x01010004, 0x00010000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++    0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
++};
++
++std::string FormatRuleLines()
++{
++  // Sleep/Freeze/Self-KO clauses stay honor rules and are never emitted here;
++  // species/item/ban clauses are enforced app-side by FormatRules. This pins
++  // only what the in-game rules screen controls: Double, level 100, bring 6
++  // pick 4, via the game's own tournament preset (see above).
++  if (Config::Get(Config::MAIN_XD_FORMAT) != FormatRules::FORMAT_ORRE_COLOSSEUM)
++    return {};
++
++  std::string lines;
++  for (const auto& line : ORRE_MENU_GLOBAL_LINES)
++    AppendLine(&lines, line[0], line[1]);
++  for (size_t i = 0; i < 36; i++)
++    AppendLine(&lines, ORRE_RULESET_BASE + static_cast<u32>(4 * i), ORRE_RULESET_WORDS[i]);
++  return lines;
++}
++
+ Selection ConfigSelection()
+ {
+   Selection sel;
+@@ -739,11 +786,21 @@ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
+   // Side mapping (host -> "Player" block, guest -> "Opponent" line) is the
+   // expected orientation; if the one-time emulator test shows it reversed,
+   // swap the first two arguments HERE only.
+-  const std::string block = GenerateCodeBlock(
++  std::string block = GenerateCodeBlock(
+       sel.host_model > 0 ? std::optional<int>(sel.host_model) : std::nullopt, guest_model,
+       sel.music > 0 ? std::optional<int>(sel.music) : std::nullopt,
+       sel.venue > 0 ? std::optional<int>(sel.venue) : std::nullopt,
+       SaveBustClass(1), SaveBustClass(2));
++  // FORMAT seam: the future rules-pin patch contributes its in-game rule pins
++  // through FormatRuleLines() (see BattleCustomizer.h). Today the helper
++  // returns "" for every format, so this append never changes the block and
++  // an all-default session stays byte-for-byte stock in both formats.
++  if (const std::string format_lines = FormatRuleLines(); !format_lines.empty())
++  {
++    if (!block.empty())
++      block.push_back('\n');
++    block += format_lines;
++  }
+   const bool active = !block.empty();
+ 
+   // One line per regeneration so a tester's log says exactly what was picked
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+index 2c5a54d..fd614e8 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+@@ -125,6 +125,20 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+                               std::optional<int> bgm, std::optional<int> venue,
+                               int p1_class = 0, int p2_class = 0);
+ 
++// ---- FORMAT seam (v1.4.0) --------------------------------------------------
++// The IN-GAME rules layer of the Orre Colosseum format -- doubles, level 100,
++// bring-6-pick-4, team preview -- is pinned by AR writes that ship in a
++// SEPARATE rules-pin patch once its field map completes. THIS is the seam that
++// patch lands in: RegenerateIni appends whatever this helper returns to the
++// assembled "$OrreLink Battle Style" block, and the helper consults the format
++// key (Config::MAIN_XD_FORMAT, values in FormatRules.h) to decide what to
++// emit. TODAY it returns "" for every format, so format=Free and format=Orre
++// generate byte-identical blocks and sessions. Party legality (species/item
++// bans and clauses) is NOT this seam's business -- FormatRules validates that
++// at the submission/host gates. Sleep/Freeze/Self-KO clauses are honor rules:
++// documented in UI copy, never emitted here.
++std::string FormatRuleLines();
++
+ // The host's four launcher selections. 0 (the config default) = game default.
+ struct Selection
+ {
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.cpp b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+new file mode 100644
+index 0000000..005f481
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+@@ -0,0 +1,242 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "UICommon/XDNetplay/FormatRules.h"
++
++#include <algorithm>
++#include <cctype>
++#include <map>
++#include <optional>
++#include <utility>
++
++#include <fmt/format.h>
++
++namespace XDNetplay::FormatRules
++{
++namespace
++{
++// The Orre Colosseum restricted list, by NATIONAL dex number. National ids are
++// the stable identity here because the internal (Hoenn) species id space
++// diverges from National from Hoenn onward.
++//
++// Every id verified against the bundled Data/Sys/XDNetplay/gen3data.json
++// (identical copy shipped as the Android asset), field "species".<name>.natDex:
++//   mewtwo 150, mew 151, lugia 249, hooh 250, celebi 251, kyogre 382
++//   (internal id 404), groudon 383 (405), rayquaza 384 (406), jirachi 385
++//   (409), deoxys 386 (410). The file carries one entry per species (no
++//   separate form entries), so matching on natDex covers all forms.
++struct BannedSpecies
++{
++  int nat_dex;
++  const char* display;
++};
++constexpr BannedSpecies BANNED_SPECIES[] = {
++    {150, "Mewtwo"}, {151, "Mew"},     {249, "Lugia"},    {250, "Ho-Oh"},   {251, "Celebi"},
++    {382, "Kyogre"}, {383, "Groudon"}, {384, "Rayquaza"}, {385, "Jirachi"}, {386, "Deoxys"},
++};
++
++// Soul Dew's Gen 3 item id, verified against the bundled
++// Data/Sys/XDNetplay/gen3data.json, field "items"."souldew" = 191.
++constexpr int SOUL_DEW_ITEM_ID = 191;
++constexpr const char* SOUL_DEW_DISPLAY = "Soul Dew";
++
++const BannedSpecies* FindBannedSpecies(int nat_dex)
++{
++  for (const BannedSpecies& banned : BANNED_SPECIES)
++  {
++    if (banned.nat_dex == nat_dex)
++      return &banned;
++  }
++  return nullptr;
++}
++
++// One party member, normalized from either entry point.
++struct Entry
++{
++  // National dex number; 0 when the species could not be mapped (never
++  // matches the ban list -- species_key still dedups it).
++  int nat_dex = 0;
++  // Species Clause identity: the National dex number when known, otherwise a
++  // key derived from the raw internal id so two identical unknowns still
++  // collide with each other and nothing else.
++  int species_key = 0;
++  // Held item id; 0 = no item. ITEMLESS MONS NEVER COUNT AS DUPLICATES of
++  // each other -- "no item" is excluded from the Item Clause entirely.
++  int item_id = 0;
++  // What the refusal message calls this mon / item: for Showdown sets the
++  // text the user actually typed, for built mons the Gen3Data name.
++  std::string species_display;
++  std::string item_display;
++};
++
++// "leftovers" -> "Leftovers": the bundle path only has Gen3Data's normalized
++// lookup names to show, so at least lead with a capital.
++std::string Capitalize(std::string name)
++{
++  if (!name.empty())
++    name[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(name[0])));
++  return name;
++}
++
++// The shared rule core. Check order is fixed so refusals are deterministic:
++// banned species, banned item, Species Clause, Item Clause -- first violation
++// wins, and within a check the earliest party slot wins.
++Verdict ValidateEntries(const std::vector<Entry>& entries)
++{
++  for (const Entry& entry : entries)
++  {
++    if (FindBannedSpecies(entry.nat_dex) != nullptr)
++      return {false, fmt::format("banned species: {}", entry.species_display)};
++  }
++
++  for (const Entry& entry : entries)
++  {
++    if (entry.item_id == SOUL_DEW_ITEM_ID)
++      return {false, fmt::format("banned item: {}", entry.item_display)};
++  }
++
++  // Species Clause: no duplicate species among the party.
++  {
++    std::map<int, const Entry*> seen;
++    for (const Entry& entry : entries)
++    {
++      const auto [it, inserted] = seen.emplace(entry.species_key, &entry);
++      if (!inserted)
++        return {false, fmt::format("duplicate species: {}", it->second->species_display)};
++    }
++  }
++
++  // Item Clause: no duplicate held items among the party. Only mons that HOLD
++  // an item participate (item_id != 0 was filtered by the builders), so any
++  // number of itemless mons coexist.
++  {
++    std::map<int, int> counts;
++    for (const Entry& entry : entries)
++    {
++      if (entry.item_id != 0)
++        counts[entry.item_id]++;
++    }
++    for (const Entry& entry : entries)
++    {
++      if (entry.item_id != 0 && counts[entry.item_id] > 1)
++      {
++        return {false, fmt::format("duplicate item: {} (x{})", entry.item_display,
++                                   counts[entry.item_id])};
++      }
++    }
++  }
++
++  return {};
++}
++}  // namespace
++
++bool IsOrreColosseum(int format_key_value)
++{
++  // Exact match only: an unknown value behaves as Free (no enforcement),
++  // never as a surprise lockout.
++  return format_key_value == FORMAT_ORRE_COLOSSEUM;
++}
++
++const char* FormatDisplayName(int format_key_value)
++{
++  return IsOrreColosseum(format_key_value) ? "Orre Colosseum" : "Free";
++}
++
++Verdict ValidateSets(const std::vector<ShowdownSet>& sets, const Gen3Data& data)
++{
++  std::vector<Entry> entries;
++  entries.reserve(sets.size());
++  for (const ShowdownSet& set : sets)
++  {
++    // Resolution mirrors MonFactory::Build exactly: FindSpecies/ItemId apply
++    // Gen3Data's normalization (lowercase, alphanumerics only), so case and
++    // punctuation ("KYOGRE", "Mr. Mime", "soul dew") can never cause a false
++    // refusal. A set whose species or item does NOT resolve is skipped whole,
++    // because MonFactory refuses such a set and it never reaches the save.
++    const Gen3Data::Species* species = data.FindSpecies(set.species);
++    if (species == nullptr)
++      continue;
++
++    Entry entry;
++    entry.nat_dex = species->nat_dex;
++    entry.species_key = species->nat_dex;
++    entry.species_display = set.species;  // name the mon what the user typed
++    if (set.item)
++    {
++      const std::optional<int> item_id = data.ItemId(*set.item);
++      if (!item_id)
++        continue;  // MonFactory refuses the whole set on an unknown item
++      entry.item_id = *item_id;
++      entry.item_display = *set.item;  // name the item what the user typed
++    }
++    // No "@ item" in the paste: item_id stays 0 and this mon is invisible to
++    // the Item Clause -- itemless mons must never collide with each other.
++    entries.push_back(std::move(entry));
++  }
++  return ValidateEntries(entries);
++}
++
++Verdict ValidateParty(std::span<const Gen3Mon> party, const Gen3Data& data)
++{
++  // Reverse maps, built per call: internal species id -> species entry, and
++  // item id -> normalized display name. Party validation is a rare,
++  // interactive-scale event; a linear pass over ~400 species / ~350 items is
++  // nothing.
++  std::map<int, const Gen3Data::Species*> species_by_internal_id;
++  for (const auto& [key, species] : data.GetSpecies())
++    species_by_internal_id.emplace(species.id, &species);
++  std::map<int, std::string> item_name_by_id;
++  for (const auto& [name, id] : data.GetItems())
++    item_name_by_id.emplace(id, name);
++
++  std::vector<Entry> entries;
++  entries.reserve(party.size());
++  for (const Gen3Mon& mon : party)
++  {
++    if (mon.IsEmpty())
++      continue;
++
++    Entry entry;
++    const auto species_it = species_by_internal_id.find(static_cast<int>(mon.species));
++    if (species_it != species_by_internal_id.end())
++    {
++      entry.nat_dex = species_it->second->nat_dex;
++      entry.species_key = species_it->second->nat_dex;
++      const BannedSpecies* banned = FindBannedSpecies(entry.nat_dex);
++      // Prefer the canonical spelling for the fixed ban list ("Ho-Oh" rather
++      // than a de-punctuated "hooh"); everything else gets the Gen3Data name.
++      entry.species_display =
++          banned != nullptr ? banned->display : Capitalize(species_it->second->name);
++    }
++    else
++    {
++      // Unknown internal id (nothing in gen3data.json): it cannot be on the
++      // ban list, but two copies of the same unknown still violate the
++      // Species Clause. Offset the key far past every National dex number so
++      // it can never collide with a known species.
++      entry.species_key = 1000000 + static_cast<int>(mon.species);
++      entry.species_display = fmt::format("species #{}", mon.species);
++    }
++
++    // held_item == 0 is "no item": excluded from the Item Clause entirely, so
++    // any number of itemless mons never read as duplicates of each other.
++    if (mon.held_item != 0)
++    {
++      entry.item_id = static_cast<int>(mon.held_item);
++      if (entry.item_id == SOUL_DEW_ITEM_ID)
++      {
++        entry.item_display = SOUL_DEW_DISPLAY;
++      }
++      else
++      {
++        const auto item_it = item_name_by_id.find(entry.item_id);
++        entry.item_display = item_it != item_name_by_id.end() ?
++                                 Capitalize(item_it->second) :
++                                 fmt::format("item #{}", entry.item_id);
++      }
++    }
++    entries.push_back(std::move(entry));
++  }
++  return ValidateEntries(entries);
++}
++}  // namespace XDNetplay::FormatRules
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.h b/Source/Core/UICommon/XDNetplay/FormatRules.h
+new file mode 100644
+index 0000000..86c0675
+--- /dev/null
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.h
+@@ -0,0 +1,100 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <span>
++#include <string>
++#include <vector>
++
++#include "UICommon/XDNetplay/Gen3Data.h"
++#include "UICommon/XDNetplay/Gen3Mon.h"
++#include "UICommon/XDNetplay/ShowdownParser.h"
++
++// ---------------------------------------------------------------------------
++// Battle formats ("$OrreLink FORMAT")
++// ---------------------------------------------------------------------------
++//
++// PURE party validation for the one-tap FORMAT feature: no UI, no file IO, no
++// config reads. Callers hand in the format key's value plus (species, item)
++// data and get back either "ok" or one specific, human-readable reason.
++//
++// The format is the HOST's choice, persisted in the MAIN_XD_FORMAT config key
++// exactly like the Battle Style picks:
++//
++//     0 = Free           the default; changes NOTHING. No validation ever
++//                        runs, sessions stay byte-identical to a build
++//                        without this feature.
++//     1 = Orre Colosseum the canon in-game ruleset of XD's Orre Colosseum.
++//
++// What "Orre Colosseum" enforces HERE (the party-legality layer):
++//   * Species ban list: Gen 1-3 species EXCEPT the restricted legendaries and
++//     mythicals -- Mewtwo, Mew, Lugia, Ho-Oh, Celebi, Kyogre, Groudon,
++//     Rayquaza, Jirachi, Deoxys (BANNED_SPECIES in the .cpp, by National dex).
++//   * Species Clause: no duplicate species among the party.
++//   * Item Clause: no duplicate held items among the party. Itemless mons
++//     NEVER count as duplicates of each other -- "no item" is not an item.
++//   * Soul Dew is banned outright (item id 191; see the .cpp).
++//
++// What it deliberately does NOT enforce:
++//   * Doubles / level-100 / bring-6-pick-4 / team preview are the IN-GAME
++//     rules layer, which ships in a separate rules-pin patch once its field
++//     map completes. BattleCustomizer::FormatRuleLines() is the seam it lands
++//     in; today that helper returns nothing.
++//   * Sleep Clause, Freeze Clause and the Self-KO Clause are HONOR rules --
++//     they are documented in UI copy and never enforced by code, matching how
++//     the real Orre Colosseum leaves them to the players.
++//
++// Enforcement sites (the callers):
++//   * guest submission gate -- InjectGuestTeam / InjectGuestBundle validate
++//     before any lifecycle side effect; the refusal reason rides the existing
++//     status -> room-chat path prefixed "Orre Colosseum: ".
++//   * host gate -- ValidateHostPartiesForFormat (TeamInjector.h) checks the
++//     host's port-2 party and port-3 fallback party before hosting begins.
++//   * paste-time feedback -- team editors and the Submit dialog show a
++//     non-blocking note; only the two gates above ever block.
++namespace XDNetplay::FormatRules
++{
++// Values of the MAIN_XD_FORMAT config key. An int (not an enum class) because
++// it travels through config/JNI as a plain integer, like the style picks.
++constexpr int FORMAT_FREE = 0;
++constexpr int FORMAT_ORRE_COLOSSEUM = 1;
++
++// True only for the exact Orre Colosseum value: an unknown/garbage key value
++// behaves as Free (no enforcement), never as a surprise lockout.
++bool IsOrreColosseum(int format_key_value);
++
++// Short display name for a format key value ("Free" / "Orre Colosseum"),
++// shared by both platforms' UI so the dropdowns and messages agree.
++const char* FormatDisplayName(int format_key_value);
++
++// Validation outcome. When !ok, reason is one specific human sentence naming
++// the offending mon or item, e.g.:
++//     "banned species: Kyogre"
++//     "banned item: Soul Dew"
++//     "duplicate species: Snorlax"
++//     "duplicate item: Leftovers (x2)"
++struct Verdict
++{
++  bool ok = true;
++  std::string reason;
++};
++
++// Entry point (a): parsed Showdown sets, PRE-build -- names are resolved
++// through Gen3Data with its own normalization (lowercase, alphanumerics only),
++// so "KYOGRE", "Mr. Mime" and "Nidoran-F" all resolve exactly as MonFactory
++// will resolve them. A set whose species or item name does not resolve is
++// SKIPPED here, because MonFactory::Build will refuse that whole set and the
++// mon can never land in the save -- validating it would risk refusing a paste
++// whose offending entry was never going to play. Validates ALL resolvable
++// sets, whatever the party size (1..6; a paste is capped downstream).
++Verdict ValidateSets(const std::vector<ShowdownSet>& sets, const Gen3Data& data);
++
++// Entry point (b): built Gen3Mon spans -- the party-bundle path and save
++// reading. mon.species is the INTERNAL (Hoenn) species id; it is mapped to the
++// National dex number through Gen3Data before the ban list / Species Clause
++// apply (the two id spaces diverge from Hoenn onward: Kyogre is internal 404,
++// National 382). held_item == 0 means "no item" and never counts toward the
++// Item Clause. Validates every non-empty mon in the span (party size 1..6).
++Verdict ValidateParty(std::span<const Gen3Mon> party, const Gen3Data& data);
++}  // namespace XDNetplay::FormatRules
+diff --git a/Source/Core/UICommon/XDNetplay/Gen3Data.h b/Source/Core/UICommon/XDNetplay/Gen3Data.h
+index 25bf6dd..e456d93 100644
+--- a/Source/Core/UICommon/XDNetplay/Gen3Data.h
++++ b/Source/Core/UICommon/XDNetplay/Gen3Data.h
+@@ -85,6 +85,9 @@ public:
+   std::optional<int> ExpForLevel(const std::string& exp_group, int level) const;
+ 
+   const std::map<std::string, Species>& GetSpecies() const { return m_species; }
++  // Normalized item name -> id, exposed for reverse lookups (FormatRules names
++  // a held item in its refusal reasons from this map).
++  const std::map<std::string, int>& GetItems() const { return m_items; }
+   const std::map<int, std::string>& GetTypeNames() const { return m_type_names; }
+ 
+ private:
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index 637c536..57753b0 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -32,6 +32,7 @@
+ #include "Core/HW/GBACore.h"
+ #endif
+ 
++#include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Data.h"
+ #include "UICommon/XDNetplay/Gen3Mon.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+@@ -497,6 +498,24 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+   if (!data)
+     return fail(fmt::format("game data unavailable ({})", error));
+ 
++  // FORMAT gate (guest submission, Showdown form): with the HOST's format key
++  // set to Orre Colosseum, the submitted party must be legal BEFORE any
++  // lifecycle side effect runs (the self-heal and the .hostteam stash below
++  // are the first ones) -- a refused submission leaves no trace. The refusal
++  // reason rides the normal status -> room-chat path, prefixed so the guest
++  // knows which ruleset spoke. The guest's own format key is irrelevant here:
++  // this code runs on the host, and the host's key governs the room. With
++  // format=Free this block is a single int compare -- no validation runs and
++  // behavior stays byte-identical. (Parsing twice under Orre is deliberate:
++  // the pristine Free path below keeps its original shape.)
++  if (FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT)))
++  {
++    const FormatRules::Verdict verdict =
++        FormatRules::ValidateSets(ShowdownParser::ParseTeam(showdown_text), *data);
++    if (!verdict.ok)
++      return fail("Orre Colosseum: " + verdict.reason);
++  }
++
+   const std::string save_path = ResolveGuestSavePath(device, &error);
+   if (save_path.empty())
+     return fail(std::move(error));
+@@ -637,6 +656,29 @@ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* s
+   if (!decoded)
+     return fail(fmt::format("save bundle rejected ({})", error));
+ 
++  // FORMAT gate (guest submission, bundle form): same contract as the Showdown
++  // gate in InjectGuestTeam -- the HOST's format key governs, the check runs
++  // BEFORE any lifecycle side effect (self-heal/stash), and a refusal goes out
++  // through the status -> room-chat path prefixed "Orre Colosseum: ". The
++  // decoded mons carry INTERNAL species ids; ValidateParty maps them to
++  // National dex numbers through Gen3Data before the ban list applies. With
++  // format=Free this is a single int compare and nothing else runs. Unlike the
++  // Showdown path, Orre cannot proceed when gen3data.json is unreadable --
++  // waving an unvalidatable party through would silently break the room's
++  // ruleset, so the submission is refused just as loudly.
++  if (FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT)))
++  {
++    std::string data_error;
++    const auto data = Gen3Data::LoadBundled(&data_error);
++    if (!data)
++      return fail(fmt::format("Orre Colosseum: cannot validate the party (game data "
++                              "unavailable: {})",
++                              data_error));
++    const FormatRules::Verdict verdict = FormatRules::ValidateParty(decoded->mons, *data);
++    if (!verdict.ok)
++      return fail("Orre Colosseum: " + verdict.reason);
++  }
++
+   const std::string save_path = ResolveGuestSavePath(device, &error);
+   if (save_path.empty())
+     return fail(std::move(error));
+@@ -698,6 +740,69 @@ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* s
+ #endif
+ }
+ 
++bool ValidateHostPartiesForFormat(std::string* reason)
++{
++  // Free (or any unknown key value): one int compare, nothing else -- no file
++  // reads, no validation, hosting proceeds exactly as before this feature.
++  if (!FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT)))
++    return true;
++
++#ifndef HAS_LIBMGBA
++  // No GBA support means no socket saves to validate (and no session that
++  // could play them).
++  return true;
++#else
++  std::string data_error;
++  const auto data = Gen3Data::LoadBundled(&data_error);
++  if (!data)
++  {
++    // Without gen3data.json nothing anywhere can validate (the guest gates
++    // refuse submissions outright in this state); don't invent a hosting
++    // blocker for a broken install on top of that.
++    return true;
++  }
++
++  // Both of the host's parties will be played under the room's rules: port 2
++  // is the host's own team, port 3 is the fallback the guest plays whenever
++  // they never submit one. Validate the saves the session will actually read
++  // -- SavePathForDevice is the exact resolution SyncSaveData uses.
++  for (const int device : {1, 2})
++  {
++    const std::string save_path = SavePathForDevice(device);
++    if (save_path.empty() || !File::Exists(save_path))
++      continue;  // not a rules question; the setup checklist owns missing saves
++
++    std::vector<u8> bytes;
++    if (!ReadFileBytes(save_path, &bytes))
++      continue;
++    const auto save = EmeraldSave::Create(std::move(bytes));
++    if (!save)
++      continue;  // unreadable save: surfaced elsewhere, not a format violation
++    // FRLG keeps its party at different section-1 offsets, so the shared
++    // Emerald-offset reader below would decode garbage -- skip rather than
++    // refuse on noise (FRLG hosting limits have their own loud refusals).
++    if (EmeraldSave::DetectGame(*save) == Gen3Game::FireRedLeafGreen)
++      continue;
++    const auto party = save->ReadParty();
++    if (!party || party->empty())
++      continue;
++
++    const FormatRules::Verdict verdict = FormatRules::ValidateParty(*party, *data);
++    if (!verdict.ok)
++    {
++      if (reason)
++      {
++        *reason = fmt::format("{} (GBA port {}) is not Orre Colosseum legal - {}",
++                              device == 1 ? "your team" : "the guest-slot fallback team",
++                              device + 1, verdict.reason);
++      }
++      return false;
++    }
++  }
++  return true;
++#endif
++}
++
+ void RestoreHostTeam(int device)
+ {
+   // THE ORDERING THIS EXISTS TO FIX
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 168a0c5..0de9370 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -152,6 +152,27 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+ // does: that socket's ROM cannot run the Emerald-template disposable save.
+ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status);
+ 
++// HOST gate for the one-tap FORMAT feature (FormatRules.h): when the host's
++// MAIN_XD_FORMAT key is Orre Colosseum, validate the parties the HOST brings
++// to the room -- the port-2 save (the host's own team) AND the port-3 save
++// (the guest-slot fallback, played whenever the guest never submits) -- since
++// both will be played under the room's rules. Returns true when hosting may
++// proceed; false with *reason set to a user-displayable sentence naming the
++// offending mon or item AND which slot it sits in. Callers block hosting on
++// false (desktop: ModalMessageBox in MainWindow::NetPlayHost; Android: the
++// connection-error surface in nativeHost -- the same place the FRLG/
++// disposable-save hosting refusals ship), strictly BEFORE the disposable-save
++// swap and the server, so a refusal leaves no swapped state behind.
++//
++// With format=Free this returns true after one int compare -- no file is read,
++// no validation runs, hosting is byte-identical to a build without formats.
++// Deliberately lenient about anything that is not a rules violation: a port
++// with no save, an unreadable/FRLG save (whose party the Emerald-offset
++// readers cannot decode) or an empty party is SKIPPED, not refused -- those
++// conditions exist in Free too and have their own handling; this gate only
++// answers "is a readable party Orre-legal".
++bool ValidateHostPartiesForFormat(std::string* reason);
++
+ // End-of-session cleanup: give the host their own team back AND leave no file
+ // on this machine holding the opponent's party. Call it whenever a room ends,
+ // from either side of the connection -- it works out for itself what is there.
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 5d819c5..1d8789a 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.3.4";
++constexpr char VERSION[] = "1.4.0";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
