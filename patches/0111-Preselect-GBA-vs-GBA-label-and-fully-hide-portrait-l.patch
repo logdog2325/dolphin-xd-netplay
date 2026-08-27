@@ -1,0 +1,524 @@
+From f1aa938abf956aae93abb770e0b7fa912197a7cc Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Thu, 27 Aug 2026 14:53:30 -0700
+Subject: [PATCH] Preselect GBA vs GBA, label and fully hide portrait-less
+ models
+
+Three fixes from 1.4.1 field testing, shipped together as v1.4.2:
+
+- One-tap Orre Colosseum now pins the VS mode row to GBA vs GBA instead
+  of holding it on GC vs GBA. The layout global doubles as the mode row
+  (0 = GC vs GBA, 1 = GBA vs GBA, >= 2 = tag), so the old pin of 0 both
+  showed the wrong mode and reverted every attempt to change it. Value 1
+  is verified against the layout table (ports {2,3}, matching this
+  fork's SI config) and skips the GC-pad presence gates.
+
+- The bust hide now also zeroes the class-0 widget pair (0x201/0x208).
+  That column is every bust descriptor's compile-time default record, so
+  screens that draw before the per-class re-crop -- the team preview
+  screen -- still showed the GC protagonist for portrait-less picks. A
+  whole-image scan confirmed the fourteen records are the only path to
+  the bust atlas, so this closes the last surface. Emitted only while a
+  hide is active, so genuine GC-vs-GBA sessions are untouched.
+
+- Model pickers on all surfaces now label the sixty models without
+  pre-battle art as "(no portrait)" (with an explanatory note) instead
+  of a tier marking, so it is visible up front that only the six GBA
+  protagonists have the full presentation.
+---
+ .../features/netplay/ui/NetplayScreen.kt      |  8 ++++
+ .../features/xdnetplay/BattleStyleBridge.kt   | 22 ++++++---
+ .../xdnetplay/ui/BattleStyleDropdown.kt       | 30 +++++++++---
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  7 +++
+ .../app/src/main/res/values/strings.xml       |  2 +
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        | 31 +++++++-----
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  | 33 ++++++-------
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 47 ++++++++++++++-----
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 35 +++++++++++++-
+ .../UICommon/XDNetplay/BattleCustomizer.h     |  7 +++
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 11 files changed, 169 insertions(+), 55 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index d2ef0b8..e919e83 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -251,6 +251,14 @@ fun NetplayScreen(
+                         modifier = Modifier.fillMaxWidth(),
+                         supportingText = stringResource(R.string.xd_style_submit_model_hint)
+                     )
++                    // Caption under the model control: what "(no portrait)"
++                    // costs (nothing but the close-up), so nobody reads it as
++                    // "broken".
++                    Text(
++                        stringResource(R.string.xd_style_no_portrait_note),
++                        style = MaterialTheme.typography.bodySmall,
++                        color = MaterialTheme.colorScheme.onSurfaceVariant
++                    )
+                     Spacer(Modifier.height(12.dp))
+                     OutlinedTextField(
+                         value = teamDraft,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+index 51c4007..c7789be 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/BattleStyleBridge.kt
+@@ -18,13 +18,17 @@ package org.dolphinemu.dolphinemu.features.xdnetplay
+  * AR section is genuinely absent, never a write of the vanilla value.
+  */
+ object BattleStyleBridge {
+-    /** One selectable option. Tables come tested-safe first, then
++    /** One selectable option. Music/venue tables come tested-safe first, then
+      *  [experimental] entries, so a dropdown can insert its divider at the
+-     *  first tier change. */
++     *  first tier change. [hasPortrait] is model-only (null for music/venue):
++     *  false means the game ships no pre-battle bust for this model — it
++     *  battles fine, but the connection and team screens show no close-up, and
++     *  the dropdowns label it "(no portrait)" instead of any tier marking. */
+     data class StyleOption(
+         val id: Int,
+         val name: String,
+-        val experimental: Boolean
++        val experimental: Boolean,
++        val hasPortrait: Boolean? = null
+     )
+ 
+     /** "which" indices shared with the C++ side of the bridge. */
+@@ -52,13 +56,19 @@ object BattleStyleBridge {
+      */
+     fun setSelection(which: Int, id: Int) = nativeSetSelection(which, id)
+ 
+-    /** Flat [id, name, tier, ...] triples from the C++ tables. */
++    /** Flat [id, name, tier, portrait, ...] quads from the C++ tables
++     *  (portrait "1"/"0" on models, "-" where the notion does not apply). */
+     private fun parseTable(flat: Array<String>): List<StyleOption> =
+-        (flat.indices step 3).map {
++        (flat.indices step 4).map {
+             StyleOption(
+                 id = flat[it].toIntOrNull() ?: 0,
+                 name = flat[it + 1],
+-                experimental = flat[it + 2] == "experimental"
++                experimental = flat[it + 2] == "experimental",
++                hasPortrait = when (flat[it + 3]) {
++                    "1" -> true
++                    "0" -> false
++                    else -> null
++                }
+             )
+         }
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
+index 4f46395..b3acdfc 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/BattleStyleDropdown.kt
+@@ -24,10 +24,12 @@ import org.dolphinemu.dolphinemu.features.xdnetplay.BattleStyleBridge
+ 
+ /**
+  * One cosmetic battle-style selector: a dropdown over a BattleStyleBridge
+- * table with a default entry (id 0 — "Game default" / "No preference") first,
+- * then the tested-safe options, then an "Experimental" divider and the
+- * experimental ones. The tables arrive tested-safe-first from native code, so
+- * the divider goes at the first tier change.
++ * table with a default entry (id 0 — "Game default" / "No preference") first.
++ * Music/venue tables arrive tested-safe-first from native code and get an
++ * "Experimental" divider at the first tier change. Model tables (the entries
++ * carrying a non-null [BattleStyleBridge.StyleOption.hasPortrait]) get no tier
++ * presentation — every model is field-proven in battle — but models without a
++ * pre-rendered bust are labeled "(no portrait)".
+  *
+  * Purely cosmetic choices, so the picker never blocks anything: an id that is
+  * no longer in the table (say, after an update) just renders as the default
+@@ -45,7 +47,8 @@ fun BattleStyleDropdown(
+     supportingText: String? = null,
+ ) {
+     var expanded by remember { mutableStateOf(false) }
+-    val selectedName = options.firstOrNull { it.id == selectedId }?.name ?: defaultLabel
++    val selectedName = options.firstOrNull { it.id == selectedId }?.let { optionLabel(it) }
++        ?: defaultLabel
+ 
+     ExposedDropdownMenuBox(
+         expanded = expanded,
+@@ -79,7 +82,10 @@ fun BattleStyleDropdown(
+             )
+             var dividerShown = false
+             options.forEach { option ->
+-                if (option.experimental && !dividerShown) {
++                // The tier divider is music/venue-only: model entries carry a
++                // portrait flag instead (hasPortrait != null) and present that
++                // via their "(no portrait)" label, never a tier.
++                if (option.experimental && option.hasPortrait == null && !dividerShown) {
+                     dividerShown = true
+                     HorizontalDivider()
+                     DropdownMenuItem(
+@@ -96,7 +102,7 @@ fun BattleStyleDropdown(
+                     )
+                 }
+                 DropdownMenuItem(
+-                    text = { Text(option.name) },
++                    text = { Text(optionLabel(option)) },
+                     onClick = {
+                         onSelected(option.id)
+                         expanded = false
+@@ -107,3 +113,13 @@ fun BattleStyleDropdown(
+         }
+     }
+ }
++
++/** Display label for one option: the plain name, or "name (no portrait)" for
++ *  a model the game ships no pre-battle bust for. */
++@Composable
++private fun optionLabel(option: BattleStyleBridge.StyleOption): String =
++    if (option.hasPortrait == false) {
++        stringResource(R.string.xd_style_no_portrait_suffix, option.name)
++    } else {
++        option.name
++    }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 8e5e21d..b33299c 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -332,6 +332,13 @@ private fun BattleStyleCard(
+                 modifier = Modifier.fillMaxWidth(),
+                 supportingText = stringResource(R.string.xd_style_guest_model_hint)
+             )
++            // One line under the model rows: what "(no portrait)" costs
++            // (nothing but the close-up), so nobody reads it as "broken".
++            Text(
++                text = stringResource(R.string.xd_style_no_portrait_note),
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant
++            )
+             BattleStyleDropdown(
+                 label = stringResource(R.string.xd_style_music),
+                 options = musicOptions,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 58937fb..0bd3d5b 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1125,6 +1125,8 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_style_game_default">Game default</string>
+     <string name="xd_style_no_preference">No preference</string>
+     <string name="xd_style_experimental">Experimental</string>
++    <string name="xd_style_no_portrait_suffix">%1$s (no portrait)</string>
++    <string name="xd_style_no_portrait_note">Models marked “(no portrait)” show no close-up on the connection and team screens — the battle model still changes.</string>
+     <string name="xd_style_submit_model_label">Trainer model</string>
+     <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
+ 
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index f236c9e..9852917 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -79,14 +79,18 @@ std::string GetLastError()
+ }
+ 
+ // Battle-style helper: flatten a BattleCustomizer option table for the Kotlin
+-// side as [id, name, tier, ...] triples (id decimal, tier "safe"/
+-// "experimental"). Tables are ordered tested-safe first, so a dropdown can
+-// insert its "Experimental" divider at the first tier change.
++// side as [id, name, tier, portrait, ...] quads (id decimal, tier "safe"/
++// "experimental", portrait "1"/"0" for model tables -- ModelHasPortrait -- and
++// "-" for music/venue, where the notion does not apply). Music/venue tables
++// are ordered tested-safe first, so a dropdown can insert its "Experimental"
++// divider at the first tier change; model dropdowns present the portrait flag
++// instead of the tier (the models are field-proven).
+ jobjectArray StyleTableToJava(JNIEnv* env,
+-                              std::span<const XDNetplay::BattleCustomizer::StyleOption> table)
++                              std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
++                              bool model_table)
+ {
+   std::vector<std::string> flat;
+-  flat.reserve(table.size() * 3);
++  flat.reserve(table.size() * 4);
+   for (const auto& option : table)
+   {
+     flat.push_back(std::to_string(option.id));
+@@ -94,6 +98,9 @@ jobjectArray StyleTableToJava(JNIEnv* env,
+     flat.push_back(option.tier == XDNetplay::BattleCustomizer::Tier::Experimental ?
+                        "experimental" :
+                        "safe");
++    flat.push_back(!model_table ? "-" :
++                   XDNetplay::BattleCustomizer::ModelHasPortrait(option.id) ? "1" :
++                                                                              "0");
+   }
+   return SpanToJStringArray(env, flat);
+ }
+@@ -295,9 +302,11 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_UpdateCheckBridge_nativeCheckF
+ // block is assembled in shared core at host time (nativeStartGame ->
+ // BattleCustomizer::PrepareForStart and the TeamData arrival hook).
+ //
+-// Table encoding: flat [id, name, tier, id, name, tier, ...] with id decimal
+-// and tier "safe" or "experimental". Tables are ordered tested-safe first, so
+-// a dropdown can insert its "Experimental" divider at the first tier change.
++// Table encoding: flat [id, name, tier, portrait, ...] quads with id decimal,
++// tier "safe" or "experimental" and portrait "1"/"0" (models) or "-" (music/
++// venue). Music/venue tables are ordered tested-safe first, so a dropdown can
++// insert its "Experimental" divider at the first tier change; model dropdowns
++// show "(no portrait)" from the portrait flag instead of any tier marking.
+ //
+ // Selection encoding ("which", shared with BattleStyleBridge.kt):
+ //   0 = host's own model   1 = guest-model fallback   2 = music   3 = venue
+@@ -309,21 +318,21 @@ JNIEXPORT jobjectArray JNICALL
+ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetModelTable(JNIEnv* env,
+                                                                                         jobject)
+ {
+-  return StyleTableToJava(env, XDNetplay::BattleCustomizer::ModelTable());
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::ModelTable(), true);
+ }
+ 
+ JNIEXPORT jobjectArray JNICALL
+ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetMusicTable(JNIEnv* env,
+                                                                                         jobject)
+ {
+-  return StyleTableToJava(env, XDNetplay::BattleCustomizer::MusicTable());
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::MusicTable(), false);
+ }
+ 
+ JNIEXPORT jobjectArray JNICALL
+ Java_org_dolphinemu_dolphinemu_features_xdnetplay_BattleStyleBridge_nativeGetVenueTable(JNIEnv* env,
+                                                                                         jobject)
+ {
+-  return StyleTableToJava(env, XDNetplay::BattleCustomizer::VenueTable());
++  return StyleTableToJava(env, XDNetplay::BattleCustomizer::VenueTable(), false);
+ }
+ 
+ JNIEXPORT jint JNICALL
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 3db720c..7fb7b58 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -969,30 +969,31 @@ void NetPlayDialog::OnSubmitTeam()
+   // payload as the team, as a "Model:" header line, and the HOST validates it
+   // against its own copy of this table before assembling the synced AR block.
+   // "No preference" sends no header at all -- the host's "Guest model"
+-  // fallback dropdown then decides. Entries past the separator are valid but
+-  // untested in battle, and their labels say so.
++  // fallback dropdown then decides. Every model is field-proven in battle, so
++  // no tier presentation here; the one caveat a pick can carry is having no
++  // pre-rendered bust, said in the label as "(no portrait)" and explained by
++  // the caption under the combo.
+   auto* model_layout = new QHBoxLayout;
+   auto* model_combo = new QComboBox(&dialog);
+   model_combo->addItem(tr("No preference"), 0);
++  for (const XDNetplay::BattleCustomizer::StyleOption& option :
++       XDNetplay::BattleCustomizer::ModelTable())
+   {
+-    using XDNetplay::BattleCustomizer::Tier;
+-    bool past_tested = false;
+-    for (const XDNetplay::BattleCustomizer::StyleOption& option :
+-         XDNetplay::BattleCustomizer::ModelTable())
+-    {
+-      if (!past_tested && option.tier == Tier::Experimental)
+-      {
+-        model_combo->insertSeparator(model_combo->count());
+-        past_tested = true;
+-      }
+-      const QString name = QString::fromUtf8(option.name);
+-      model_combo->addItem(
+-          option.tier == Tier::Experimental ? tr("%1 (untested)").arg(name) : name, option.id);
+-    }
++    const QString name = QString::fromUtf8(option.name);
++    model_combo->addItem(XDNetplay::BattleCustomizer::ModelHasPortrait(option.id) ?
++                             name :
++                             tr("%1 (no portrait)").arg(name),
++                         option.id);
+   }
+   model_layout->addWidget(new QLabel(tr("Trainer model:"), &dialog));
+   model_layout->addWidget(model_combo, 1);
+   dialog_layout->addLayout(model_layout);
++  auto* portrait_note = new QLabel(
++      tr("Models marked \"(no portrait)\" show no close-up on the connection and team "
++         "screens — the battle model still changes."),
++      &dialog);
++  portrait_note->setWordWrap(true);
++  dialog_layout->addWidget(portrait_note);
+ 
+   // "Use my save": submit the party from the player's OWN local save (the
+   // port-2 slot the Team Editor's "Host" role edits -- their slot regardless
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index d01e5fa..404b340 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -374,10 +374,13 @@ void XDLauncherDialog::CreateMainLayout()
+   // Battle Style: picks the HOST makes. All but the first are purely cosmetic:
+   // BattleCustomizer turns them into one synced AR code at Start, so both
+   // players always see the same thing; "Game default" genuinely emits nothing
+-  // and an all-default session stays byte-for-byte stock. Entries after each
+-  // list's separator are valid but untested in battle -- their labels say so;
+-  // venues whose terrain changes a few moves carry that in the label too, no
+-  // extra dialogs.
++  // and an all-default session stays byte-for-byte stock. Music and venue
++  // entries after each list's separator are valid but untested in battle --
++  // their labels say so; venues whose terrain changes a few moves carry that
++  // in the label too, no extra dialogs. MODELS are field-proven, so their
++  // lists carry no tier presentation at all: instead, models without a
++  // pre-rendered bust say "(no portrait)" and a one-line note under the model
++  // rows explains what that means.
+   //
+   // The first row is the battle FORMAT (v1.4.0) -- the one pick that is not
+   // cosmetic. It is persisted in MAIN_XD_FORMAT exactly like the style keys;
+@@ -428,21 +431,26 @@ void XDLauncherDialog::CreateMainLayout()
+       XDNetplay::FormatRules::FORMAT_ORRE_COLOSSEUM);
+   const auto populate_style_combo =
+       [this](QComboBox* combo, std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
+-             bool terrain_suffix) {
++             bool model_table, bool terrain_suffix) {
+         using XDNetplay::BattleCustomizer::Tier;
+         combo->addItem(tr("Game default"), 0);
+         bool past_tested = false;
+         for (const XDNetplay::BattleCustomizer::StyleOption& option : table)
+         {
+-          // The tables list tested-safe entries first; the tier change is
+-          // where the "here be dragons" separator goes.
+-          if (!past_tested && option.tier == Tier::Experimental)
++          // Music/venue tables list tested-safe entries first; the tier change
++          // is where the "here be dragons" separator goes. Model lists get no
++          // tier presentation (the field has disproven "untested" there):
++          // their one distinction is whether the pick has a pre-rendered bust,
++          // said in the label as "(no portrait)".
++          if (!model_table && !past_tested && option.tier == Tier::Experimental)
+           {
+             combo->insertSeparator(combo->count());
+             past_tested = true;
+           }
+           const QString name = QString::fromUtf8(option.name);
+-          const bool untested = option.tier == Tier::Experimental;
++          const bool untested = !model_table && option.tier == Tier::Experimental;
++          const bool no_portrait =
++              model_table && !XDNetplay::BattleCustomizer::ModelHasPortrait(option.id);
+           const bool terrain = terrain_suffix && VenueAltersTerrain(option.id);
+           QString item;
+           if (untested && terrain)
+@@ -451,6 +459,8 @@ void XDLauncherDialog::CreateMainLayout()
+             item = tr("%1 (untested)").arg(name);
+           else if (terrain)
+             item = tr("%1 (alters Nature Power etc.)").arg(name);
++          else if (no_portrait)
++            item = tr("%1 (no portrait)").arg(name);
+           else
+             item = name;
+           combo->addItem(item, option.id);
+@@ -463,14 +473,25 @@ void XDLauncherDialog::CreateMainLayout()
+       tr("Guest model (used only if they don't pick):"),
+       tr("Fallback only: a model the guest picks when submitting\n"
+          "their team always wins over this."));
++  // One line under the model rows: what "(no portrait)" costs (nothing but the
++  // close-up), so nobody reads it as "broken".
++  auto* portrait_note = new QLabel(
++      tr("Models marked \"(no portrait)\" show no close-up on the connection and team "
++         "screens — the battle model still changes."));
++  portrait_note->setWordWrap(true);
++  style_layout->addWidget(portrait_note, style_row, 0, 1, 2);
++  style_row++;
+   m_style_music_combo = add_style_combo(tr("Battle music:"), QString());
+   m_style_venue_combo = add_style_combo(
+       tr("Battle location:"), tr("Locations that alter Nature Power, Camouflage or Secret Power\n"
+                                  "say so in their name -- everything else is purely cosmetic."));
+-  populate_style_combo(m_style_host_model_combo, XDNetplay::BattleCustomizer::ModelTable(), false);
+-  populate_style_combo(m_style_guest_model_combo, XDNetplay::BattleCustomizer::ModelTable(), false);
+-  populate_style_combo(m_style_music_combo, XDNetplay::BattleCustomizer::MusicTable(), false);
+-  populate_style_combo(m_style_venue_combo, XDNetplay::BattleCustomizer::VenueTable(), true);
++  populate_style_combo(m_style_host_model_combo, XDNetplay::BattleCustomizer::ModelTable(), true,
++                       false);
++  populate_style_combo(m_style_guest_model_combo, XDNetplay::BattleCustomizer::ModelTable(), true,
++                       false);
++  populate_style_combo(m_style_music_combo, XDNetplay::BattleCustomizer::MusicTable(), false,
++                       false);
++  populate_style_combo(m_style_venue_combo, XDNetplay::BattleCustomizer::VenueTable(), false, true);
+   style_layout->setColumnStretch(1, 1);
+   style_box->setLayout(style_layout);
+   layout->addWidget(style_box);
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 366cfbb..dc8a1ad 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -572,6 +572,13 @@ bool IsValidVenueId(int id)
+   return FindOption(VENUES, id) != nullptr;
+ }
+ 
++bool ModelHasPortrait(int model_id)
++{
++  // Exactly the models with a bust class -- i.e. the six GBA player models the
++  // connection menu binds bust widgets for (see ModelBustClass above).
++  return ModelBustClass(model_id) != 0;
++}
++
+ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2_model,
+                               std::optional<int> bgm, std::optional<int> venue, int p1_class,
+                               int p2_class)
+@@ -658,10 +665,29 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+     };
+     // No collision: each side hides its own class. Collision (shared class):
+     // hide only when BOTH sides are bustless, emitted once.
++    bool any_hide = false;
+     if (p1_hide && (!classes_collide || p2_hide))
++    {
+       emit_hide(p1_class);
++      any_hide = true;
++    }
+     if (p2_hide && !classes_collide)
++    {
+       emit_hide(p2_class);
++      any_hide = true;
++    }
++    // Class 0 rides along with any hide: the column-0 GC-protagonist bust is
++    // every bust widget's compile-time DEFAULT record (verified: all sixteen
++    // bust descriptors default to 0x201/0x208), so a widget drawn before its
++    // per-class re-crop -- the team preview screen does this -- shows the
++    // protagonist even though no class ever selected it. The complete-image
++    // scan proved these fourteen records are the ONLY path to the bust atlas,
++    // so zeroing class 0 too closes the last surface. Only ever emitted while
++    // a hide is active, i.e. a portrait-less pick in this app's GBA-vs-GBA
++    // flow -- a genuine GC-vs-GBA session (where column 0 is a real player's
++    // bust) never has these lines.
++    if (any_hide)
++      emit_hide(0);
+   }
+   if (music)
+   {
+@@ -695,7 +721,14 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+ // getter's working buffer (rebuilt in-call), never ctx+0x10 (races the random
+ // venue roll); the venue stays on the field-proven record +0x06 pin.
+ constexpr u32 ORRE_MENU_GLOBAL_LINES[][2] = {
+-    {0x044349EC, 0x00000000},  // player layout = 2P (layout >= 2 would force tag mode)
++    {0x044349EC, 0x00000001},  // player layout = GBA vs GBA. The layout global IS the mode row:
++                               // 0 = GC vs GBA, 1 = GBA vs GBA, 2/3 = tag (>= 2 forces tag at
++                               // commit). Pinning 0 held the row on GC vs GBA and per-frame
++                               // reverted any attempt to select GBA vs GBA -- the field bug.
++                               // Value 1 verified against the layout table at 0x802EAA70 (ports
++                               // {2,3}, matching this fork's SI config exactly) and the mode
++                               // label atlas; layout 1 also skips the GC-pad presence gates, so
++                               // no new refusal dialog becomes reachable.
+     {0x044349F0, 0x00000001},  // battle type = Double -> ctx+8 = 1 -> record 7
+     {0x044349FC, 0x00000003},  // rules choice = Custom 1 (save-backed slot the getter
+                                // returns DIRECTLY for selections 3..5 -- the pin holds)
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+index fd614e8..e19e1cb 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+@@ -102,6 +102,13 @@ bool IsValidModelId(int id);
+ bool IsValidMusicId(int id);
+ bool IsValidVenueId(int id);
+ 
++// Whether the disc ships a pre-rendered pre-battle bust for this model: true
++// exactly for the six GBA player models (0x04..0x09). Every other model
++// battles fine (field-proven) but has no close-up portrait, so the connection
++// and team screens show none for it -- the UI labels such picks
++// "(no portrait)" instead of presenting a tier.
++bool ModelHasPortrait(int model_id);
++
+ // Pure assembly: returns the op lines of the "$OrreLink Battle Style" AR code
+ // (one "AAAAAAAA VVVVVVVV" per line, '\n'-separated, no "$" name line), or an
+ // EMPTY string when every field is absent -- the caller must then emit no code
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 45d7481..8ec0628 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.4.1";
++constexpr char VERSION[] = "1.4.2";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
