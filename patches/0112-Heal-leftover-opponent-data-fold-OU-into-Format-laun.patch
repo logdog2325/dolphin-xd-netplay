@@ -1,0 +1,1456 @@
+From f79e263f4e203839970f860946e352cd36cfd96d Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Thu, 27 Aug 2026 17:41:23 -0700
+Subject: [PATCH] Heal leftover opponent data, fold OU into Format, launcher
+ parity
+
+Three changes shipped together as v1.4.3:
+
+SECURITY: a session that died without its room-close cleanup (app killed,
+crash) left the opponent's injected team as the port-3 socket save -- the
+next SOLO boot played it, and hosting again could have synced it to a new
+guest. Cleanup previously ran only at room close or when the NEXT guest
+submission arrived. New XDNetplay::HealLeftoverGuestState() finishes the
+guest-team lifecycle standalone (the old heal was gated on a .netplayorig
+import stash that template-save hosts never have) and also scrubs stray
+NetPlayTemp copies on joiner machines. It runs from every safe boundary:
+launcher open, team editor open, solo boot, host start, external join, save
+import. Boundaries are guarded by a new room-scoped session flag
+(BattleCustomizer::IsNetplaySessionActive, set by BeginSession at room open
+on both platforms, cleared by EndSession) -- NetPlay::IsNetPlayRunning alone
+is game-scoped and cannot see a lobby, which is exactly when live guest
+teams are on disk.
+
+The standalone "$XD OU Fixes" cheats toggle is gone on every platform; the
+Format dropdown gains an OU entry (Free / OU / Orre Colosseum). The global
+cheats flag is now DERIVED state for XD sessions: PrepareForStart reconciles
+it to (style/rules block active || Format == OU) in both directions --
+including turning a stale toggle-era value off under Free -- remembers the
+pre-session value, and EndSession restores it (written to the Base layer
+explicitly, so a mid-game room close cannot strand the restore in the
+doomed CurrentRun layer). Solo boots no longer claim the netplay lifecycle:
+EnsureGbaConfig uses the new ScrubLeftovers() instead of BeginSession, so
+the solo cleanup hook actually runs. OU rooms are tagged "[OU] " in the
+public lobby, like "[Orre] ".
+
+Launcher parity: Android seeds the bundled VS-mode memory-card GCI into
+GC/USA/Card A (from the build-time Sys asset tree, temp+rename write) and
+gains the Practice-vs-dummy switch; public-lobby joins on both platforms now
+gate on the XD dump and the official BIOS like every other session path;
+desktop's join-by-code checks the game list, and the GBA-controls fix button
+no longer fires two dialogs.
+---
+ .../features/xdnetplay/FormatBridge.kt        |  11 +-
+ .../features/xdnetplay/SaveImportBridge.kt    |  11 ++
+ .../features/xdnetplay/XdMatchmaker.kt        |  20 ++-
+ .../xdnetplay/ui/FindBattlesActivity.kt       |  14 +-
+ .../xdnetplay/ui/TeamEditorActivity.kt        |   7 +
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  59 ++++++--
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  30 ++--
+ .../app/src/main/res/values/strings.xml       |   4 +-
+ .../jni/NetPlay/NetPlayIndexBridge.cpp        |  14 +-
+ Source/Android/jni/NetPlay/Netplay.cpp        |  19 +++
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |   7 +
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |   7 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  87 ++++++-----
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |   4 +-
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  35 +++--
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |  14 +-
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 137 +++++++++++-------
+ .../UICommon/XDNetplay/BattleCustomizer.h     |  65 ++++++---
+ .../UICommon/XDNetplay/DisposableSave.cpp     |  50 ++++---
+ .../Core/UICommon/XDNetplay/FormatRules.cpp   |  11 +-
+ Source/Core/UICommon/XDNetplay/FormatRules.h  |  15 +-
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  |  55 +++++++
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  22 +++
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 24 files changed, 509 insertions(+), 191 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+index b060393..99488ca 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+@@ -7,7 +7,7 @@ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.Gen3Mon
+ /**
+  * Kotlin side of the battle-FORMAT bridge in
+  * Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp — the one-tap Format pick
+- * (Free / Orre Colosseum) for XD GBA-vs-GBA netplay.
++ * (Free / Orre Colosseum / OU) for XD GBA-vs-GBA netplay.
+  *
+  * This exposes VALIDATION only, and validation is deliberately not duplicated
+  * in Kotlin: the ruleset — the restricted-species ban list, Species Clause,
+@@ -30,6 +30,12 @@ object FormatBridge {
+     const val FORMAT_FREE = 0
+     const val FORMAT_ORRE_COLOSSEUM = 1
+ 
++    /** The community "$XD OU Fixes" patches (bring 6 pick 4). No legality
++     *  layer — like Free it produces no notes; shared core enables the
++     *  Sys-bundled OU Fixes code on the host when this is the pick (the
++     *  Format dropdown replaced the old standalone OU switch). */
++    const val FORMAT_OU = 2
++
+     /**
+      * True only for the exact Orre Colosseum value, matching
+      * FormatRules::IsOrreColosseum: an unknown/garbage key value behaves as
+@@ -38,6 +44,9 @@ object FormatBridge {
+     fun isOrreColosseum(formatKeyValue: Int): Boolean =
+         formatKeyValue == FORMAT_ORRE_COLOSSEUM
+ 
++    /** True only for the exact OU value — same unknown-behaves-as-Free rule. */
++    fun isOu(formatKeyValue: Int): Boolean = formatKeyValue == FORMAT_OU
++
+     /**
+      * Orre Colosseum check of a Showdown team export, using shared core's own
+      * parser and name resolution (so "KYOGRE", "Mr. Mime" and "soul dew"
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+index a92e157..7a863cc 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/SaveImportBridge.kt
+@@ -54,6 +54,15 @@ object SaveImportBridge {
+     fun restoreDefaultSave(deviceNumber: Int): Outcome =
+         parseOutcome(nativeRestoreDefaultSave(deviceNumber))
+ 
++    /**
++     * Boundary heal for a killed session's leftovers: if an opponent's team is
++     * still in a socket save (or a disposable is still standing in for an
++     * import), put the player's own data back before anything reads or syncs
++     * it. No-op unless leftovers exist; refuses while a room or emulation is
++     * live. Call when a screen that reads the socket saves opens.
++     */
++    fun healLeftoverSession() = nativeHealLeftoverSession()
++
+     /** Outcome encoding shared with the C++ side: ["1"/"0", message]. */
+     private fun parseOutcome(flat: Array<String>): Outcome =
+         Outcome(ok = flat.getOrNull(0) == "1", message = flat.getOrNull(1) ?: "")
+@@ -61,4 +70,6 @@ object SaveImportBridge {
+     private external fun nativeImportUserSave(sourcePath: String, device: Int): Array<String>
+ 
+     private external fun nativeRestoreDefaultSave(device: Int): Array<String>
++
++    private external fun nativeHealLeftoverSession()
+ }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+index c1a7fcb..4994abe 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/XdMatchmaker.kt
+@@ -30,6 +30,7 @@ object XdMatchmaker {
+      *     XD [OC] <nickname>            ("OC" = Open Challenge)
+      *     [Orre] XD [OC] <nickname>     when the host's Format pick is
+      *                                   Orre Colosseum
++     *     [OU] XD [OC] <nickname>       when the host's Format pick is OU
+      *
+      * The IDENTICAL format lives in XDNetplayConfig.cpp::MakeOpenSessionName on
+      * desktop. Keep the two in sync — it is the only thing that lets a human
+@@ -37,12 +38,13 @@ object XdMatchmaker {
+      *
+      * Matching itself never keys off the name (see [pickMatch]); the tags are
+      * for people, so a differently named open room is still joinable. The
+-     * "[Orre] " prefix in particular is a human-readable label only — this
+-     * patch adds no matchmaking filter for it, and a Free room's name is
+-     * byte-identical to before the Format feature existed.
++     * "[Orre] " and "[OU] " prefixes in particular are human-readable labels
++     * only — this patch adds no matchmaking filter for them, and a Free
++     * room's name is byte-identical to before the Format feature existed.
+      */
+     const val SESSION_NAME_PREFIX = "XD [OC] "
+     const val ORRE_TAG = "[Orre] "
++    const val OU_TAG = "[OU] "
+ 
+     const val FILE = Settings.FILE_DOLPHIN
+     const val SECTION = Settings.SECTION_INI_NETPLAY
+@@ -55,17 +57,21 @@ object XdMatchmaker {
+     const val DEFAULT_REGION = "NA"
+ 
+     /**
+-     * The name a room this device hosts should publish under. [orreFormat]
++     * The name a room this device hosts should publish under. [formatId]
+      * defaults to the device's own Format pick — the caller IS the host on
+      * every publish path — and is overridable so [FindBattlesActivity] can
+-     * recognize both auto-name shapes regardless of the current pick.
++     * recognize every auto-name shape regardless of the current pick.
+      */
+     fun sessionName(
+         nickname: String,
+-        orreFormat: Boolean = FormatBridge.isOrreColosseum(IntSetting.MAIN_XD_FORMAT.int)
++        formatId: Int = IntSetting.MAIN_XD_FORMAT.int
+     ): String {
+         val base = SESSION_NAME_PREFIX + nickname.ifEmpty { "Player" }
+-        return if (orreFormat) ORRE_TAG + base else base
++        return when {
++            FormatBridge.isOrreColosseum(formatId) -> ORRE_TAG + base
++            FormatBridge.isOu(formatId) -> OU_TAG + base
++            else -> base
++        }
+     }
+ 
+     /**
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+index b12cc39..9ced74a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/FindBattlesActivity.kt
+@@ -27,6 +27,7 @@ import org.dolphinemu.dolphinemu.features.settings.model.NativeConfig
+ import org.dolphinemu.dolphinemu.features.settings.model.StringSetting
+ import org.dolphinemu.dolphinemu.features.xdnetplay.LobbySession
+ import org.dolphinemu.dolphinemu.features.xdnetplay.NetPlayIndexBridge
++import org.dolphinemu.dolphinemu.features.xdnetplay.FormatBridge
+ import org.dolphinemu.dolphinemu.features.xdnetplay.XdMatchmaker
+ import org.dolphinemu.dolphinemu.services.GameFileCacheManager
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+@@ -208,14 +209,15 @@ class FindBattlesActivity : AppCompatActivity(), ThemeProvider {
+         // exactly when a room hosted right now would.
+         val nickname = StringSetting.NETPLAY_NICKNAME.string
+         val defaultName = XdMatchmaker.sessionName(nickname)
+-        // A stored name matching EITHER auto-shape is an auto-name from an
++        // A stored name matching ANY auto-shape is an auto-name from an
+         // earlier publish, not something the user typed — recompute it, so a
+-        // "[Orre] " tag stuck in config from a previous pick can never
+-        // mislabel a Free room (or vice versa). Hand-typed names pass through
+-        // untouched.
++        // "[Orre] " or "[OU] " tag stuck in config from a previous pick can
++        // never mislabel a Free room (or vice versa). Hand-typed names pass
++        // through untouched.
+         val autoNames = setOf(
+-            XdMatchmaker.sessionName(nickname, orreFormat = false),
+-            XdMatchmaker.sessionName(nickname, orreFormat = true)
++            XdMatchmaker.sessionName(nickname, formatId = FormatBridge.FORMAT_FREE),
++            XdMatchmaker.sessionName(nickname, formatId = FormatBridge.FORMAT_ORRE_COLOSSEUM),
++            XdMatchmaker.sessionName(nickname, formatId = FormatBridge.FORMAT_OU)
+         )
+         uiState = uiState.copy(
+             publishEnabled = NativeConfig.getBoolean(
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index 7dfabdb..a9109be 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -31,6 +31,7 @@ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.SaveNaming
+ import org.dolphinemu.dolphinemu.features.xdnetplay.gen3.ShowdownParser
+ import org.dolphinemu.dolphinemu.ui.main.ThemeProvider
+ import org.dolphinemu.dolphinemu.ui.theme.DolphinTheme
++import org.dolphinemu.dolphinemu.features.xdnetplay.SaveImportBridge
+ import org.dolphinemu.dolphinemu.utils.DirectoryInitialization
+ import org.dolphinemu.dolphinemu.utils.ThemeHelper
+ import org.json.JSONObject
+@@ -49,6 +50,12 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         super.onCreate(savedInstanceState)
+ 
+         repo = TeamRepo(this)
++        // The editor displays whatever the socket save holds -- after a killed
++        // session that can be the OPPONENT's team. Heal leftovers before the
++        // first read; no-op in a live room (the room-wide lock governs there).
++        if (DirectoryInitialization.areDolphinDirectoriesReady()) {
++            SaveImportBridge.healLeftoverSession()
++        }
+         reload(TeamRole.HOST)
+ 
+         setContent {
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index a0a4ca1..a5c07d8 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -65,7 +65,6 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var controllerMapped by mutableStateOf(false)
+     private var biosLinkReady by mutableStateOf(false)
+     private var statusMessage by mutableStateOf<String?>(null)
+-    private var cheatsEnabled by mutableStateOf(false)
+ 
+     // Cosmetic battle-style selectors (host side). The option tables live in
+     // native code (BattleCustomizer) and are fetched once directories are
+@@ -79,12 +78,13 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var musicId by mutableStateOf(0)
+     private var venueId by mutableStateOf(0)
+ 
+-    // The one-tap battle FORMAT pick (Free / Orre Colosseum), persisted in the
++    // The one-tap battle FORMAT pick (Free / Orre Colosseum / OU), persisted in the
+     // native Main/XDNetplay/Format key via the settings model, exactly like
+     // the Battle Style picks above. The key's value is what the enforcing
+     // gates in shared core read when this device hosts; a pick here is
+     // already "applied".
+     private var formatId by mutableStateOf(FormatBridge.FORMAT_FREE)
++    private var practiceDummy by mutableStateOf(false)
+ 
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+     private var searching by mutableStateOf(false)
+@@ -277,6 +277,11 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         DirectoryInitialization.start(this)
+         AfterDirectoryInitializationRunner().runWithLifecycle(this) {
+             initialized = true
++            // Boundary heal for a killed session's leftovers (an opponent's
++            // team in a socket save, a disposable over an import) before
++            // anything on this screen reads or seeds the saves. No-op unless
++            // leftovers exist.
++            SaveImportBridge.healLeftoverSession()
+             refreshChecks()
+             GameFileCacheManager.startLoad()
+         }
+@@ -315,10 +320,10 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+                     onPlayXd = { bootXd() },
+-                    cheatsEnabled = cheatsEnabled,
+-                    onCheatsChanged = { on ->
+-                        cheatsEnabled = on
+-                        BooleanSetting.MAIN_ENABLE_CHEATS.setBoolean(NativeConfig.LAYER_BASE, on)
++                    practiceDummy = practiceDummy,
++                    onPracticeDummyChanged = { on ->
++                        practiceDummy = on
++                        BooleanSetting.MAIN_GBA_PRACTICE_DUMMY.setBoolean(NativeConfig.LAYER_BASE, on)
+                         NativeConfig.save(NativeConfig.LAYER_BASE)
+                     },
+                     modelOptions = modelOptions,
+@@ -546,7 +551,6 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     }
+ 
+     private fun refreshChecks() {
+-        cheatsEnabled = BooleanSetting.MAIN_ENABLE_CHEATS.boolean
+         // Battle-style tables are static native data — fetch once; selections
+         // re-read every refresh so an external config change is reflected.
+         if (modelOptions.isEmpty()) {
+@@ -560,10 +564,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         musicId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_MUSIC)
+         venueId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_VENUE)
+         formatId = IntSetting.MAIN_XD_FORMAT.int
++        practiceDummy = BooleanSetting.MAIN_GBA_PRACTICE_DUMMY.boolean
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+         teamSavesReady = if (emeraldRomSet) seedTeamSaves() else false
++        seedVsModeGci()
+         controllerMapped = try {
+             AutoMapper.isMapped() || AutoMapper.autoMap()
+         } catch (_: Exception) {
+@@ -711,10 +717,11 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         if (IntSetting.MAIN_SI_DEVICE_2.int != 13) {
+             IntSetting.MAIN_SI_DEVICE_2.setInt(NativeConfig.LAYER_BASE, 13); changed = true
+         }
+-        // The 2-year-stable papajefe XDNetplay bundle runs with cheats ON so the
+-        // $XD OU Fixes AR code (enabled in the bundled GXXE01.ini) actually
+-        // Cheats are off by default and controlled by the "$XD OU Fixes" switch
+-        // on the launcher (host's choice syncs to the guest in netplay). Don't
++        // Cheats are DERIVED state for XD sessions: shared core's
++        // PrepareForStart turns MAIN_ENABLE_CHEATS on exactly when the session
++        // needs the AR engine (a Battle Style/rules block, or Format = OU, the
++        // pick that replaced the old standalone "$XD OU Fixes" switch) and off
++        // otherwise; the host's value syncs to the guest in netplay. Don't
+         // force them on here.
+         // PBR mode turns the touch overlay on for the Wii Remote pointer. XD is
+         // played with the handheld's physical buttons, so put it back.
+@@ -740,6 +747,36 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+      * Places the bundled dummy team saves where Dolphin expects the netplay
+      * GBA saves, so hosting works out of the box. Never overwrites.
+      */
++    // Mirror of desktop's XDNetplay::SeedVsModeGci (XDNetplayConfig.cpp): put
++    // the bundled VS-mode memory-card save into GC/USA/Card A once, never
++    // overwriting, so a fresh install boots XD with VS mode ready instead of a
++    // new-game screen. The source is the build-time Sys asset tree (the jni
++    // CMakeLists copies Data/Sys into assets/Sys for every APK), the same
++    // file desktop reads from its Sys directory. Written via temp + atomic
++    // rename so a copy interrupted mid-write can never leave a truncated file
++    // that the exists() guard would then keep forever. Failure is non-fatal
++    // -- the player can still start a story save; retried on every refresh.
++    private fun seedVsModeGci() {
++        val cardDir = File(
++            DirectoryInitialization.getUserDirectory(),
++            "GC" + File.separator + "USA" + File.separator + "Card A"
++        )
++        val target = File(cardDir, "01-GXXE-PokemonXD.gci")
++        val tmp = File(cardDir, "01-GXXE-PokemonXD.gci.tmp")
++        try {
++            if (target.exists()) return
++            cardDir.mkdirs()
++            assets.open("Sys/XDNetplay/01-GXXE-PokemonXD.gci").use { input ->
++                tmp.outputStream().use { input.copyTo(it) }
++            }
++            if (!tmp.renameTo(target)) tmp.delete()
++        } catch (_: Exception) {
++            // Missing asset or storage hiccup: drop the partial temp so the
++            // next refresh retries cleanly.
++            tmp.delete()
++        }
++    }
++
+     private fun seedTeamSaves(): Boolean {
+         val rom = StringSetting.MAIN_GBA_ROM_2.string
+             .ifEmpty { StringSetting.MAIN_GBA_ROM_3.string }
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index b33299c..297d139 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -71,9 +71,9 @@ fun XDLauncherScreen(
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
+     onPlayXd: () -> Unit,
++    practiceDummy: Boolean,
++    onPracticeDummyChanged: (Boolean) -> Unit,
+     onBattle: () -> Unit,
+-    cheatsEnabled: Boolean,
+-    onCheatsChanged: (Boolean) -> Unit,
+     modelOptions: List<BattleStyleBridge.StyleOption>,
+     musicOptions: List<BattleStyleBridge.StyleOption>,
+     venueOptions: List<BattleStyleBridge.StyleOption>,
+@@ -172,14 +172,15 @@ fun XDLauncherScreen(
+                     verticalAlignment = Alignment.CenterVertically
+                 ) {
+                     Column(Modifier.weight(1f)) {
+-                        Text("\$XD OU Fixes cheat", style = MaterialTheme.typography.bodyLarge)
++                        Text("Practice vs dummy", style = MaterialTheme.typography.bodyLarge)
+                         Text(
+-                            "Off by default. When you host, this applies to both players.",
++                            "Auto-plays GBA port 3 so you can practice link battles alone.",
+                             style = MaterialTheme.typography.bodySmall
+                         )
+                     }
+-                    Switch(checked = cheatsEnabled, onCheckedChange = onCheatsChanged)
++                    Switch(checked = practiceDummy, onCheckedChange = onPracticeDummyChanged)
+                 }
++
+                 Spacer(Modifier.height(12.dp))
+                 // The battle Format pick plus the cosmetic battle-style
+                 // selectors, host-side. The guest picks its OWN model in the
+@@ -234,7 +235,11 @@ fun XDLauncherScreen(
+                 Spacer(Modifier.height(12.dp))
+                 OutlinedButton(
+                     onClick = onFindBattles,
+-                    enabled = xdGameFound,
++                    // Same gate as Battle: the lobby's join path skips this
++                    // screen's checklist, and joining without the official
++                    // BIOS is exactly the silent GBA-not-detected session the
++                    // checklist exists to prevent.
++                    enabled = xdGameFound && biosLinkReady,
+                     modifier = Modifier.fillMaxWidth()
+                 ) {
+                     Text("Find Battles  —  public lobby", style = MaterialTheme.typography.titleMedium)
+@@ -296,6 +301,11 @@ private fun BattleStyleCard(
+                         id = FormatBridge.FORMAT_ORRE_COLOSSEUM,
+                         name = stringResource(R.string.xd_format_orre),
+                         experimental = false
++                    ),
++                    BattleStyleBridge.StyleOption(
++                        id = FormatBridge.FORMAT_OU,
++                        name = stringResource(R.string.xd_format_ou),
++                        experimental = false
+                     )
+                 ),
+                 selectedId = formatId,
+@@ -303,10 +313,10 @@ private fun BattleStyleCard(
+                 onSelected = onFormatChanged,
+                 modifier = Modifier.fillMaxWidth(),
+                 supportingText = stringResource(
+-                    if (formatId == FormatBridge.FORMAT_ORRE_COLOSSEUM) {
+-                        R.string.xd_format_hint_orre
+-                    } else {
+-                        R.string.xd_format_hint_free
++                    when (formatId) {
++                        FormatBridge.FORMAT_ORRE_COLOSSEUM -> R.string.xd_format_hint_orre
++                        FormatBridge.FORMAT_OU -> R.string.xd_format_hint_ou
++                        else -> R.string.xd_format_hint_free
+                     }
+                 )
+             )
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 0bd3d5b..c34aadf 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1136,7 +1136,9 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_format_label">Format</string>
+     <string name="xd_format_free">Free</string>
+     <string name="xd_format_orre">Orre Colosseum</string>
+-    <string name="xd_format_hint_free">No team rules — anything a Gen 3 save can hold.</string>
++    <string name="xd_format_ou">OU</string>
++    <string name="xd_format_hint_free">No patches, no team rules — anything a Gen 3 save can hold.</string>
++    <string name="xd_format_hint_ou">Applies to rooms you host: runs the community $XD OU Fixes patches for both players (bring 6, pick 4, and its mechanics fixes). No team rules.</string>
+     <string name="xd_format_hint_orre">Applies to rooms you host (listed with an [Orre] tag): no Mewtwo, Mew, Lugia, Ho-Oh, Celebi, Kyogre, Groudon, Rayquaza, Jirachi, or Deoxys; no duplicate species; no duplicate held items; Soul Dew banned. Sleep, Freeze, and Self-KO clauses are honor rules — not enforced.</string>
+     <!-- Non-blocking paste-time note; %1$s is a reason from shared core,
+          e.g. "banned species: Kyogre". -->
+diff --git a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+index 9852917..1f18268 100644
+--- a/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayIndexBridge.cpp
+@@ -453,11 +453,23 @@ Java_org_dolphinemu_dolphinemu_features_xdnetplay_SaveImportBridge_nativeRestore
+   return SpanToJStringArray(env, outcome);
+ }
+ 
++JNIEXPORT void JNICALL
++Java_org_dolphinemu_dolphinemu_features_xdnetplay_SaveImportBridge_nativeHealLeftoverSession(
++    JNIEnv*, jobject)
++{
++  // Boundary heal for a killed session's leftovers, callable from the screens
++  // that read the socket saves (launcher checklist, team editor). Mirrors the
++  // desktop launcher's showEvent heal; no-op unless leftovers exist, refuses
++  // while a room or emulation is live.
++  XDNetplay::DisposableSave::HealLeftoverSession();
++}
++
+ // ---------------------------------------------------------------------------
+ // Format bridge (Kotlin counterpart: features/xdnetplay/FormatBridge)
+ // ---------------------------------------------------------------------------
+ //
+-// PASTE-TIME validation for the one-tap FORMAT pick (Free / Orre Colosseum).
++// PASTE-TIME validation for the one-tap FORMAT pick (Free / Orre Colosseum /
++// OU; only Orre Colosseum has a legality layer).
+ // The ruleset lives ONLY in UICommon/XDNetplay/FormatRules -- the same code
+ // the enforcing gates run (the host gate in nativeHost, the guest-submission
+ // gate in the host's TeamInjector) -- so a note shown here and a refusal shown
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index 8849467..a5cb59a 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -225,6 +225,17 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeJoin(JNIEnv
+   }
+   else
+   {
++    // EXTERNAL join only (a host's self-join of its local server lands in the
++    // branch above): boundary heal before connecting, for a killed earlier
++    // session's leftovers -- an opponent's team in a socket save, a previous
++    // host's saves in the NetPlayTemp copies. On the host path this call
++    // would be a disaster, not a no-op: nativeHost has ALREADY swapped
++    // imported saves for disposables and stashed them as .netplayorig, and
++    // the heal would put the full imports right back into the synced path.
++    // (nativeHost's BeginSession also arms the session-active guard, but the
++    // branch split keeps this correct on its own.)
++    XDNetplay::DisposableSave::HealLeftoverSession();
++
+     const std::string traversal_choice = Config::Get(Config::NETPLAY_TRAVERSAL_CHOICE);
+     is_traversal = traversal_choice == "traversal";
+     host_ip = is_traversal ? Config::Get(Config::NETPLAY_HOST_CODE) :
+@@ -239,6 +250,14 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeJoin(JNIEnv
+   if (!client->IsConnected())
+     return 0;
+ 
++  // The room is open from here for a JOINER: mark the netplay session active
++  // so boundary heals (launcher, team editor) stand down for its duration --
++  // the desktop counterpart is NetPlayDialog::show, which covers both roles.
++  // A self-joining host already did this at the end of nativeHost; the
++  // OnRoomClosed callback's EndSession is the matching clear for both.
++  if (!XDNetplay::BattleCustomizer::IsNetplaySessionActive())
++    XDNetplay::BattleCustomizer::BeginSession();
++
+   return reinterpret_cast<jlong>(client.release());
+ }
+ 
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 7fb7b58..8323cea 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -569,6 +569,13 @@ void NetPlayDialog::reject()
+ 
+ void NetPlayDialog::show(std::string nickname, bool use_traversal)
+ {
++  // The room is open from here (host and joiner alike; the one call site is
++  // MainWindow's room creation): mark the netplay session active so boundary
++  // heals (launcher showEvent, team editor open) know the guest-team stashes
++  // and the disposable-save swap now belong to a LIVE room. OnRoomClosed's
++  // EndSession is the matching clear.
++  XDNetplay::BattleCustomizer::BeginSession();
++
+   m_nickname = std::move(nickname);
+   m_use_traversal = use_traversal;
+   m_buffer_size = 0;
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 4e821e7..707fd34 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -36,6 +36,7 @@
+ #include "DolphinQt/QtUtils/QueueOnObject.h"
+ #include "DolphinQt/Settings.h"
+ 
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Text.h"
+ #include "UICommon/XDNetplay/MonFactory.h"
+@@ -137,6 +138,12 @@ void TeamEditorDialog::ConnectWidgets()
+ void TeamEditorDialog::showEvent(QShowEvent* event)
+ {
+   QDialog::showEvent(event);
++  // The editor displays whatever the socket save holds -- after a killed
++  // session that can be the OPPONENT's team. Heal leftovers before every
++  // (re)load: the dialog instance is cached across opens, so a ctor-only heal
++  // would miss every open after the first. No-op unless leftovers exist;
++  // stands down while a room or emulation is live.
++  XDNetplay::DisposableSave::HealLeftoverSession();
+   ReloadForRole();
+ }
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 404b340..9a193d3 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -48,6 +48,7 @@
+ #include "UICommon/GameFile.h"
+ #include "UICommon/NetPlayIndex.h"
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
++#include "UICommon/XDNetplay/DisposableSave.h"
+ #include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/SaveImport.h"
+@@ -194,14 +195,13 @@ void PrepareNetplayConfig()
+ void PreparePublishConfig(bool open_challenge)
+ {
+   Config::SetBaseOrCurrent(Config::NETPLAY_USE_INDEX, true);
+-  // The "[Orre] " room tag rides the published name when the host's Format
+-  // pick is Orre Colosseum -- label only, no matchmaking filter change; with
+-  // Format = Free the name is byte-identical to before the feature.
++  // The "[Orre] " / "[OU] " room tags ride the published name from the host's
++  // Format pick -- labels only, no matchmaking filter change; with Format =
++  // Free the name is byte-identical to before the feature.
+   Config::SetBaseOrCurrent(
+       Config::NETPLAY_INDEX_NAME,
+-      XDNetplay::MakeOpenSessionName(
+-          Config::Get(Config::NETPLAY_NICKNAME),
+-          XDNetplay::FormatRules::IsOrreColosseum(Config::Get(Config::MAIN_XD_FORMAT))));
++      XDNetplay::MakeOpenSessionName(Config::Get(Config::NETPLAY_NICKNAME),
++                                     Config::Get(Config::MAIN_XD_FORMAT)));
+   if (Config::Get(Config::NETPLAY_INDEX_REGION).empty())
+     Config::SetBaseOrCurrent(Config::NETPLAY_INDEX_REGION, "NA");
+   if (open_challenge)
+@@ -415,10 +415,12 @@ void XDLauncherDialog::CreateMainLayout()
+          "  • Soul Dew is banned\n"
+          "Sleep, Freeze and Self-KO clauses are honor rules: please follow\n"
+          "them yourselves — OrreLink never enforces them.\n\n"
+-         "Free — no restrictions; sessions are exactly as before this option\n"
+-         "existed. When you JOIN a room, the host's Format applies, not yours;\n"
+-         "your own pick still gives you legality notes in the Team Editor and\n"
+-         "the Submit Team dialog."));
++         "OU — runs the community $XD OU Fixes patches for both players\n"
++         "(bring-6-pick-4 and its mechanics fixes). No team restrictions.\n\n"
++         "Free — no patches, no restrictions; sessions are exactly as before\n"
++         "this option existed. When you JOIN a room, the host's Format\n"
++         "applies, not yours; your own pick still gives you legality notes in\n"
++         "the Team Editor and the Submit Team dialog."));
+   // The entry labels come from FormatRules so the dropdown, the refusal
+   // dialogs and the room-chat messages all name the formats identically.
+   m_format_combo->addItem(
+@@ -429,6 +431,10 @@ void XDLauncherDialog::CreateMainLayout()
+       QString::fromUtf8(XDNetplay::FormatRules::FormatDisplayName(
+           XDNetplay::FormatRules::FORMAT_ORRE_COLOSSEUM)),
+       XDNetplay::FormatRules::FORMAT_ORRE_COLOSSEUM);
++  m_format_combo->addItem(
++      QString::fromUtf8(
++          XDNetplay::FormatRules::FormatDisplayName(XDNetplay::FormatRules::FORMAT_OU)),
++      XDNetplay::FormatRules::FORMAT_OU);
+   const auto populate_style_combo =
+       [this](QComboBox* combo, std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
+              bool model_table, bool terrain_suffix) {
+@@ -496,13 +502,6 @@ void XDLauncherDialog::CreateMainLayout()
+   style_box->setLayout(style_layout);
+   layout->addWidget(style_box);
+ 
+-  m_cheats_check = new QCheckBox(tr("Enable $XD OU Fixes cheat (OU format)"));
+-  m_cheats_check->setToolTip(
+-      tr("Off by default. When you HOST, this choice applies to both players.\n"
+-         "Needed for the OU bring-6-pick-4 format; leave off for Orre Colosseum."));
+-  m_cheats_check->setChecked(Config::Get(Config::MAIN_ENABLE_CHEATS));
+-  layout->addWidget(m_cheats_check);
+-
+   // Same setting the hub's own checkbox writes. Reworded because the hub, not
+   // this launcher, is what actually opens at startup now -- a checkbox that
+   // names the wrong window is worse than no checkbox.
+@@ -530,8 +529,6 @@ void XDLauncherDialog::ConnectWidgets()
+   connect(m_team_saves_row.fix_button, &QPushButton::clicked, this,
+           &XDLauncherDialog::OnFixTeamSaves);
+   connect(m_vs_save_row.fix_button, &QPushButton::clicked, this, &XDLauncherDialog::OnFixVsSave);
+-  connect(m_gba_input_row.fix_button, &QPushButton::clicked, this,
+-          &XDLauncherDialog::OnGbaInputInfo);
+ 
+   connect(m_save_row_port2.import_button, &QPushButton::clicked, this,
+           [this] { OnImportSave(1); });
+@@ -546,13 +543,28 @@ void XDLauncherDialog::ConnectWidgets()
+   connect(m_search_button, &QPushButton::clicked, this, &XDLauncherDialog::OnSearchForMatch);
+   connect(m_host_button, &QPushButton::clicked, this, &XDLauncherDialog::OnHost);
+   connect(m_join_button, &QPushButton::clicked, this, &XDLauncherDialog::OnJoin);
+-  connect(m_browse_button, &QPushButton::clicked, this, [this] { emit BrowsePublic(); });
+-  connect(m_team_editor_button, &QPushButton::clicked, this, &XDLauncherDialog::OnTeamEditor);
+-
+-  connect(m_cheats_check, &QCheckBox::toggled, this, [](bool checked) {
+-    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, checked);
+-    Config::Save();
++  connect(m_browse_button, &QPushButton::clicked, this, [this] {
++    // The browser's join path skips this dialog, so gate at the door: joining
++    // without the dump or the official BIOS produces exactly the silent
++    // GBA-not-detected session the checklist exists to prevent.
++    if (!FindXdGame())
++    {
++      ModalMessageBox::warning(
++          this, tr("OrreLink"),
++          tr("Pokémon XD (USA) was not found in your game list. Add its folder first."));
++      return;
++    }
++    if (!XDNetplay::CheckOfficialBios(nullptr))
++    {
++      ModalMessageBox::warning(
++          this, tr("OrreLink"),
++          tr("The official GBA BIOS is required — XD cannot detect the GBA without it. "
++             "Add it with \"Choose BIOS...\" first."));
++      return;
++    }
++    emit BrowsePublic();
+   });
++  connect(m_team_editor_button, &QPushButton::clicked, this, &XDLauncherDialog::OnTeamEditor);
+ 
+   connect(m_practice_dummy_check, &QCheckBox::toggled, this, [](bool checked) {
+     Config::SetBaseOrCurrent(Config::MAIN_GBA_PRACTICE_DUMMY, checked);
+@@ -594,6 +606,12 @@ bool XDLauncherDialog::ShowOnStartup()
+ void XDLauncherDialog::showEvent(QShowEvent* event)
+ {
+   QDialog::showEvent(event);
++  // Boundary heal for a killed session's leftovers (an opponent's team in a
++  // socket save, a disposable over an import): the launcher opening is the
++  // first thing a player does after a crash, and everything it leads to --
++  // solo boot, the team editor, hosting -- reads the socket saves. No-op
++  // unless leftovers exist; refuses to run while a room or emulation is live.
++  XDNetplay::DisposableSave::HealLeftoverSession();
+   {
+     const QSignalBlocker blocker(m_practice_dummy_check);
+     m_practice_dummy_check->setChecked(Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY));
+@@ -915,14 +933,6 @@ void XDLauncherDialog::OnFixVsSave()
+   RefreshChecklist();
+ }
+ 
+-void XDLauncherDialog::OnGbaInputInfo()
+-{
+-  ModalMessageBox::information(
+-      this, tr("GBA Input"),
+-      tr("Map the GBA buttons in the main Controllers settings: ports 2 and 3 are set to "
+-         "Emulated GBA by the launcher; only the button mapping is up to you."));
+-}
+-
+ void XDLauncherDialog::OnTeamEditor()
+ {
+   if (!m_team_editor)
+@@ -1126,6 +1136,17 @@ void XDLauncherDialog::OnJoin()
+     return;
+   }
+ 
++  // Netplay never downloads the game: a joiner without the XD dump in their
++  // game list connects and then dies at start with a generic "game not found"
++  // far from the checklist that explains the fix. Same gate as Boot/Host.
++  if (!FindXdGame())
++  {
++    ModalMessageBox::warning(
++        this, tr("OrreLink"),
++        tr("Pokémon XD (USA) was not found in your game list. Add its folder first."));
++    return;
++  }
++
+   if (!XDNetplay::CheckOfficialBios(nullptr))
+   {
+     ModalMessageBox::warning(
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 35326f0..8bd792d 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -84,7 +84,6 @@ private:
+   void OnFixGbaInput();
+   void OnFixTeamSaves();
+   void OnFixVsSave();
+-  void OnGbaInputInfo();
+ 
+   // |device| is the GBA device number: 1 = port 2 (your side), 2 = port 3
+   // (the guest slot).
+@@ -123,7 +122,7 @@ private:
+   // "Game default", which genuinely emits nothing.
+   //
+   // m_format_combo is the one non-cosmetic pick in that group: the battle
+-  // FORMAT (Free / Orre Colosseum), persisted in MAIN_XD_FORMAT and enforced
++  // FORMAT (Free / Orre Colosseum / OU), persisted in MAIN_XD_FORMAT and enforced
+   // by FormatRules' gates -- see the tooltip built in CreateMainLayout.
+   QComboBox* m_format_combo;
+   QComboBox* m_style_host_model_combo;
+@@ -132,7 +131,6 @@ private:
+   QComboBox* m_style_venue_combo;
+ 
+   QCheckBox* m_practice_dummy_check;
+-  QCheckBox* m_cheats_check;
+   QCheckBox* m_show_on_startup_check;
+   QPushButton* m_boot_button;
+   QPushButton* m_host_button;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 3b1c351..dc60caf 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -31,6 +31,7 @@
+ 
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/DisposableSave.h"
++#include "UICommon/XDNetplay/FormatRules.h"
+ 
+ namespace XDNetplay
+ {
+@@ -60,14 +61,18 @@ bool IsXdGameId(const std::string& game_id)
+   return game_id.rfind(XD_GAME_ID, 0) == 0;
+ }
+ 
+-std::string MakeOpenSessionName(const std::string& nickname, bool orre_format)
++std::string MakeOpenSessionName(const std::string& nickname, int format_key_value)
+ {
+   // Mirrors XdMatchmaker.sessionName() on Android, byte for byte. The
+-  // "[Orre] " room tag is a purely human-readable label (no matchmaking
+-  // filter keys off it in this patch); with the Format pick on Free the name
++  // "[Orre] " / "[OU] " room tags are purely human-readable labels (no
++  // matchmaking filter keys off them); with the Format pick on Free the name
+   // is byte-identical to the pre-Format builds.
+   const std::string base = "XD [OC] " + (nickname.empty() ? std::string("Player") : nickname);
+-  return orre_format ? "[Orre] " + base : base;
++  if (XDNetplay::FormatRules::IsOrreColosseum(format_key_value))
++    return "[Orre] " + base;
++  if (XDNetplay::FormatRules::IsOu(format_key_value))
++    return "[OU] " + base;
++  return base;
+ }
+ 
+ bool LooksLikeXdSession(const std::string& published_game_name)
+@@ -106,15 +111,21 @@ bool EnsureGbaConfig()
+   Config::SetBaseOrCurrent(Config::GetInfoForSIDevice(2),
+                            SerialInterface::SIDEVICE_GC_GBA_EMULATED);
+ 
+-  // Cheats (the $XD OU Fixes code) are off by default now and governed by the
+-  // launcher's "OU rules ($XD OU Fixes)" toggle; don't force them on here.
++  // Cheats (the $XD OU Fixes code) are DERIVED state: BattleCustomizer::
++  // PrepareForStart turns them on exactly when the session needs the AR engine
++  // (a style/rules block, or Format = OU -- the pick that replaced the old
++  // standalone toggle) and off otherwise. Don't force them here.
+ 
+   // Session-boundary scrub for the cosmetic battle-style feature: remove any
+   // "$OrreLink Battle Style" block a crashed session left orphaned in the
+   // local GXXE01.ini, so stale cosmetics cannot leak into a solo boot or the
+-  // next session. EnsureGbaConfig only runs from the launcher (never while a
+-  // room is open), which is exactly the boundary BeginSession wants.
+-  BattleCustomizer::BeginSession();
++  // next session. Deliberately NOT BeginSession: this helper also runs for
++  // SOLO boots, and claiming the netplay lifecycle there made the solo
++  // cleanup hook stand down -- EndSession (which restores the reconciled
++  // cheats flag) then waited for a room-closed event a solo boot never gets.
++  // The netplay room itself calls BeginSession when it opens
++  // (NetPlayDialog::show / Android nativeHost).
++  BattleCustomizer::ScrubLeftovers();
+ 
+   // Same boundary, same reason, for the disposable netplay saves: if a crashed
+   // hosted session left a <save>.netplayorig stash behind, the socket save
+@@ -165,9 +176,9 @@ void ApplyStartForcing(NetPlay::NetPlayServer* server)
+   gba_config[2].enabled = true;
+ 
+   // Sync the host's team saves to the guest, give each player only their own
+-  // Sync codes so the HOST's cheat choice governs both sides (if the host runs
+-  // $XD OU Fixes, the guest gets it too; if not, both run clean). We no longer
+-  // force cheats on -- the host's launcher toggle decides.
++  // Sync codes so the HOST's choice governs both sides (if the host's Format
++  // is OU, the $XD OU Fixes code carries to the guest; if not, both run
++  // clean). Cheats themselves are reconciled by PrepareForStart below.
+   Config::SetBaseOrCurrent(Config::NETPLAY_SAVEDATA_LOAD, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_HIDE_REMOTE_GBAS, true);
+   Config::SetBaseOrCurrent(Config::NETPLAY_SYNC_CODES, true);
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index efe0617..35caa61 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -32,8 +32,10 @@ bool IsXdGameId(const std::string& game_id);
+ //
+ //     XD [OC] <nickname>            ("OC" = Open Challenge)
+ //     [Orre] XD [OC] <nickname>     when the host's Format pick is Orre
+-//                                   Colosseum (orre_format = the caller's read
+-//                                   of Config::MAIN_XD_FORMAT)
++//                                   Colosseum
++//     [OU] XD [OC] <nickname>       when the host's Format pick is OU
++//                                   (format_key_value = the caller's read of
++//                                   Config::MAIN_XD_FORMAT)
+ //
+ // The IDENTICAL format lives on the Android side in XdMatchmaker.kt
+ // (SESSION_NAME_PREFIX). Keep the two in sync -- it is the only thing that
+@@ -43,10 +45,10 @@ bool IsXdGameId(const std::string& game_id);
+ // Matching itself never keys off the name: it keys off player_count /
+ // in_game / has_password, so a room named anything else is still joinable.
+ // The tag exists purely so the lobby reads sensibly to people -- including the
+-// "[Orre] " prefix, which is a human-readable label only; this patch adds no
+-// matchmaking filter for it, and a Free room's name is byte-identical to
+-// before the Format feature existed.
+-std::string MakeOpenSessionName(const std::string& nickname, bool orre_format);
++// "[Orre] " and "[OU] " prefixes, which are human-readable labels only; this
++// patch adds no matchmaking filter for them, and a Free room's name is
++// byte-identical to before the Format feature existed.
++std::string MakeOpenSessionName(const std::string& nickname, int format_key_value);
+ 
+ // True when an index entry's published "game" string looks like Pokemon XD.
+ //
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index dc8a1ad..6bd128f 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -447,10 +447,13 @@ std::mutex s_mutex;
+ // The guest's submitted model, already validated. Overwritten (or reset) by
+ // every TeamData arrival; wins over the host's fallback dropdown.
+ std::optional<int> s_guest_model;
+-// True after PrepareForStart turned MAIN_ENABLE_CHEATS on for a cosmetics-only
+-// session; tells RegenerateFromConfig the user's real OU choice is still OFF
+-// and tells EndSession to give the flag back.
+-bool s_cheats_forced = false;
++// The user's MAIN_ENABLE_CHEATS value from before PrepareForStart first
++// reconciled it for this session (the flag is DERIVED state during an XD
++// session: on iff the style/rules block or the OU format needs the AR engine).
++// Set once per session on the first reconciliation that changes the flag;
++// EndSession writes it back, so a desktop user's global cheats preference for
++// other games survives XD sessions unchanged.
++std::optional<bool> s_cheats_before;
+ // Whether the most recent RegenerateIni left a non-empty block in the file.
+ bool s_block_active = false;
+ // True between BeginSession and EndSession -- i.e. a netplay room owns the
+@@ -775,7 +778,7 @@ void BeginSession()
+   {
+     std::lock_guard lock(s_mutex);
+     s_guest_model.reset();
+-    s_cheats_forced = false;
++    s_cheats_before.reset();
+     s_block_active = false;
+     s_netplay_session = true;
+   }
+@@ -783,6 +786,35 @@ void BeginSession()
+   RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
+ }
+ 
++void ScrubLeftovers()
++{
++  // Same stance as the file heals: while emulation runs, whatever is stashed
++  // belongs to the LIVE boot -- most importantly s_cheats_before, which the
++  // core-state hook's EndSession needs intact to restore the cheats flag when
++  // that boot ends. (Desktop hits this for real: the launcher's Host/Join
++  // buttons run EnsureGbaConfig -> here BEFORE MainWindow refuses because a
++  // game is running.) Every caller is a recurring boundary, so standing down
++  // only delays the scrub.
++  if (!Core::IsUninitialized(Core::System::GetInstance()))
++    return;
++  {
++    std::lock_guard lock(s_mutex);
++    // A live room owns the stashes and the INI block -- nothing is a leftover.
++    if (s_netplay_session)
++      return;
++    s_guest_model.reset();
++    s_cheats_before.reset();
++    s_block_active = false;
++  }
++  RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
++}
++
++bool IsNetplaySessionActive()
++{
++  std::lock_guard lock(s_mutex);
++  return s_netplay_session;
++}
++
+ void SetGuestModel(std::optional<int> id)
+ {
+   {
+@@ -1000,17 +1032,11 @@ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status)
+ 
+ bool RegenerateFromConfig(std::string* status)
+ {
+-  bool forced;
+-  {
+-    std::lock_guard lock(s_mutex);
+-    forced = s_cheats_forced;
+-  }
+-  // Once PrepareForStart has forced cheats on, MAIN_ENABLE_CHEATS no longer
+-  // reflects the user's OU choice -- it was OFF, or no force would have
+-  // happened. Without this, the regenerate before a SECOND Start in the same
+-  // room would drop the OU-Fixes disable and hand the guest OU patches the
+-  // host never asked for.
+-  const bool ou_enabled = !forced && Config::Get(Config::MAIN_ENABLE_CHEATS);
++  // The OU choice is the Format dropdown now (the old standalone toggle is
++  // gone), so it reads straight from the format key -- PrepareForStart's
++  // cheats reconciliation can no longer distort it, however many Starts a
++  // room sees.
++  const bool ou_enabled = Config::Get(Config::MAIN_XD_FORMAT) == FormatRules::FORMAT_OU;
+   return RegenerateIni(ConfigSelection(), ou_enabled, status);
+ }
+ 
+@@ -1043,72 +1069,77 @@ void PrepareForStart()
+   RegenerateFromConfig(nullptr);
+ 
+   bool active;
+-  bool forced;
+   {
+     std::lock_guard lock(s_mutex);
+     active = s_block_active;
+-    forced = s_cheats_forced;
+-  }
+-  // The AR engine and SyncCodes are both gated on the host's global cheats
+-  // flag; a cosmetic pick with the OU toggle off would silently do nothing
+-  // without this. Runs before RequestStartGame, therefore before the
+-  // SetupNetSettings snapshot and the SyncCodes INI read. When nothing is
+-  // active the flag is left entirely alone -- a stock session stays stock.
+-  if (active && !forced && !Config::Get(Config::MAIN_ENABLE_CHEATS))
+-  {
+-    {
+-      std::lock_guard lock(s_mutex);
+-      s_cheats_forced = true;
+-    }
+-    // RegenerateFromConfig above already saw the pre-force value (OU off) and
+-    // wrote the "$XD OU Fixes" local disable, so forcing afterwards is safe.
+-    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, true);
+-    LogNote("battlestyle cheats forced on for this session (OU stays disabled)");
+   }
+-  else if (!active && forced)
++  // MAIN_ENABLE_CHEATS is DERIVED state for an XD session: the old standalone
++  // "OU Fixes" toggle became the OU entry of the Format dropdown, so nothing
++  // user-facing writes this flag for XD any more. The AR engine (and netplay's
++  // SyncCodes, via the SetupNetSettings snapshot taken after this hook) must
++  // be ON when anything of ours has to load -- the style/rules block, or the
++  // Sys-bundled OU Fixes code in OU format -- and OFF otherwise, INCLUDING
++  // when a stale true is left over from the removed toggle: without the
++  // off-direction, "Free" would silently keep shipping OU patches the UI can
++  // no longer show or clear. The pre-session value is remembered once and
++  // EndSession writes it back, so a desktop user's global cheats preference
++  // for other games survives XD sessions unchanged. Ordering stays safe in
++  // both directions: the regenerate above already wrote the INI for exactly
++  // this format (OU on -> no local disable; otherwise the block, when active,
++  // carries the "$XD OU Fixes" disable).
++  const bool ou = Config::Get(Config::MAIN_XD_FORMAT) == FormatRules::FORMAT_OU;
++  const bool need_cheats = active || ou;
++  if (Config::Get(Config::MAIN_ENABLE_CHEATS) != need_cheats)
+   {
+-    // The force is a per-start invariant, not a latch. If the block emptied
+-    // between battles in the same room (guest re-submitted without a model,
+-    // host zeroed the dropdowns), the regenerate above stripped the OU-Fixes
+-    // disable -- so leaving cheats forced on would ship Sys-enabled OU
+-    // patches the host's toggle says are OFF. Give the flag back before the
+-    // SetupNetSettings snapshot reads it.
+     {
+       std::lock_guard lock(s_mutex);
+-      s_cheats_forced = false;
++      if (!s_cheats_before)
++        s_cheats_before = !need_cheats;
+     }
+-    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
+-    LogNote("battlestyle block emptied; forced cheats handed back");
++    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, need_cheats);
++    LogNote(fmt::format("battlestyle cheats {} for this session (format={} block={})",
++                        need_cheats ? "on" : "off",
++                        FormatRules::FormatDisplayName(Config::Get(Config::MAIN_XD_FORMAT)),
++                        active ? "active" : "empty"));
+   }
+ }
+ 
+ void EndSession()
+ {
+-  bool forced;
++  std::optional<bool> cheats_before;
+   {
+     std::lock_guard lock(s_mutex);
+     s_guest_model.reset();
+-    forced = s_cheats_forced;
+-    s_cheats_forced = false;
++    cheats_before = s_cheats_before;
++    s_cheats_before.reset();
+     s_netplay_session = false;
+   }
+   // Pure removal: with the stash cleared and an all-default selection this
+   // strips the block, its enabled line and the OU-Fixes disable, leaving the
+   // user's GXXE01.ini as it was before the session.
+   RegenerateIni(Selection{}, /*ou_enabled=*/true, nullptr);
+-  // Give the cheats flag back if the pre-start hook forced it: the user's OU
+-  // toggle reads this key, and leaving it flipped would turn a cosmetics-only
+-  // session into OU rules next time.
+-  if (forced)
++  // Put the cheats flag back the way the user had it before the session's
++  // reconciliation (see PrepareForStart): the flag is only DERIVED state while
++  // an XD session runs, and a desktop user's global preference for other games
++  // must survive it.
++  if (cheats_before)
+   {
+-    Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, false);
++    // Base explicitly, not SetBaseOrCurrent: a mid-game room close runs this
++    // while the Netplay config layer still holds MAIN_ENABLE_CHEATS, and
++    // SetBaseOrCurrent would then route the restore into the CurrentRun layer
++    // -- which BootManager::RestoreConfig wipes moments later, stranding the
++    // reconciled value in Base forever. The pre-session value was captured
++    // FROM Base (PrepareForStart runs before any boot layers exist), so Base
++    // is exactly where it belongs; the still-running game never sees the
++    // write because the Netplay layer keeps overriding until teardown.
++    Config::Set(Config::LayerType::Base, Config::MAIN_ENABLE_CHEATS, *cheats_before);
+     Config::Save();
+   }
+ #ifdef HAS_LIBMGBA
+   // The session's log is closed by the time cleanup runs; append like the team
+   // purge does, so the same file also records that the block was taken out.
+   GBADetectLog::LogPostSession(
+-      fmt::format("battlestyle cleanup done cheats_restored={}", forced ? 1 : 0));
++      fmt::format("battlestyle cleanup done cheats_restored={}", cheats_before ? 1 : 0));
+ #endif
+ }
+ }  // namespace XDNetplay::BattleCustomizer
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+index e19e1cb..93fa264 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.h
+@@ -48,12 +48,14 @@ namespace XDNetplay::BattleCustomizer
+ //
+ // Cheats gating: nothing ships unless the host's MAIN_ENABLE_CHEATS is true
+ // when RequestStartGame runs (SetupNetSettings snapshots it; guests inherit
+-// it through the netplay config layer). The launcher equates that flag with
+-// its "OU rules ($XD OU Fixes)" toggle, so when a cosmetic is active while
+-// the OU toggle is OFF, PrepareForStart forces cheats on and RegenerateIni
+-// writes "$XD OU Fixes" into the local [ActionReplay_Disabled] -- the local
+-// pass of ReadEnabledAndDisabled can disable a Sys-bundled code -- keeping
+-// the OU patches off while the cosmetic block runs. EndSession undoes both.
++// it through the netplay config layer). Since the Format dropdown absorbed
++// the old standalone "OU Fixes" toggle, that flag is DERIVED state for XD
++// sessions: PrepareForStart reconciles it to (block active || format == OU),
++// in both directions, remembering the pre-session value. When the block is
++// active while the format is NOT OU, RegenerateIni writes "$XD OU Fixes"
++// into the local [ActionReplay_Disabled] -- the local pass of
++// ReadEnabledAndDisabled can disable a Sys-bundled code -- keeping the OU
++// patches off while the block runs. EndSession restores the remembered flag.
+ //
+ // Every address in the generated block is NTSC-U (GXXE01) ONLY. The block is
+ // keyed to the GXXE01 local INI, so a future PAL/JP experiment cannot inherit
+@@ -158,13 +160,14 @@ struct Selection
+ // Reads the four MAIN_XD_STYLE_* config keys.
+ Selection ConfigSelection();
+ 
+-// Session-boundary scrub: clears the stashed guest model and removes any
+-// "$OrreLink Battle Style" block a crashed session left orphaned in
+-// User/GameSettings/GXXE01.ini (plus its enabled line and the OU-Fixes local
+-// disable), so stale cosmetics can never leak into a solo boot or the next
+-// session. Call when a hosting flow begins (desktop: EnsureGbaConfig;
+-// Android: nativeHost). Do NOT call while a room is open -- it would discard
+-// a guest's submitted model.
++// Room-open entry: performs the same scrub as ScrubLeftovers AND marks the
++// netplay session active (IsNetplaySessionActive). Call when the netplay room
++// actually opens -- desktop: NetPlayDialog::show (host and joiner alike);
++// Android: the end of nativeHost, and nativeJoin's external-join branch after
++// the client connects. Do NOT call from solo-boot or launcher boundaries
++// (that is ScrubLeftovers' job -- claiming the lifecycle there makes the
++// solo-cleanup hook stand down and strands the cheats-flag restore), and NOT
++// while a room is open -- it would discard a guest's submitted model.
+ void BeginSession();
+ 
+ // Stash the guest's submitted model (host side, netplay thread). Called on
+@@ -175,6 +178,23 @@ void BeginSession();
+ // values are dropped here, never clamped. Cleared by Begin/EndSession.
+ void SetGuestModel(std::optional<int> id);
+ 
++// Boundary scrub WITHOUT claiming the netplay lifecycle: clears the stashes
++// and strips any leftover "$OrreLink Battle Style" block a crashed session
++// left in the local INI. This is the call for solo-boot and launcher-open
++// boundaries -- BeginSession does the same scrub but also marks a netplay
++// session as active, which makes the solo-cleanup core-state hook stand down
++// and EndSession (the cheats-flag restore) wait for a room-closed event that
++// a solo boot never gets. No-op while a netplay session is active: whatever
++// is stashed then belongs to the LIVE room, not to a crashed one.
++void ScrubLeftovers();
++
++// True from BeginSession (a netplay room opened in this process) until
++// EndSession. The heal machinery consults this: NetPlay::IsNetPlayRunning()
++// is GAME-scoped (true only while a netplay game runs), yet guest teams are
++// injected exactly while it is false -- in the lobby and between battles --
++// so lifecycle files on disk are only "leftovers" when this is false too.
++bool IsNetplaySessionActive();
++
+ // Rewrites the "$OrreLink Battle Style" block in User/GameSettings/GXXE01.ini
+ // from sel (+ the stashed guest model, which wins over sel.guest_model_
+ // fallback), enables it via [ActionReplay_Enabled], and -- only while the
+@@ -184,24 +204,25 @@ void SetGuestModel(std::optional<int> id);
+ bool RegenerateIni(const Selection& sel, bool ou_enabled, std::string* status);
+ 
+ // RegenerateIni driven entirely by config: selection from the MAIN_XD_STYLE_*
+-// keys, ou_enabled from MAIN_ENABLE_CHEATS (corrected for a force applied by
+-// PrepareForStart earlier in this session, so a second Start in the same room
+-// cannot mistake our own forcing for the user's OU choice). This is the call
+-// for the host's TeamData handlers: regenerate on every submission arrival so
+-// a model submitted any time before Start is honored.
++// keys, ou_enabled from MAIN_XD_FORMAT == FORMAT_OU (the Format dropdown is
++// the OU choice now; the flag PrepareForStart reconciles cannot distort it).
++// This is the call for the host's TeamData handlers: regenerate on every
++// submission arrival so a model submitted any time before Start is honored.
+ bool RegenerateFromConfig(std::string* status);
+ 
+ // The pre-start hook, host side, strictly before RequestStartGame (desktop:
+ // ApplyStartForcing; Android: nativeStartGame): regenerates the block once
+-// more, then -- only when the block is non-empty -- forces MAIN_ENABLE_CHEATS
+-// on so the block actually loads and ships (see the gating note above).
++// more, then reconciles MAIN_ENABLE_CHEATS to what this session needs -- on
++// when the block is non-empty or the format is OU, off otherwise (see the
++// gating note above; the off-direction is what keeps a stale flag from the
++// removed OU toggle from silently shipping OU patches under "Free").
+ // A submission that arrives after this point is rejected by the server while
+ // the battle runs, so the synced set can never diverge mid-session.
+ void PrepareForStart();
+ 
+ // End-of-session cleanup, next to RestoreHostTeam in the OnRoomClosed hooks:
+ // clears the guest stash, removes the block/enabled/disabled lines (pure
+-// removal -- the file is stock again), and gives MAIN_ENABLE_CHEATS back to
+-// the user if PrepareForStart forced it on this session.
++// removal -- the file is stock again), and puts MAIN_ENABLE_CHEATS back to
++// its pre-session value if PrepareForStart reconciled it this session.
+ void EndSession();
+ }  // namespace XDNetplay::BattleCustomizer
+diff --git a/Source/Core/UICommon/XDNetplay/DisposableSave.cpp b/Source/Core/UICommon/XDNetplay/DisposableSave.cpp
+index f7c1c2d..14bf2d9 100644
+--- a/Source/Core/UICommon/XDNetplay/DisposableSave.cpp
++++ b/Source/Core/UICommon/XDNetplay/DisposableSave.cpp
+@@ -3,6 +3,8 @@
+ 
+ #include "UICommon/XDNetplay/DisposableSave.h"
+ 
++#include "UICommon/XDNetplay/BattleCustomizer.h"
++
+ #include <atomic>
+ #include <mutex>
+ #include <optional>
+@@ -201,29 +203,20 @@ std::optional<EmeraldSave> BuildDisposable(int device, std::vector<u8> source_by
+   return disposable;
+ }
+ 
+-// Crash self-heal, part 1: if the crashed session ALSO left TeamInjector's
+-// lifecycle unfinished on the port-3 slot (a guest's party may still be in the
+-// save and its .bak/.tmp), finish that first: RestoreHostTeam runs its purge
+-// inline when emulation is down, restoring the disposable from .hostteam and
+-// scrubbing the guest copies; part 2 (RestoreNow) then puts the import back
+-// over the disposable. Calling RestoreHostTeam here also registers
+-// TeamInjector's Core-state hook before this module ever registers its own,
+-// preserving the restore-after-purge callback order.
++// Crash self-heal, part 1, is XDNetplay::HealLeftoverGuestState (TeamInjector):
++// if the crashed session left the guest-team lifecycle unfinished (a guest's
++// party may still be in a socket save, with .bak/.tmp/.guestteam beside it),
++// its purge restores the pre-injection save -- for an imported port that is
++// the session's disposable -- and scrubs the guest copies; part 2 (RestoreNow)
++// then puts the import back over the result. It goes through RestoreHostTeam,
++// which keeps TeamInjector's Core-state hook registered ahead of this
++// module's, preserving the restore-after-purge callback order.
+ //
+ // MUST be called with s_restore_mutex NOT held: RestoreHostTeam's first call
+ // registers a Core-state callback (HookableEvent's own lock), and this
+ // module's callback takes s_restore_mutex under that same lock -- taking the
+ // two in the opposite order here could deadlock (same note as TeamInjector's
+ // out-of-lock registration).
+-void FinishInnerLifecycleIfLeftover()
+-{
+-  const std::string save_path = SavePathForDevice(2);
+-  if (!save_path.empty() && File::Exists(save_path + NETPLAY_ORIG_SUFFIX) &&
+-      InnerLifecyclePending(save_path))
+-  {
+-    XDNetplay::RestoreHostTeam(2);
+-  }
+-}
+ 
+ // Crash self-heal, part 2, for one port. First-stash-wins: the leftover
+ // .netplayorig IS the import; it is restored, never re-stashed over (a
+@@ -248,9 +241,22 @@ void HealLeftoverSession()
+   // LIVE session's stash, and "healing" it would put the full import back into
+   // the very save path the room is about to sync. Same guard for a running
+   // game: the mGBA cores own the socket saves.
++  // Room-scoped guard first: IsNetPlayRunning is GAME-scoped and cannot see a
++  // lobby or a between-battles window, which is exactly when a live room's
++  // .netplayorig stash and guest-team markers exist (see the TeamInjector
++  // heal's guard note). BeginSession/EndSession bracket the room on both
++  // platforms.
++  if (XDNetplay::BattleCustomizer::IsNetplaySessionActive())
++    return;
+   if (NetPlay::IsNetPlayRunning() || !Core::IsUninitialized(Core::System::GetInstance()))
+     return;
+-  FinishInnerLifecycleIfLeftover();
++  // The guest-team lifecycle heals STANDALONE, not only under a .netplayorig:
++  // a template-save host (no import, so no .netplayorig ever exists) whose
++  // session was killed still has the opponent's party as the socket save, and
++  // the old .netplayorig-gated finish walked right past it -- the next solo
++  // boot then played the guest's team (the 1.4.2 field report). Same
++  // out-of-lock ordering note as the part-1 comment above.
++  XDNetplay::HealLeftoverGuestState();
+   std::lock_guard lock(s_restore_mutex);
+   HealDeviceNow(1);
+   HealDeviceNow(2);
+@@ -280,9 +286,11 @@ bool PrepareForHosting(std::string* error)
+ 
+   // A crashed previous session next: restore before anything is rebuilt, so
+   // the extraction below always reads the real import, never a stale
+-  // disposable. The inner-lifecycle finish runs before the lock (see
+-  // FinishInnerLifecycleIfLeftover's deadlock note).
+-  FinishInnerLifecycleIfLeftover();
++  // disposable -- and so a leftover GUEST team can never be what SyncSaveData
++  // ships to this room's joiners (the standalone heal covers hosts with no
++  // import, where no .netplayorig gates the finish). Runs before the lock
++  // (see the part-1 deadlock note above).
++  XDNetplay::HealLeftoverGuestState();
+ 
+   std::lock_guard lock(s_restore_mutex);
+   HealDeviceNow(1);
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.cpp b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+index 005f481..8c3a082 100644
+--- a/Source/Core/UICommon/XDNetplay/FormatRules.cpp
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+@@ -137,9 +137,18 @@ bool IsOrreColosseum(int format_key_value)
+   return format_key_value == FORMAT_ORRE_COLOSSEUM;
+ }
+ 
++bool IsOu(int format_key_value)
++{
++  return format_key_value == FORMAT_OU;
++}
++
+ const char* FormatDisplayName(int format_key_value)
+ {
+-  return IsOrreColosseum(format_key_value) ? "Orre Colosseum" : "Free";
++  if (IsOrreColosseum(format_key_value))
++    return "Orre Colosseum";
++  if (IsOu(format_key_value))
++    return "OU";
++  return "Free";
+ }
+ 
+ Verdict ValidateSets(const std::vector<ShowdownSet>& sets, const Gen3Data& data)
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.h b/Source/Core/UICommon/XDNetplay/FormatRules.h
+index 86c0675..d0314b7 100644
+--- a/Source/Core/UICommon/XDNetplay/FormatRules.h
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.h
+@@ -26,6 +26,13 @@
+ //                        runs, sessions stay byte-identical to a build
+ //                        without this feature.
+ //     1 = Orre Colosseum the canon in-game ruleset of XD's Orre Colosseum.
++//     2 = OU             the community "$XD OU Fixes" patch set (bring 6 pick
++//                        4 and its mechanics fixes). No party-legality layer:
++//                        like Free it validates nothing here; picking it makes
++//                        the host session run with the Sys-bundled OU Fixes
++//                        code enabled (BattleCustomizer derives the cheats
++//                        flag from this key -- the format dropdown REPLACED
++//                        the old standalone "OU Fixes" toggle).
+ //
+ // What "Orre Colosseum" enforces HERE (the party-legality layer):
+ //   * Species ban list: Gen 1-3 species EXCEPT the restricted legendaries and
+@@ -59,13 +66,17 @@ namespace XDNetplay::FormatRules
+ // it travels through config/JNI as a plain integer, like the style picks.
+ constexpr int FORMAT_FREE = 0;
+ constexpr int FORMAT_ORRE_COLOSSEUM = 1;
++constexpr int FORMAT_OU = 2;
+ 
+ // True only for the exact Orre Colosseum value: an unknown/garbage key value
+ // behaves as Free (no enforcement), never as a surprise lockout.
+ bool IsOrreColosseum(int format_key_value);
+ 
+-// Short display name for a format key value ("Free" / "Orre Colosseum"),
+-// shared by both platforms' UI so the dropdowns and messages agree.
++// True only for the exact OU value -- same unknown-behaves-as-Free rule.
++bool IsOu(int format_key_value);
++
++// Short display name for a format key value ("Free" / "Orre Colosseum" /
++// "OU"), shared by both platforms' UI so the dropdowns and messages agree.
+ const char* FormatDisplayName(int format_key_value);
+ 
+ // Validation outcome. When !ok, reason is one specific human sentence naming
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index 57753b0..60c92c6 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -27,11 +27,13 @@
+ #include "Core/Config/MainSettings.h"
+ #include "Core/Core.h"
+ #include "Core/HW/GBADetectLog.h"
++#include "Core/NetPlayProto.h"
+ #include "Core/System.h"
+ #ifdef HAS_LIBMGBA
+ #include "Core/HW/GBACore.h"
+ #endif
+ 
++#include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Data.h"
+ #include "UICommon/XDNetplay/Gen3Mon.h"
+@@ -843,4 +845,57 @@ void RestoreHostTeam(int device)
+   if (Core::IsUninitialized(Core::System::GetInstance()))
+     RunPendingPurge();
+ }
++
++void HealLeftoverGuestState()
++{
++  // While a netplay SESSION is open in this process, .guestteam/.hostteam are
++  // the LIVE room's lifecycle -- purging now would delete the current guest's
++  // submitted team. IsNetPlayRunning alone cannot see this: it is GAME-scoped
++  // (set at StartGame, cleared at StopGame), and guest teams are injected
++  // exactly while it is false -- in the lobby and between battles -- so the
++  // room-scoped BattleCustomizer flag is the guard that actually matters
++  // (BeginSession fires when a room opens on either platform, EndSession when
++  // it closes). While emulation runs, the mGBA cores own the save files.
++  // Either way: stand down; every caller is a boundary that recurs, so a
++  // skipped heal is only delayed.
++  if (BattleCustomizer::IsNetplaySessionActive() || NetPlay::IsNetPlayRunning() ||
++      !Core::IsUninitialized(Core::System::GetInstance()))
++    return;
++
++  bool purged = false;
++  for (const int device : {1, 2})
++  {
++    const std::string save_path = SavePathForDevice(device);
++    if (save_path.empty())
++      continue;
++    if (File::Exists(save_path + GUEST_MARK_SUFFIX) || File::Exists(save_path + HOST_STASH_SUFFIX))
++    {
++      // Through RestoreHostTeam, not PurgeNow directly: it runs inline here
++      // (emulation is down), and its once-registration keeps TeamInjector's
++      // Core-state hook ahead of DisposableSave's in listener order -- the
++      // same reason the old .netplayorig-gated heal went through it.
++      RestoreHostTeam(device);
++      purged = true;
++    }
++  }
++  if (purged)
++    return;
++
++  // No injection lifecycle pending, but a JOINER's machine can still hold the
++  // host's synced saves in NetPlayTemp*.sav after a killed session -- there is
++  // no marker for those, their cleanup normally rides the room-close purge
++  // that never ran. Netplay rebuilds these files from the wire at every sync,
++  // so deleting them while emulation is down is always safe.
++  std::vector<std::string> notes;
++  for (int slot = 0; slot < 4; ++slot)
++  {
++    if (ScrubAndDelete(NetPlayTempSavePath(slot)))
++      notes.emplace_back(fmt::format("removed=netplaytemp{}", slot + 1));
++  }
++#ifdef HAS_LIBMGBA
++  if (!notes.empty())
++    GBADetectLog::LogPostSession(
++        fmt::format("boot-heal teamcleanup {}", fmt::format("{}", fmt::join(notes, " "))));
++#endif
++}
+ }  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 0de9370..2aa2719 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -203,4 +203,26 @@ bool ValidateHostPartiesForFormat(std::string* reason);
+ // and runs then. Callers do not need to care which happened. Every run appends
+ // a "teamcleanup" line to the GBA detect log.
+ void RestoreHostTeam(int device);
++
++// Boot-boundary self-heal for a session that DIED without its cleanup: the
++// app was killed or crashed while a room was open, so RestoreHostTeam never
++// ran, and the socket save still holds the last guest's party with .guestteam
++// / .hostteam lying beside it. Field case: a killed 1.4.1 session left the
++// opponent's full team as the port-3 save, and the next SOLO boot played it.
++// SelfHealStaleGuestState only runs when the NEXT injection arrives, which a
++// solo boot never triggers -- this is the missing boundary heal.
++//
++// For each GBA device with lifecycle files pending, runs the full purge
++// (restore the host's save, scrub .bak/.tmp/NetPlayTemp copies, drop the
++// marker). When no lifecycle is pending it still deletes stray NetPlayTemp
++// saves -- a JOINER's machine keeps the host's synced saves there when a
++// session is killed, with no marker to say so.
++//
++// Safe to call from any session boundary, as often as wanted: it is a no-op
++// unless leftovers exist, and it refuses to touch anything while netplay is
++// running (markers then belong to the LIVE session) or while emulation owns
++// the saves. DisposableSave::HealLeftoverSession calls this first, so every
++// existing heal boundary (launcher open, solo boot, host start, save import)
++// gets it automatically.
++void HealLeftoverGuestState();
+ }  // namespace XDNetplay
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 8ec0628..392822d 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.4.2";
++constexpr char VERSION[] = "1.4.3";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
