@@ -1,0 +1,84 @@
+From 0c9ef9042e19214a8a83209d9690d316d7a7ef86 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 30 Aug 2026 19:31:17 -0700
+Subject: [PATCH] Blank the pick-screen trainer panels too
+
+Field result on 1.5.1: pick-4 works, but the trainer picture on the
+pick/team-preview screen still showed. That picture is a DIFFERENT system
+from the bust widgets the existing hide zeroes: the screen is built from
+28-byte element records in DOL .data, and its trainer picture is the
+img-0x25F 306x168 panel -- one record per player-slot position, four in
+total (exhaustive scan), always the baked GC protagonist and therefore
+always the wrong head in GBA-vs-GBA. The community's OU code removes it by
+nopping the element handler's frame setup, which corrupts the dispatcher
+stack and takes the Pokemon pictures with it; this instead zeroes just the
+four panels' w/h (one 16-bit AR write each, repeat count covering w and h),
+leaving the mon pictures and the rest of the element pass intact. Same
+trigger as the class-0 bust hide: any format session, or a portrait-less
+pick.
+---
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   | 28 +++++++++++++++++++
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 41388ab..a7ed7a0 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -137,6 +137,26 @@ constexpr u32 BustWhWordAddr(u32 widget_id, u32 language_slot)
+   return 0x04000000u | ((0x803001A8u + widget_id * 72 + 8 + 12 * language_slot + 4) & 0x01FFFFFFu);
+ }
+ 
++// The PICK/TEAM-PREVIEW screen's trainer-picture panels -- a different system
++// from the bust widgets above. That screen is built from 28-byte element
++// records in DOL .data ({handler u32, id u16, pad u16, color u32, img u16,
++// x u16, y u16, w u16, h u16, ...}); the trainer picture is the img-0x25F
++// 306x168 panel, one record per player-slot position (2x2 grid of layout
++// variants, one handler each -- exhaustive scan of the data section found
++// exactly these four). In GBA-vs-GBA that picture is ALWAYS the baked GC
++// protagonist -- the wrong head for both players (the community's OU code
++// kills it too, by nopping the whole element handler's frame setup, which
++// corrupts the dispatcher stack and takes the Pokemon pictures with it; this
++// zeroes just the panels' w/h instead, one 16-bit AR write covering w and h
++// per record via the repeat count, leaving the mon pictures and the rest of
++// the element pass intact). Vanilla value at +0x12: 0x0132 0x00A8.
++constexpr u32 PREVIEW_TRAINER_PANEL_RECORDS[4] = {0x80329D88, 0x8032A274, 0x8032A760,
++                                                  0x8032AC4C};
++constexpr u32 PreviewPanelWhAddr(u32 record)
++{
++  return 0x02000000u | ((record + 0x12) & 0x01FFFFFFu);  // 16-bit write at &w
++}
++
+ // Model id -> bust class (1 FRLG-m, 2 FRLG-f, 3 RS-m, 4 RS-f, 5 E-m, 6 E-f).
+ // Only the six GBA player models have bust widgets in the connection menu;
+ // anything else returns 0 = no bust remap (battle model still changes).
+@@ -697,7 +717,15 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+     // unconditionally. A genuine GC-vs-GBA session (where column 0 is a real
+     // player's bust) never gets these lines: no format pin, no hide.
+     if (any_hide || hide_default_busts)
++    {
+       emit_hide(0);
++      // Same trigger, different screen: blank the pick/preview screen's four
++      // trainer-picture panels (see PREVIEW_TRAINER_PANEL_RECORDS). Value:
++      // repeat count 1 in the high half makes the one 16-bit write cover both
++      // w (+0x12) and h (+0x14).
++      for (const u32 record : PREVIEW_TRAINER_PANEL_RECORDS)
++        AppendLine(&block, PreviewPanelWhAddr(record), 0x00010000);
++    }
+   }
+   if (music)
+   {
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 67279e4..2e9c7c0 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.1";
++constexpr char VERSION[] = "1.5.2";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
