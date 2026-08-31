@@ -20,8 +20,16 @@ Rulesets ("same as Orre but ..."):
 
 Entry shapes:
 
-- **Orre** = bring 6, pick 4 (doubles, as today).
-- **Hoenn** = same as Orre but bring 6, pick 3.
+- **Orre** = bring 6, pick 4, DOUBLE battles.
+- **Hoenn** = bring 6, pick 3, SINGLE battles (corrected by Logan 2026-08-30;
+  the first implementation wrongly assumed doubles).
+
+Clauses (Logan, 2026-08-30): Item Clause, Sleep Clause, Freeze Clause and
+Self-KO Clause (Explosion/Destiny Bond/Perish Song with your final Pokemon
+loses you the game) apply to EVERY format, Orre and Hoenn alike. DECODED
+2026-08-30: the stock tournament preset bytes OrreLink pins carry all of
+these clauses ON (ruleset +0x0C..+0x13; note +0x11's inverted polarity), so
+the game itself enforces them -- they are NOT honor rules.
 
 Giving the six selectable formats:
 
@@ -58,3 +66,13 @@ do not build from it.
   same +7=06 structure as slot 3); entries 3 is the same byte patched to 3.
 - Level is enforced by the game's own rules screen (the pin), not by paste
   validation.
+- ENTRY MODE (decoded 2026-08-30): ruleset +0x1C u16 must be 0 or the game
+  ignores the entries count (+0x1A) and plays all 6 -- the getter at
+  0x8004cfe0 returns 6 whenever +0x1C != 0. The stock preset ships +0x1C=1;
+  OrreLink zeroes it, which makes the game's own pick-N flow run (full 4v4/
+  3v3 enforcement chain verified by disassembly).
+- SOUL DEW cannot be banned in-game for custom rule slots: the 32-entry
+  bannable-item table (0x8032EB08) does not contain item 191, and the game's
+  hardcoded Soul Dew check lives only in the default-rules builder that
+  custom slots bypass. App-side gates (paste/host/submission) are the Soul
+  Dew enforcement, by structural necessity.
