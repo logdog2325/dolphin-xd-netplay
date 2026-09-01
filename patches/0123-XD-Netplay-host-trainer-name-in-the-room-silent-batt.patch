@@ -1,0 +1,1486 @@
+From dfb20b706b8471fd421c92048300c14c6cdfee5c Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 1 Sep 2026 13:36:43 -0700
+Subject: [PATCH] XD Netplay: host trainer name in the room, silent battle
+ music, raise-to-100 opt-in, GBA link progress OSD (v1.5.8)
+
+- Host can set its in-game trainer name from the netplay room on desktop
+  and Android (RenameHostTrainer: GBA port 2 save, OT re-stamp, verified
+  write); the bundled templates ship as Player1/Player2 and the team
+  editor's field was the only place to change it.
+- Battle music gains 'No music (silent battle)': writes 0 into the VS BGM
+  table, the engine's own start-nothing sentinel (id==0 skip in the
+  streamed-voice starter); SFX untouched. Table id 0x10000 so it can never
+  collide with 'Game default'.
+- Raise to Lv. 100, opt-in only: team editor button (level-100 formats
+  only) and a Submit Team checkbox carried as a RaiseLevel100 header,
+  applied by the host only under a level-100 format. Only ever raises.
+- On-screen progress for the fixed GBA link ladder (negotiating / upload
+  percent / client starting), counted per lock so rematches read right.
+- First-screen copy states host-only picks vs what a joiner sets in the
+  next window; hint copy for the host name field.
+---
+ .../features/netplay/NetplaySession.kt        |  30 ++++-
+ .../netplay/model/NetplayViewModel.kt         |  32 ++++-
+ .../features/netplay/ui/NetplayActivity.kt    |   2 +
+ .../features/netplay/ui/NetplayScreen.kt      |  99 +++++++++++++-
+ .../features/xdnetplay/FormatBridge.kt        |  10 ++
+ .../features/xdnetplay/gen3/MonFactory.kt     |  26 ++++
+ .../xdnetplay/ui/TeamEditorActivity.kt        |  19 +++
+ .../features/xdnetplay/ui/TeamEditorScreen.kt |  22 ++-
+ .../app/src/main/res/values/strings.xml       |   8 +-
+ .../jni/NetPlay/NetPlayUICallbacks.cpp        |   6 +-
+ Source/Android/jni/NetPlay/Netplay.cpp        |  25 +++-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    |  48 +++++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |   5 +
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  |  60 ++++++++-
+ Source/Core/DolphinQt/NetPlay/NetPlayDialog.h |   3 +
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  35 ++++-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.h    |   2 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |   7 +-
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   |  19 ++-
+ .../Core/UICommon/XDNetplay/FormatRules.cpp   |   6 +
+ Source/Core/UICommon/XDNetplay/FormatRules.h  |   8 ++
+ Source/Core/UICommon/XDNetplay/MonFactory.cpp |  58 ++++++++
+ Source/Core/UICommon/XDNetplay/MonFactory.h   |  15 +++
+ .../Core/UICommon/XDNetplay/TeamInjector.cpp  | 126 +++++++++++++++++-
+ Source/Core/UICommon/XDNetplay/TeamInjector.h |  30 ++++-
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 26 files changed, 655 insertions(+), 48 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+index ac3889c..9f8190a 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/NetplaySession.kt
+@@ -182,8 +182,18 @@ class NetplaySession(
+      * a "Model:" header in the same message; <= 0 means "no preference" (no
+      * header at all -- the host's fallback dropdown decides).
+      */
+-    fun submitTeam(showdownText: String, trainerName: String, modelId: Int) =
+-        nativeSubmitTeam(showdownText, trainerName, modelId)
++    fun submitTeam(
++        showdownText: String,
++        trainerName: String,
++        modelId: Int,
++        raiseToLevel100: Boolean = false
++    ) = nativeSubmitTeam(showdownText, trainerName, modelId, raiseToLevel100)
++
++    /** Host only: rename the trainer in the GBA port 2 save. Returns a status line. */
++    fun setHostTrainerName(name: String): String = nativeSetHostTrainerName(name)
++
++    /** Current trainer name of the GBA port 2 save, or "" when unreadable. */
++    fun hostTrainerName(): String = nativeHostTrainerName()
+ 
+     /**
+      * "Use my save": submit the party from this player's OWN local save (their
+@@ -200,7 +210,8 @@ class NetplaySession(
+      * @return "" when the bundle was sent, else a user-displayable reason why
+      * nothing was sent (no save, empty party, FireRed/LeafGreen save, ...).
+      */
+-    fun submitSaveBundle(modelId: Int): String = nativeSubmitSaveBundle(modelId)
++    fun submitSaveBundle(modelId: Int, raiseToLevel100: Boolean = false): String =
++        nativeSubmitSaveBundle(modelId, raiseToLevel100)
+ 
+     /** Show a line in this player's own chat log; nothing is sent over the wire. */
+     fun showLocalMessage(message: String) {
+@@ -300,9 +311,18 @@ class NetplaySession(
+ 
+     private external fun nativeSendMessage(message: String)
+ 
+-    private external fun nativeSubmitTeam(showdownText: String, trainerName: String, modelId: Int)
++    private external fun nativeSubmitTeam(
++        showdownText: String,
++        trainerName: String,
++        modelId: Int,
++        raiseToLevel100: Boolean
++    )
++
++    private external fun nativeSubmitSaveBundle(modelId: Int, raiseToLevel100: Boolean): String
++
++    private external fun nativeSetHostTrainerName(name: String): String
+ 
+-    private external fun nativeSubmitSaveBundle(modelId: Int): String
++    private external fun nativeHostTrainerName(): String
+ 
+     private external fun nativeSetHostInputAuthority(enable: Boolean)
+ 
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+index 580199f..3cfcd55 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/model/NetplayViewModel.kt
+@@ -190,7 +190,7 @@ class NetplayViewModel(
+      * validates the id against its own table, so a stale pick can never be
+      * applied, and it can never reject the team.
+      */
+-    fun submitTeam(text: String, trainerName: String, modelId: Int) {
++    fun submitTeam(text: String, trainerName: String, modelId: Int, raiseToLevel100: Boolean = false) {
+         val trimmed = text.trim()
+         if (trimmed.isEmpty()) {
+             return
+@@ -204,7 +204,7 @@ class NetplayViewModel(
+         val pokepaste = Regex("^https?://pokepast\\.es/[A-Za-z0-9]+").find(trimmed)?.value
+         if (pokepaste == null) {
+             storeSubmitDrafts(trimmed, name, modelId, useMySave = false)
+-            netplaySession.submitTeam(trimmed, name, modelId)
++            netplaySession.submitTeam(trimmed, name, modelId, raiseToLevel100)
+             return
+         }
+         viewModelScope.launch(Dispatchers.IO) {
+@@ -222,12 +222,34 @@ class NetplayViewModel(
+                     // Store what the user typed (the link, not the fetched
+                     // body) so next session's sheet prefills the same way.
+                     storeSubmitDrafts(trimmed, name, modelId, useMySave = false)
+-                    netplaySession.submitTeam(body, name, modelId)
++                    netplaySession.submitTeam(body, name, modelId, raiseToLevel100)
+                 }
+             }
+         }
+     }
+ 
++    /** The host's current in-game trainer name (GBA port 2 save), for prefilling. */
++    val hostTrainerName = MutableStateFlow("")
++
++    init {
++        viewModelScope.launch(Dispatchers.IO) {
++            val current = netplaySession.hostTrainerName()
++            withContext(Dispatchers.Main) { hostTrainerName.value = current }
++        }
++    }
++
++    /** Host only: rename the trainer in the GBA port 2 save (the one the room syncs). */
++    fun setHostTrainerName(name: String) {
++        viewModelScope.launch(Dispatchers.IO) {
++            val status = netplaySession.setHostTrainerName(name)
++            val current = netplaySession.hostTrainerName()
++            withContext(Dispatchers.Main) {
++                hostTrainerName.value = current
++                netplaySession.showLocalMessage(status)
++            }
++        }
++    }
++
+     /**
+      * XD Netplay "Use my save": submit the party from this player's OWN local
+      * save -- real mon bytes, real trainer identity -- instead of a Showdown
+@@ -237,9 +259,9 @@ class NetplayViewModel(
+      * here (the save's real trainer name always wins; see NetplaySession), so
+      * only [modelId] rides along.
+      */
+-    fun submitSaveBundle(modelId: Int) {
++    fun submitSaveBundle(modelId: Int, raiseToLevel100: Boolean = false) {
+         viewModelScope.launch(Dispatchers.IO) {
+-            val error = netplaySession.submitSaveBundle(modelId)
++            val error = netplaySession.submitSaveBundle(modelId, raiseToLevel100)
+             withContext(Dispatchers.Main) {
+                 if (error.isEmpty()) {
+                     // The team/name drafts were not part of this submission;
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+index 6a5d804..1e15d3e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayActivity.kt
+@@ -75,6 +75,8 @@ class NetplayActivity : AppCompatActivity(), ThemeProvider {
+                     onSendMessage = viewModel::sendMessage,
+                     onSubmitTeam = viewModel::submitTeam,
+                     onSubmitSaveBundle = viewModel::submitSaveBundle,
++                    onSetHostName = viewModel::setHostTrainerName,
++                    hostTrainerName = viewModel.hostTrainerName.collectAsState().value,
+                     initialTeamText = submitPrefill.teamText,
+                     initialTrainerName = submitPrefill.trainerName,
+                     initialModelId = submitPrefill.modelId,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 78a4046..1e2bf84 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -125,6 +125,8 @@ import java.util.Locale
+ fun NetplayScreen(
+     onBackClicked: () -> Unit,
+     isHosting: Boolean,
++    onSetHostName: (String) -> Unit = {},
++    hostTrainerName: String = "",
+     connectionLost: Flow<Unit>,
+     fatalTraversalError: Flow<TraversalState.Failure>,
+     messages: List<NetplayMessage>,
+@@ -148,8 +150,8 @@ fun NetplayScreen(
+     saveTransferProgress: SaveTransferProgress?,
+     gameDigestProgress: GameDigestProgress?,
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+-    onSubmitTeam: (String, String, Int) -> Unit,
+-    onSubmitSaveBundle: (Int) -> Unit,
++    onSubmitTeam: (String, String, Int, Boolean) -> Unit,
++    onSubmitSaveBundle: (Int, Boolean) -> Unit,
+     initialTeamText: String,
+     initialTrainerName: String,
+     initialModelId: Int,
+@@ -191,6 +193,9 @@ fun NetplayScreen(
+     // save's real trainer name always wins; see NetplaySession), so both grey
+     // out. The model pick stays meaningful either way.
+     var useMySave by rememberSaveable { mutableStateOf(initialUseMySave) }
++    // Opt-in: ask the host to raise every under-level mon to Lv. 100 (host
++    // applies it only in a level-100 format; only ever raises).
++    var raiseTo100 by rememberSaveable { mutableStateOf(false) }
+     if (showSubmitTeam) {
+         AlertDialog(
+             title = { Text("Submit Team") },
+@@ -254,6 +259,21 @@ fun NetplayScreen(
+                         modifier = Modifier.fillMaxWidth(),
+                         supportingText = stringResource(R.string.xd_style_submit_model_hint)
+                     )
++                    Spacer(Modifier.height(8.dp))
++                    Row(
++                        modifier = Modifier.fillMaxWidth(),
++                        verticalAlignment = Alignment.CenterVertically
++                    ) {
++                        Column(Modifier.weight(1f)) {
++                            Text(stringResource(R.string.xd_submit_raise_100))
++                            Text(
++                                stringResource(R.string.xd_submit_raise_100_hint),
++                                style = MaterialTheme.typography.bodySmall,
++                                color = MaterialTheme.colorScheme.onSurfaceVariant
++                            )
++                        }
++                        Switch(checked = raiseTo100, onCheckedChange = { raiseTo100 = it })
++                    }
+                     // Caption under the model control: what "(no portrait)"
+                     // costs (nothing but the close-up), so nobody reads it as
+                     // "broken".
+@@ -298,9 +318,9 @@ fun NetplayScreen(
+                 TextButton(
+                     onClick = {
+                         if (useMySave) {
+-                            onSubmitSaveBundle(modelDraft)
++                            onSubmitSaveBundle(modelDraft, raiseTo100)
+                         } else {
+-                            onSubmitTeam(teamDraft.trim(), nameDraft.trim(), modelDraft)
++                            onSubmitTeam(teamDraft.trim(), nameDraft.trim(), modelDraft, raiseTo100)
+                         }
+                         showSubmitTeam = false
+                     },
+@@ -365,6 +385,8 @@ fun NetplayScreen(
+         if (useWideLayout) {
+             LandscapeContent(
+                 isHosting = isHosting,
++                onSetHostName = onSetHostName,
++                hostTrainerName = hostTrainerName,
+                 messages = messages,
+                 onSendMessage = onSendMessage,
+                 showChat = showChat,
+@@ -394,6 +416,8 @@ fun NetplayScreen(
+         } else {
+             PortraitContent(
+                 isHosting = isHosting,
++                onSetHostName = onSetHostName,
++                hostTrainerName = hostTrainerName,
+                 messages = messages,
+                 onSendMessage = onSendMessage,
+                 showChat = showChat,
+@@ -515,6 +539,8 @@ fun NetplayScreen(
+ @Composable
+ private fun PortraitContent(
+     isHosting: Boolean,
++    onSetHostName: (String) -> Unit = {},
++    hostTrainerName: String = "",
+     messages: List<NetplayMessage>,
+     onSendMessage: (String) -> Unit,
+     showChat: Boolean,
+@@ -576,6 +602,8 @@ private fun PortraitContent(
+             clientBuffer = clientBuffer,
+             onClientBufferChanged = onClientBufferChanged,
+             isHosting = isHosting,
++            onSetHostName = onSetHostName,
++            hostTrainerName = hostTrainerName,
+             joinAddresses = joinAddresses,
+             selectedJoinInfoType = selectedJoinInfoType,
+             onSelectedJoinInfoTypeChanged = onSelectedJoinInfoTypeChanged,
+@@ -592,6 +620,8 @@ private fun PortraitContent(
+ @Composable
+ private fun LandscapeContent(
+     isHosting: Boolean,
++    onSetHostName: (String) -> Unit = {},
++    hostTrainerName: String = "",
+     messages: List<NetplayMessage>,
+     onSendMessage: (String) -> Unit,
+     showChat: Boolean,
+@@ -665,6 +695,8 @@ private fun LandscapeContent(
+                 clientBuffer = clientBuffer,
+                 onClientBufferChanged = onClientBufferChanged,
+                 isHosting = isHosting,
++                onSetHostName = onSetHostName,
++                hostTrainerName = hostTrainerName,
+                 joinAddresses = joinAddresses,
+                 selectedJoinInfoType = selectedJoinInfoType,
+                 onSelectedJoinInfoTypeChanged = onSelectedJoinInfoTypeChanged,
+@@ -678,6 +710,52 @@ private fun LandscapeContent(
+     }
+ }
+ 
++/**
++ * XD Netplay, host side: the joiner sets its in-game name in the Submit Team
++ * sheet; the host sets its own here. Written straight into the GBA port 2
++ * save the room syncs at start (with the party's OT names re-stamped).
++ */
++@Composable
++private fun HostTrainerNameSection(onSetHostName: (String) -> Unit, hostTrainerName: String) {
++    // Prefilled with the save's current name; re-seeded when that loads or changes.
++    var name by rememberSaveable(hostTrainerName) { mutableStateOf(hostTrainerName) }
++    Column(
++        modifier = Modifier
++            .fillMaxWidth()
++            .padding(horizontal = DolphinTheme.scaffoldPadding)
++    ) {
++        Text(
++            stringResource(R.string.xd_host_name_title),
++            style = MaterialTheme.typography.titleMedium
++        )
++        Text(
++            stringResource(R.string.xd_host_name_hint),
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++        Spacer(Modifier.height(8.dp))
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            verticalAlignment = Alignment.CenterVertically
++        ) {
++            OutlinedTextField(
++                value = name,
++                onValueChange = { name = it.take(7) },
++                singleLine = true,
++                label = { Text(stringResource(R.string.xd_host_name_label)) },
++                modifier = Modifier.weight(1f)
++            )
++            Spacer(Modifier.width(8.dp))
++            Button(
++                onClick = { onSetHostName(name.trim()) },
++                enabled = name.isNotBlank()
++            ) {
++                Text(stringResource(R.string.xd_host_name_set))
++            }
++        }
++    }
++}
++
+ @Composable
+ private fun PlayersAndSettings(
+     game: String,
+@@ -696,6 +774,8 @@ private fun PlayersAndSettings(
+     clientBuffer: Int,
+     onClientBufferChanged: (Int) -> Unit,
+     isHosting: Boolean,
++    onSetHostName: (String) -> Unit = {},
++    hostTrainerName: String = "",
+     joinAddresses: Map<JoinInfoType, JoinAddress>,
+     selectedJoinInfoType: JoinInfoType,
+     onSelectedJoinInfoTypeChanged: (JoinInfoType) -> Unit,
+@@ -716,6 +796,13 @@ private fun PlayersAndSettings(
+         if (isHosting) {
+             MenuSpacer()
+ 
++            HostTrainerNameSection(
++                onSetHostName = onSetHostName,
++                hostTrainerName = hostTrainerName
++            )
++
++            MenuSpacer()
++
+             JoinAddressSection(
+                 joinAddresses = joinAddresses,
+                 selectedType = selectedJoinInfoType,
+@@ -1592,8 +1679,8 @@ private fun PreviewNetplayScreen() {
+             JoinInfoType.EXTERNAL to JoinAddress.Loaded("203.0.113.1:2626"),
+             JoinInfoType.LOCAL to JoinAddress.Loaded("192.168.1.5:2626"),
+         ),
+-        onSubmitTeam = { _, _, _ -> },
+-        onSubmitSaveBundle = {},
++        onSubmitTeam = { _, _, _, _ -> },
++        onSubmitSaveBundle = { _, _ -> },
+         initialTeamText = "",
+         initialTrainerName = "PLAYER",
+         initialModelId = 0,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+index 6c20911..657aec7 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/FormatBridge.kt
+@@ -47,6 +47,16 @@ object FormatBridge {
+     /** True only for the exact OU value — same unknown-behaves-as-Free rule. */
+     fun isOu(formatKeyValue: Int): Boolean = formatKeyValue == FORMAT_OU
+ 
++    /** The fixed battle level a format pins: 100 for the Standard/Unlimited
++     *  formats, 50 for the Limited ones, 0 for Free/OU/unknown. Mirrors
++     *  FormatRules::FormatFixedLevel — keep in sync. */
++    fun fixedLevel(formatKeyValue: Int): Int = when (formatKeyValue) {
++        FORMAT_ORRE_COLOSSEUM, FORMAT_ORRE_UNLIMITED,
++        FORMAT_HOENN_STADIUM, FORMAT_HOENN_UNLIMITED -> 100
++        FORMAT_ORRE_LIMITED, FORMAT_HOENN_LIMITED -> 50
++        else -> 0
++    }
++
+     /** The Orre community's six settled formats: three rulesets (Standard =
+      *  Orre Colosseum's rules; Unlimited = everything allowed, Soul Dew
+      *  legal, clauses still apply; Limited = level 50 with ALL legendaries
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+index 7dfa7f3..744b762 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/gen3/MonFactory.kt
+@@ -181,6 +181,32 @@ object MonFactory {
+      * with nature plus/minus indices 0=atk 1=def 2=speed 3=spatk 4=spdef.
+      * Arrays are in Gen 3 order: hp, atk, def, speed, spatk, spdef.
+      */
++    /**
++     * Raise ONE built mon to level 100 in place, keeping IVs, EVs, nature,
++     * moves, item and identity — only level, experience and the six party
++     * stats are recomputed (exactly as [build] does). RAISE ONLY: a mon at
++     * level 100 or above is untouched, and a mon is NEVER lowered (lowering
++     * past where a move was learned breaks legality). Empty slots and species
++     * the data cannot resolve are skipped. Mirrors MonFactory::RaiseMonToLevel100.
++     * @return true if the mon changed
++     */
++    fun raiseToLevel100(mon: Gen3Mon, data: Gen3Data): Boolean {
++        if (mon.isEmpty() || mon.level >= 100) return false
++        val species = data.species.values.firstOrNull { it.id == mon.species } ?: return false
++        val nature = data.nature(mon.natureName) ?: data.nature("hardy") ?: return false
++        val stats = computeStats(species, 100, mon.ivs(), mon.evs, nature)
++        mon.level = 100
++        mon.experience = data.expForLevel(species.expGroup, 100)
++        mon.maxHp = stats[0]
++        mon.currentHp = stats[0]
++        mon.attack = stats[1]
++        mon.defense = stats[2]
++        mon.speed = stats[3]
++        mon.spAttack = stats[4]
++        mon.spDefense = stats[5]
++        return true
++    }
++
+     private fun computeStats(
+         species: Gen3Data.Species,
+         level: Int,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+index e2bf1ea..53f0706 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorActivity.kt
+@@ -68,6 +68,8 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+                     onTrainerNameChange = { setTrainerName(it) },
+                     onImport = { importShowdown(it) },
+                     onRemoveSelected = { removeSelected() },
++                    onRaiseToLevel100 = { raiseToLevel100() },
++                    raiseAvailable = FormatBridge.fixedLevel(IntSetting.MAIN_XD_FORMAT.int) == 100,
+                     onSave = { saveTeam() },
+                     onShare = { shareSave() },
+                     onBack = { finish() }
+@@ -183,6 +185,20 @@ class TeamEditorActivity : AppCompatActivity(), ThemeProvider {
+         uiState = uiState.copy(dirty = failed, messages = messages)
+     }
+ 
++    private fun raiseToLevel100() {
++        // Level-100 formats only, and never a level-down: the repo helper
++        // raises under-level mons and leaves everything else exactly as-is.
++        if (FormatBridge.fixedLevel(IntSetting.MAIN_XD_FORMAT.int) != 100) return
++        val raised = repo.raiseToLevel100()
++        uiState = uiState.copy(
++            party = repo.party.toList(),
++            dirty = uiState.dirty || raised > 0,
++            messages = listOf(
++                if (raised > 0) "Raised $raised Pokémon to Lv. 100" else "Every Pokémon is already Lv. 100"
++            )
++        )
++    }
++
+     private fun removeSelected() {
+         repo.removeAt(uiState.selected)
+         uiState = uiState.copy(
+@@ -415,6 +431,9 @@ class TeamRepo(private val context: Context) {
+         if (index in party.indices) party.removeAt(index)
+     }
+ 
++    /** Raise every under-level mon to Lv. 100 (raise only). Returns how many changed. */
++    fun raiseToLevel100(): Int = party.count { MonFactory.raiseToLevel100(it, data) }
++
+     fun saveToDisk(trainerName: String): List<String> {
+         val s = save ?: return listOf("No save loaded")
+         val path = savePath ?: return listOf("No save path")
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+index 0a81117..c550fdd 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -51,7 +51,9 @@ fun TeamEditorScreen(
+     onRemoveSelected: () -> Unit,
+     onSave: () -> Unit,
+     onShare: () -> Unit,
+-    onBack: () -> Unit
++    onBack: () -> Unit,
++    onRaiseToLevel100: () -> Unit = {},
++    raiseAvailable: Boolean = false
+ ) {
+     var showImport by remember { mutableStateOf(false) }
+ 
+@@ -208,6 +210,24 @@ fun TeamEditorScreen(
+                     modifier = Modifier.weight(1f)
+                 ) { Text("Share") }
+             }
++            // Optional convenience for the level-100 formats: bump every
++            // under-level mon to Lv. 100. RAISE only — never lowers (that
++            // would break legality) — and only offered when the local Format
++            // pick is a level-100 format. "Level 100 or lower" is legal, so
++            // this is opt-in, never automatic.
++            if (raiseAvailable) {
++                val anyBelow = state.party.any { !it.isEmpty() && it.level < 100 }
++                Spacer(Modifier.height(10.dp))
++                Button(
++                    onClick = onRaiseToLevel100,
++                    enabled = anyBelow,
++                    colors = ButtonDefaults.buttonColors(
++                        containerColor = XDColors.PanelLight,
++                        contentColor = XDColors.ChipText
++                    ),
++                    modifier = Modifier.fillMaxWidth()
++                ) { Text(if (anyBelow) "Raise all to Lv. 100" else "All Pokémon are Lv. 100") }
++            }
+             Spacer(Modifier.height(12.dp))
+ 
+             // Status / diagnostics — always honest, always visible
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 4d3147c..a24eadf 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1116,7 +1116,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_update_no_browser">No app on this device can open the release page.</string>
+ 
+     <string name="xd_style_section_title">Battle Style</string>
+-    <string name="xd_style_section_hint">Cosmetic only. Music and battle location follow the HOST: your picks apply to rooms you host, and do nothing in rooms you join. Models are per player — you pick yours here when hosting, and in the Submit Team sheet when joining.</string>
++    <string name="xd_style_section_hint">HOST-ONLY on this screen: Format, music and battle location come from whoever hosts — your picks here apply to rooms you host and do nothing in rooms you join. JOINING? Everything you control — your team and your trainer model — is set in the NEXT window (Submit Team, inside the room). HOSTING? Your trainer name is set inside the room (or in the team editor).</string>
+     <string name="xd_style_your_model">Your model</string>
+     <string name="xd_style_guest_model">Guest model</string>
+     <string name="xd_style_guest_model_hint">Used only if they don\'t pick one themselves</string>
+@@ -1157,6 +1157,12 @@ It can efficiently compress both junk data and encrypted Wii data.
+          mode. Refusal messages (FireRed/LeafGreen save, empty party, ...) come
+          from the shared core and are not duplicated here. -->
+     <string name="xd_submit_use_save">Use my save</string>
++    <string name="xd_host_name_title">Your trainer name (host)</string>
++    <string name="xd_host_name_hint">What your opponent sees in battle. Written into the GBA port 2 save this room syncs (with an imported save it applies to this session only) — up to 7 characters. Joiners set theirs in Submit Team.</string>
++    <string name="xd_host_name_label">Trainer name</string>
++    <string name="xd_host_name_set">Set name</string>
++    <string name="xd_submit_raise_100">Raise my team to Lv. 100</string>
++    <string name="xd_submit_raise_100_hint">The host raises any Pokémon below Lv. 100 — only in a level-100 format, and never lowers one.</string>
+     <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID. This sends the Team Editor\'s "Host (GBA 2)" team.</string>
+     <string name="xd_submit_privacy_note">Your save\'s party is sent exactly as it is, and the host\'s machine receives everything in those bytes: exact moves, held items, stats, EVs, IVs, natures, nicknames, met information, ribbons, and your OT name and BOTH trainer IDs, including the secret one. Your opponent would see most of this by battling you — but not the secret ID, so only send your save to hosts you trust.</string>
+     <string name="xd_submit_name_ignored">Your save\'s real trainer name is used instead.</string>
+diff --git a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+index f1d6656..5505f75 100644
+--- a/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
++++ b/Source/Android/jni/NetPlay/NetPlayUICallbacks.cpp
+@@ -195,8 +195,10 @@ std::string NetPlayUICallbacks::OnTeamSubmission(const std::string& player,
+   std::string status;
+   const bool applied =
+       submission.save_bundle ?
+-          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status) :
+-          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status);
++          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status,
++                                       submission.raise_to_level_100) :
++          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status,
++                                     submission.raise_to_level_100);
+   if (!applied)
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+diff --git a/Source/Android/jni/NetPlay/Netplay.cpp b/Source/Android/jni/NetPlay/Netplay.cpp
+index 64a6340..a72dbba 100644
+--- a/Source/Android/jni/NetPlay/Netplay.cpp
++++ b/Source/Android/jni/NetPlay/Netplay.cpp
+@@ -87,7 +87,8 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(
+                                                                                 jobject obj,
+                                                                                 jstring jteam,
+                                                                                 jstring jname,
+-                                                                                jint jmodel)
++                                                                                jint jmodel,
++                                                                                jboolean jraise)
+ {
+   // XD Netplay: hand this player's Showdown team -- plus the in-game trainer
+   // name they want to play under and their cosmetic trainer-model pick -- to
+@@ -101,13 +102,29 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitTeam(
+   {
+     client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(
+         GetJString(env, jteam), GetJString(env, jname),
+-        jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt));
++        jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt, jraise == JNI_TRUE));
+   }
+ }
+ 
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeHostTrainerName(JNIEnv* env,
++                                                                                     jobject)
++{
++  return ToJString(env, XDNetplay::HostTrainerName());
++}
++
++JNIEXPORT jstring JNICALL
++Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSetHostTrainerName(
++    JNIEnv* env, jobject, jstring jname)
++{
++  std::string status;
++  XDNetplay::RenameHostTrainer(GetJString(env, jname), &status);
++  return ToJString(env, status);
++}
++
+ JNIEXPORT jstring JNICALL
+ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitSaveBundle(
+-    JNIEnv* env, jobject obj, jint jmodel)
++    JNIEnv* env, jobject obj, jint jmodel, jboolean jraise)
+ {
+   // XD Netplay "Use my save": submit the party FROM THIS PLAYER'S OWN SAVE --
+   // real mon bytes, real trainer identity -- instead of a Showdown paste.
+@@ -146,7 +163,7 @@ Java_org_dolphinemu_dolphinemu_features_netplay_NetplaySession_nativeSubmitSaveB
+     return ToJString(env, error);
+ 
+   client->SendTeamSubmission(XDNetplay::BuildBundleSubmissionPayload(
+-      *bundle, jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt));
++      *bundle, jmodel > 0 ? std::optional<int>(jmodel) : std::nullopt, jraise == JNI_TRUE));
+   return ToJString(env, "");
+ }
+ 
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 4ac88cd..c52e9c2 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -28,6 +28,7 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/System.h"
++#include "VideoCommon/OnScreenDisplay.h"
+ 
+ namespace SerialInterface
+ {
+@@ -547,6 +548,53 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       diag->locked.store(m_battle_locked, std::memory_order_relaxed);
+       diag->last_cmd.store(static_cast<u8>(m_last_cmd), std::memory_order_relaxed);
+ 
++      // On-screen link progress. The wait players feel is XD's own fixed
++      // multiboot ladder per GBA -- ~4 s of key exchange, then a ~26,900-write
++      // upload of the ~108 KB client, then ~1.4 s of client boot -- run for one
++      // socket and then the other, back to back. Nothing is stuck during it,
++      // but with no feedback people back out mid-upload (the field's "GBA
++      // failed to connect"). So say what is happening: display only, on the
++      // local OSD, one line per phase and one per 10% of the upload. Reads
++      // only this device's own synced state; never a control input.
++      {
++        constexpr u32 UPLOAD_WRITES = 26900;  // measured, bit-identical across sessions
++        const int port = m_device_number + 1;
++        // m_diag_wr_count is a session-lifetime counter (never reset across a
++        // rematch), so this upload is counted from the lock edge, not from 0.
++        if (m_battle_locked && m_osd_phase < 2)
++          m_osd_upload_base = m_diag_wr_count;
++        const u32 uploaded = m_diag_wr_count - m_osd_upload_base;
++        int phase = 0;
++        if (m_link_established && !m_battle_locked)
++          phase = 1;
++        else if (m_battle_locked && uploaded < UPLOAD_WRITES - 200)
++          phase = 2;
++        else if (m_battle_locked)
++          phase = 3;
++        if (phase != m_osd_phase)
++        {
++          m_osd_phase = phase;
++          m_osd_bucket = -1;
++          if (phase == 1)
++            OSD::AddMessage(fmt::format("GBA port {}: link found, negotiating (~4 s)", port),
++                            OSD::Duration::NORMAL);
++          else if (phase == 3)
++            OSD::AddMessage(fmt::format("GBA port {}: upload done, client starting", port),
++                            OSD::Duration::NORMAL);
++        }
++        if (phase == 2)
++        {
++          const int bucket = static_cast<int>(uploaded * 10 / UPLOAD_WRITES);
++          if (bucket != m_osd_bucket)
++          {
++            m_osd_bucket = bucket;
++            OSD::AddMessage(fmt::format("GBA port {}: uploading client {}% (~{} s left)", port,
++                                        bucket * 10, (10 - bucket) * 3 / 2),
++                            OSD::Duration::NORMAL);
++          }
++        }
++      }
++
+       // H5/H6: latch rising edges. Arm a short command burst on the H5 edge so
+       // the log captures the exact commands crossing the link when XD is
+       // recognized. window-open deliberately does NOT arm a burst (Review #1 I4).
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 0d8646f..7f3fc87 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -133,6 +133,11 @@ private:
+   u32 m_diag_cmd_burst = 0;       // extra command lines emitted after a transition
+   u32 m_diag_rd_count = 0;        // I4: ungated READ count (ground truth in sum)
+   u32 m_diag_wr_count = 0;        // I4: ungated WRITE count (ground truth in sum)
++  // On-screen link progress (display only, never a control input): last phase
++  // and last upload-percent bucket announced, so the OSD says each step once.
++  int m_osd_phase = 0;   // 0 idle, 1 negotiating, 2 uploading, 3 client starting
++  int m_osd_bucket = -1;
++  u32 m_osd_upload_base = 0;  // m_diag_wr_count at the moment the port locked // last 10% bucket announced during the upload
+   u64 m_diag_last_summary_tick = 0;
+   u64 m_diag_window_open_tick = 0;   // rising-edge tick, for window-close dur_ms=
+   u64 m_diag_window_close_tick = 0;  // falling-edge tick, for window-open gap_ms=
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index a0069bc..49beded 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -317,10 +317,27 @@ void NetPlayDialog::CreateChatLayout()
+   m_submit_team_button->setAutoDefault(false);
+   m_submit_team_button->hide();
+ 
++  // XD Netplay, host side: the joiner sets its in-game name in the Submit Team
++  // sheet; the host sets its own here (written into the GBA port 2 save the
++  // room syncs). Shown only while hosting.
++  m_host_name_edit = new QLineEdit;
++  m_host_name_edit->setPlaceholderText(tr("Your trainer name (what your opponent sees)"));
++  m_host_name_edit->setMaxLength(7);
++  m_host_name_edit->setToolTip(tr("Up to 7 characters. Written into the GBA port 2 save this room syncs, "
++                                  "so the next battle shows it (with an imported save it applies to "
++                                  "this session only). Joiners set theirs in Submit Team."));
++  m_host_name_edit->hide();
++  m_host_name_button = new QPushButton(tr("Set Name"));
++  m_host_name_button->setDefault(false);
++  m_host_name_button->setAutoDefault(false);
++  m_host_name_button->hide();
++
+   layout->addWidget(m_chat_edit, 0, 0, 1, -1);
+   layout->addWidget(m_chat_type_edit, 1, 0);
+   layout->addWidget(m_chat_send_button, 1, 1);
+   layout->addWidget(m_submit_team_button, 2, 0, 1, -1);
++  layout->addWidget(m_host_name_edit, 3, 0);
++  layout->addWidget(m_host_name_button, 3, 1);
+ 
+   m_chat_box->setLayout(layout);
+ }
+@@ -388,6 +405,8 @@ void NetPlayDialog::ConnectWidgets()
+   connect(m_chat_send_button, &QPushButton::clicked, this, &NetPlayDialog::OnChat);
+   connect(m_chat_type_edit, &QLineEdit::returnPressed, this, &NetPlayDialog::OnChat);
+   connect(m_submit_team_button, &QPushButton::clicked, this, &NetPlayDialog::OnSubmitTeam);
++  connect(m_host_name_button, &QPushButton::clicked, this, &NetPlayDialog::OnSetHostName);
++  connect(m_host_name_edit, &QLineEdit::returnPressed, this, &NetPlayDialog::OnSetHostName);
+   connect(m_chat_type_edit, &QLineEdit::textChanged, this,
+           [this] { m_chat_send_button->setEnabled(!m_chat_type_edit->text().isEmpty()); });
+ 
+@@ -610,6 +629,10 @@ void NetPlayDialog::show(std::string nickname, bool use_traversal)
+ #endif
+   // Only a joiner submits a team; the host edits its own saves directly.
+   m_submit_team_button->setHidden(is_hosting);
++  m_host_name_edit->setHidden(!is_hosting);
++  m_host_name_button->setHidden(!is_hosting);
++  if (is_hosting)
++    m_host_name_edit->setText(QString::fromStdString(XDNetplay::HostTrainerName()));
+   m_start_button->setHidden(!is_hosting);
+   // Only the host owns the session buffer, so only the host gets the Auto box.
+   // OnHostInputAuthorityChanged refines this once the mode is known.
+@@ -913,8 +936,10 @@ std::string NetPlayDialog::OnTeamSubmission(const std::string& player, const std
+   std::string status;
+   const bool applied =
+       submission.save_bundle ?
+-          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status) :
+-          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status);
++          XDNetplay::InjectGuestBundle(*submission.save_bundle, 2, &status,
++                                       submission.raise_to_level_100) :
++          XDNetplay::InjectGuestTeam(submission.showdown_text, submission.trainer_name, 2, &status,
++                                     submission.raise_to_level_100);
+   if (!applied)
+     return status.empty() ? std::string{"team not applied"} : "team not applied - " + status;
+   return status;
+@@ -942,6 +967,16 @@ void NetPlayDialog::OnRoomClosed()
+   XDNetplay::DisposableSave::EndNetplaySession();
+ }
+ 
++void NetPlayDialog::OnSetHostName()
++{
++  std::string status;
++  const bool ok =
++      XDNetplay::RenameHostTrainer(m_host_name_edit->text().trimmed().toStdString(), &status);
++  DisplayMessage(QString::fromStdString(status), ok ? "green" : "red");
++  if (ok)
++    m_host_name_edit->setText(QString::fromStdString(XDNetplay::HostTrainerName()));
++}
++
+ void NetPlayDialog::OnSubmitTeam()
+ {
+   // Joiner side. A pokepast.es link is resolved HERE, on the submitting
+@@ -1016,6 +1051,16 @@ void NetPlayDialog::OnSubmitTeam()
+                     &dialog);
+   dialog_layout->addWidget(use_save_check);
+ 
++  // Opt-in level-100 convenience: asks the HOST to raise every under-level mon
++  // to Lv. 100 before injecting. The host applies it only when its format is
++  // a level-100 format, and it only ever raises (never lowers -- legality).
++  // "Level 100 or lower" is legal, so this is never automatic.
++  auto* raise_check =
++      new QCheckBox(tr("Raise my team to Lv. 100 (host applies this only in a level-100 "
++                       "format; never lowers a Pokémon)"),
++                    &dialog);
++  dialog_layout->addWidget(raise_check);
++
+   // Shown only while the box is ticked. The disclosure list is deliberately
+   // exhaustive (community review): the bundle carries the real party bytes and
+   // the save's trainer identity, so everything in them lands on the host's
+@@ -1214,6 +1259,7 @@ void NetPlayDialog::OnSubmitTeam()
+   const int model_id = model_combo->currentData().toInt();
+   const std::optional<int> model =
+       model_id > 0 ? std::optional<int>(model_id) : std::nullopt;
++  const bool raise = raise_check->isChecked();
+ 
+   // Persist what was submitted so the next open prefills (read back above).
+   // Called only once a submission actually goes out -- an empty paste or a
+@@ -1273,7 +1319,7 @@ void NetPlayDialog::OnSubmitTeam()
+     // No Name header rides with a bundle -- the save's own identity wins
+     // (BuildBundleSubmissionPayload never emits one). Model still does.
+     Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
+-        XDNetplay::BuildBundleSubmissionPayload(*bundle, model));
++        XDNetplay::BuildBundleSubmissionPayload(*bundle, model, raise));
+     persist_submission();
+     DisplayMessage(tr("Your save's team was sent to the host."), "");
+ #endif
+@@ -1286,7 +1332,7 @@ void NetPlayDialog::OnSubmitTeam()
+   if (!match.hasMatch())
+   {
+     Settings::Instance().GetNetPlayClient()->SendTeamSubmission(
+-        XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name, model));
++        XDNetplay::BuildTeamSubmissionPayload(text.toStdString(), trainer_name, model, raise));
+     persist_submission();
+     DisplayMessage(tr("Team sent to the host."), "");
+     return;
+@@ -1300,13 +1346,13 @@ void NetPlayDialog::OnSubmitTeam()
+   // exactly what the retry wants.
+   persist_submission();
+   QPointer<NetPlayDialog> self(this);
+-  std::thread([self, url, trainer_name, model] {
++  std::thread([self, url, trainer_name, model, raise] {
+     Common::HttpRequest request;
+     request.FollowRedirects();
+     Common::HttpRequest::Response response = request.Get(url);
+     if (!self)
+       return;
+-    QueueOnObject(self.data(), [self, trainer_name, model, response = std::move(response)] {
++    QueueOnObject(self.data(), [self, trainer_name, model, raise, response = std::move(response)] {
+       if (!self)
+         return;
+       if (!response)
+@@ -1317,7 +1363,7 @@ void NetPlayDialog::OnSubmitTeam()
+       if (auto client = Settings::Instance().GetNetPlayClient())
+       {
+         client->SendTeamSubmission(XDNetplay::BuildTeamSubmissionPayload(
+-            std::string(response->begin(), response->end()), trainer_name, model));
++            std::string(response->begin(), response->end()), trainer_name, model, raise));
+         self->DisplayMessage(tr("Team sent to the host."), "");
+       }
+     });
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+index 3e29294..bebbf3d 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.h
+@@ -111,6 +111,7 @@ private:
+   void ConnectWidgets();
+   void OnChat();
+   void OnSubmitTeam();
++  void OnSetHostName();
+   void OnStart();
+   void DisplayMessage(const QString& msg, const std::string& color,
+                       int duration = OSD::Duration::NORMAL);
+@@ -128,6 +129,8 @@ private:
+   QLineEdit* m_chat_type_edit;
+   QPushButton* m_chat_send_button;
+   QPushButton* m_submit_team_button;
++  QLineEdit* m_host_name_edit;
++  QPushButton* m_host_name_button;
+ 
+   // Players
+   QGroupBox* m_players_box;
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 60900d3..7f1dd72 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -20,6 +20,7 @@
+ #include <QRegularExpression>
+ #include <QShowEvent>
+ #include <QUrl>
++#include <QHBoxLayout>
+ #include <QVBoxLayout>
+ 
+ #include "Common/Config/Config.h"
+@@ -105,8 +106,17 @@ void TeamEditorDialog::CreateMainLayout()
+   auto* party_layout = new QVBoxLayout;
+   m_party_list = new QListWidget;
+   m_remove_button = new NonDefaultQPushButton(tr("Remove Selected"));
++  // Optional convenience for the level-100 formats: bump every under-level
++  // mon to Lv 100 (RAISE only -- never lowers, which would break legality).
++  // Shown/enabled only when the local Format pick is a level-100 format
++  // (ReloadForRole updates it); "Level 100 or lower" is legal, so this is
++  // opt-in and never automatic.
++  m_raise_button = new NonDefaultQPushButton(tr("Raise all to Lv. 100"));
++  auto* party_buttons = new QHBoxLayout;
++  party_buttons->addWidget(m_remove_button);
++  party_buttons->addWidget(m_raise_button);
+   party_layout->addWidget(m_party_list);
+-  party_layout->addWidget(m_remove_button);
++  party_layout->addLayout(party_buttons);
+   party_box->setLayout(party_layout);
+   layout->addWidget(party_box);
+ 
+@@ -143,6 +153,7 @@ void TeamEditorDialog::ConnectWidgets()
+           [this](int) { ReloadForRole(); });
+   connect(m_import_button, &QPushButton::clicked, this, &TeamEditorDialog::OnImport);
+   connect(m_remove_button, &QPushButton::clicked, this, &TeamEditorDialog::OnRemoveSelected);
++  connect(m_raise_button, &QPushButton::clicked, this, &TeamEditorDialog::OnRaiseToLevel100);
+   connect(m_save_button, &QPushButton::clicked, this, &TeamEditorDialog::OnSave);
+   connect(m_show_folder_button, &QPushButton::clicked, this, &TeamEditorDialog::OnShowInFolder);
+ }
+@@ -361,6 +372,14 @@ void TeamEditorDialog::RefreshPartyList()
+                               .arg(mon.level)
+                               .arg(QString::fromUtf8(mon.GetNatureName())));
+   }
++  // The raise-to-100 action only makes sense for a level-100 format, and only
++  // when at least one mon is actually below 100 (never a level-DOWN).
++  const int format = Config::Get(Config::MAIN_XD_FORMAT);
++  const bool level100_format = FormatRules::FormatFixedLevel(format) == 100;
++  const bool any_below = std::any_of(m_party.begin(), m_party.end(),
++                                     [](const Gen3Mon& m) { return !m.IsEmpty() && m.level < 100; });
++  m_raise_button->setVisible(level100_format);
++  m_raise_button->setEnabled(level100_format && any_below);
+ }
+ 
+ void TeamEditorDialog::SetMessages(const QStringList& messages)
+@@ -557,6 +576,20 @@ void TeamEditorDialog::OnRemoveSelected()
+   RefreshPartyList();
+ }
+ 
++void TeamEditorDialog::OnRaiseToLevel100()
++{
++  if (!m_data)
++    return;
++  const int format = Config::Get(Config::MAIN_XD_FORMAT);
++  if (FormatRules::FormatFixedLevel(format) != 100)
++    return;  // level-100 formats only; never touch a Lv50 (Limited) team
++  const int raised = MonFactory::RaisePartyToLevel100(m_party, *m_data);
++  SetMessages({raised > 0 ?
++                   tr("Raised %1 Pokémon to Lv. 100.").arg(raised) :
++                   tr("Every Pokémon is already Lv. 100.")});
++  RefreshPartyList();
++}
++
+ void TeamEditorDialog::OnSave()
+ {
+   if (!m_save || m_save_path.empty())
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+index 08f65f8..50026c2 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.h
+@@ -59,6 +59,7 @@ private:
+   void OnImport();
+   void ApplyImportText(const std::string& text);
+   void OnRemoveSelected();
++  void OnRaiseToLevel100();
+   void OnSave();
+   void OnShowInFolder();
+ 
+@@ -90,6 +91,7 @@ private:
+   QPlainTextEdit* m_paste_edit;
+   QPushButton* m_import_button;
+   QPushButton* m_remove_button;
++  QPushButton* m_raise_button;
+   QPushButton* m_save_button;
+   QPushButton* m_show_folder_button;
+   QLabel* m_log_label;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 7a19abb..68bbdb0 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -395,9 +395,10 @@ void XDLauncherDialog::CreateMainLayout()
+     // models are PER PLAYER (a joiner picks theirs in the Submit Team
+     // sheet, and that pick beats the host's fallback dropdown).
+     auto* who_note = new QLabel(
+-        tr("Music and battle location follow the HOST — your picks apply to rooms you host "
+-           "and do nothing in rooms you join. Models are per player: pick yours here when "
+-           "hosting, or in the Submit Team sheet when joining."));
++        tr("HOST-ONLY on this screen: Format, music and battle location come from whoever "
++           "hosts — your picks here apply to rooms you host and do nothing in rooms you join. "
++           "JOINING? Everything you control — your team and your trainer model — is set in "
++           "the NEXT window (Submit Team, inside the room). HOSTING? Your trainer name is set inside the room (or in the team editor)."));
+     who_note->setWordWrap(true);
+     style_layout->addWidget(who_note, style_row, 0, 1, 2);
+     style_row++;
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 642ad28..607d1ba 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -300,7 +300,20 @@ constexpr StyleOption MODELS[] = {
+ // default" already plays, and the vanilla value must never be written.
+ // Display names are best-effort stem translations; finalize EVERY label with a
+ // listening pass through the selector before release.
++// "No music": the VS BGM selector (0x8004D580) hands staBGM_tunaide[n] to a
++// null-guarded setter with no range check, and the streamed-voice starter
++// (0x801871B4) tests the stored id against ZERO before touching the GSDVD
++// stream table -- id 0 is the engine's own "start nothing" sentinel: no
++// stream, no fault, cries/hit SFX unaffected (they go through MusyX, a
++// separate table). The table id is kept OUTSIDE u16 range so it can never
++// collide with a real stream id or with 0 (= "Game default" in the pickers);
++// GenerateCodeBlock maps it to the written value 0. Requested by a community
++// player; the old silent "Event Theme" pick was removed for the same effect
++// with none of the guarantees.
++constexpr int MUSIC_SILENT_ID = 0x10000;
++
+ constexpr StyleOption MUSICS[] = {
++    {MUSIC_SILENT_ID, "No music (silent battle)", Tier::TestedSafe},
+     {1313, "XD Battle 1 (wild battle)", Tier::TestedSafe},
+     {1314, "XD Battle 1b (wild variant)", Tier::TestedSafe},
+     {1315, "XD Battle 6 (trainer)", Tier::TestedSafe},
+@@ -727,8 +740,10 @@ std::string GenerateCodeBlock(std::optional<int> p1_model, std::optional<int> p2
+   }
+   if (music)
+   {
+-    // Three identical u32 slots (primary encoding; see MUSIC_LINES).
+-    const u32 value = static_cast<u32>(*bgm) & 0xFFFF;
++    // Three identical u32 slots (primary encoding; see MUSIC_LINES). The
++    // silent pick writes 0 (see MUSIC_SILENT_ID); everything else is a u16
++    // stream id.
++    const u32 value = *bgm == MUSIC_SILENT_ID ? 0u : (static_cast<u32>(*bgm) & 0xFFFF);
+     for (const u32 addr : MUSIC_LINES)
+       AppendLine(&block, addr, value);
+   }
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.cpp b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+index c69fa5d..ca646fb 100644
+--- a/Source/Core/UICommon/XDNetplay/FormatRules.cpp
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.cpp
+@@ -212,6 +212,12 @@ bool IsOu(int format_key_value)
+   return format_key_value == FORMAT_OU;
+ }
+ 
++int FormatFixedLevel(int format_key_value)
++{
++  return ProfileFor(format_key_value).max_level == 50 ? 50 :
++         (HasTeamRules(format_key_value) ? 100 : 0);
++}
++
+ bool HasTeamRules(int format_key_value)
+ {
+   switch (format_key_value)
+diff --git a/Source/Core/UICommon/XDNetplay/FormatRules.h b/Source/Core/UICommon/XDNetplay/FormatRules.h
+index 46fe3e3..de7aa09 100644
+--- a/Source/Core/UICommon/XDNetplay/FormatRules.h
++++ b/Source/Core/UICommon/XDNetplay/FormatRules.h
+@@ -87,6 +87,14 @@ bool IsOrreColosseum(int format_key_value);
+ // True only for the exact OU value -- same unknown-behaves-as-Free rule.
+ bool IsOu(int format_key_value);
+ 
++// The fixed battle level a format pins, or 0 for none. Standard/Unlimited
++// (Orre Colosseum, Orre Unlimited, Hoenn Stadium, Hoenn Unlimited) pin 100;
++// the two Limited formats pin 50; Free/OU and unknown values pin nothing (0).
++// Used to decide whether a "raise team to the format level" convenience is
++// offered -- it is ONLY offered for the level-100 formats, and only ever
++// raises (never lowers, which would break legality).
++int FormatFixedLevel(int format_key_value);
++
+ // True for every format that carries a party-legality layer (the six
+ // community formats -- Unlimited included, since Species and Item Clause
+ // still apply there). False for Free, OU and every unknown value: those
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.cpp b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+index 7701cd9..7b01428 100644
+--- a/Source/Core/UICommon/XDNetplay/MonFactory.cpp
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.cpp
+@@ -308,4 +308,62 @@ std::optional<Gen3Mon> Build(const ShowdownSet& set, const Gen3Data& data,
+   mon.sp_defense = static_cast<u32>(stats[5]);
+   return mon;
+ }
++
++bool RaiseMonToLevel100(Gen3Mon& mon, const Gen3Data& data)
++{
++  if (mon.IsEmpty() || mon.level >= 100)
++    return false;  // raise only -- never lower, never touch a level-100 mon
++
++  // Resolve the mon's INTERNAL (Hoenn) species id to its data entry.
++  const Gen3Data::Species* species = nullptr;
++  for (const auto& [name, sp] : data.GetSpecies())
++  {
++    if (static_cast<u32>(sp.id) == mon.species)
++    {
++      species = &sp;
++      break;
++    }
++  }
++  if (species == nullptr)
++    return false;  // unknown species: leave it exactly as-is
++
++  const std::optional<int> experience = data.ExpForLevel(species->exp_group, 100);
++  if (!experience)
++    return false;
++
++  std::array<int, 6> ivs{};
++  std::array<int, 6> evs{};
++  const auto iv = mon.GetIvs();
++  for (int i = 0; i < 6; i++)
++  {
++    ivs[i] = static_cast<int>(iv[i]);
++    evs[i] = static_cast<int>(mon.evs[i]);
++  }
++  // Nature from the PID (index -> name -> data entry), Hardy-neutral if the
++  // data cannot resolve it -- exactly Build's fallback.
++  Gen3Data::Nature nature{"hardy", 0, -1, -1};
++  if (const Gen3Data::Nature* found = data.FindNature(mon.GetNatureName()))
++    nature = *found;
++  const std::array<int, 6> stats = ComputeStats(*species, 100, ivs, evs, nature);
++
++  mon.level = 100;
++  mon.experience = static_cast<u32>(*experience);
++  mon.max_hp = static_cast<u32>(stats[0]);
++  mon.current_hp = mon.max_hp;  // full, matching Build
++  mon.attack = static_cast<u32>(stats[1]);
++  mon.defense = static_cast<u32>(stats[2]);
++  mon.speed = static_cast<u32>(stats[3]);
++  mon.sp_attack = static_cast<u32>(stats[4]);
++  mon.sp_defense = static_cast<u32>(stats[5]);
++  return true;
++}
++
++int RaisePartyToLevel100(std::span<Gen3Mon> party, const Gen3Data& data)
++{
++  int raised = 0;
++  for (Gen3Mon& mon : party)
++    raised += RaiseMonToLevel100(mon, data) ? 1 : 0;
++  return raised;
++}
++
+ }  // namespace XDNetplay::MonFactory
+diff --git a/Source/Core/UICommon/XDNetplay/MonFactory.h b/Source/Core/UICommon/XDNetplay/MonFactory.h
+index b8ac7c9..d9cbd46 100644
+--- a/Source/Core/UICommon/XDNetplay/MonFactory.h
++++ b/Source/Core/UICommon/XDNetplay/MonFactory.h
+@@ -4,6 +4,7 @@
+ #pragma once
+ 
+ #include <optional>
++#include <span>
+ #include <string>
+ 
+ #include "Common/CommonTypes.h"
+@@ -36,4 +37,18 @@ namespace XDNetplay::MonFactory
+ std::optional<Gen3Mon> Build(const ShowdownSet& set, const Gen3Data& data,
+                              const std::string& trainer_name, u32 trainer_id,
+                              std::string* error = nullptr);
++
++// Raise ONE built mon to level 100, in place, keeping its IVs, EVs, nature,
++// moves, item and identity -- only the level, experience and the six party
++// stats are recomputed (exactly as Build does at construction). RAISE ONLY:
++// a mon already at level 100 (or above) is left untouched, and a mon is
++// NEVER lowered -- lowering past where a move was learned would make it
++// illegal. Empty slots and species the data cannot resolve are skipped.
++// Returns true if the mon was changed. This is the level-100-format
++// convenience ("Level 100 or lower" is legal, so raising is opt-in, never
++// automatic).
++bool RaiseMonToLevel100(Gen3Mon& mon, const Gen3Data& data);
++
++// RaiseMonToLevel100 across a party span; returns the number of mons raised.
++int RaisePartyToLevel100(std::span<Gen3Mon> party, const Gen3Data& data);
+ }  // namespace XDNetplay::MonFactory
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+index db73365..b82fb73 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.cpp
+@@ -36,6 +36,7 @@
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ #include "UICommon/XDNetplay/FormatRules.h"
+ #include "UICommon/XDNetplay/Gen3Data.h"
++#include "UICommon/XDNetplay/Gen3Text.h"
+ #include "UICommon/XDNetplay/Gen3Mon.h"
+ #include "UICommon/XDNetplay/Gen3Save.h"
+ #include "UICommon/XDNetplay/MonFactory.h"
+@@ -62,6 +63,7 @@ constexpr const char* TMP_SUFFIX = ".tmp";
+ constexpr std::string_view NAME_HEADER_KEY = "Name";
+ constexpr std::string_view MODEL_HEADER_KEY = "Model";
+ constexpr std::string_view SAVE_BUNDLE_HEADER_KEY = "SaveBundle";
++constexpr std::string_view RAISE_HEADER_KEY = "RaiseLevel100";
+ // Headers are framing, not a payload channel: every value line stays bounded.
+ constexpr size_t MAX_NAME_LINE = 64;
+ constexpr size_t MAX_MODEL_VALUE = 32;
+@@ -384,7 +386,8 @@ void WriteGuestMark(const std::string& save_path)
+ #endif
+ 
+ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+-                                       const std::string& trainer_name, std::optional<int> model)
++                                       const std::string& trainer_name, std::optional<int> model,
++                                       bool raise_to_level_100)
+ {
+   // A newline in the name would forge extra header/blank lines, so flatten
+   // any line break to a space before it goes on the wire. The 7-character Gen 3
+@@ -405,6 +408,8 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+   // host's own fallback dropdown then decides.
+   if (model && *model > 0)
+     headers += std::string(MODEL_HEADER_KEY) + ": " + std::to_string(*model) + "\n";
++  if (raise_to_level_100)
++    headers += std::string(RAISE_HEADER_KEY) + ": 1\n";
+ 
+   if (headers.empty())
+     return showdown_text;  // nothing to say -- emit the old bare format
+@@ -412,7 +417,8 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+   return headers + "\n" + showdown_text;
+ }
+ 
+-std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle, std::optional<int> model)
++std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle, std::optional<int> model,
++                                         bool raise_to_level_100)
+ {
+   // A bundle payload is headers plus an EMPTY body: SaveBundle (base64 never
+   // contains a newline, so it cannot forge framing), the optional Model pick
+@@ -423,6 +429,8 @@ std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle, std::opt
+       std::string(SAVE_BUNDLE_HEADER_KEY) + ": " + PartyBundle::Base64Encode(bundle) + "\n";
+   if (model && *model > 0)
+     headers += std::string(MODEL_HEADER_KEY) + ": " + std::to_string(*model) + "\n";
++  if (raise_to_level_100)
++    headers += std::string(RAISE_HEADER_KEY) + ": 1\n";
+   return headers + "\n";
+ }
+ 
+@@ -466,6 +474,8 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+       name = std::string(value);
+     else if (key == MODEL_HEADER_KEY)
+       model = ParseModelValue(value);
++    else if (key == RAISE_HEADER_KEY)
++      out.raise_to_level_100 = StripWhitespace(value) == "1";
+     else if (key == SAVE_BUNDLE_HEADER_KEY)
+     {
+       // Untrusted remote text: bounded, and it must base64-decode cleanly or
+@@ -484,7 +494,7 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload)
+ }
+ 
+ bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
+-                     std::string* status)
++                     std::string* status, bool raise_to_level_100)
+ {
+   const auto fail = [status](std::string message) {
+     if (status)
+@@ -611,6 +621,15 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+   if (built.empty())
+     return fail("no usable Pokemon in that team");
+ 
++  // Guest opted in to "raise to Lv. 100": honored only under a level-100
++  // format (the HOST's pick governs the room) and only ever raises.
++  int raised = 0;
++  if (raise_to_level_100 &&
++      FormatRules::FormatFixedLevel(Config::Get(Config::MAIN_XD_FORMAT)) == 100)
++  {
++    raised = MonFactory::RaisePartyToLevel100(built, *data);
++  }
++
+   const size_t count = built.size();
+   if (!save->WriteParty(built))
+     return fail("party too large");
+@@ -629,14 +648,82 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+     // will see across the link, and it may not be what was asked for.
+     if (!applied_name.empty())
+       *status += fmt::format(", playing as {}", applied_name);
+-    else if (!dropped_name_note.empty())
++    if (!dropped_name_note.empty())
+       *status += fmt::format(" ({})", dropped_name_note);
++    if (raised > 0)
++      *status += fmt::format(", {} raised to Lv. 100", raised);
++  }
++  return true;
++#endif
++}
++
++bool RenameHostTrainer(const std::string& name, std::string* status)
++{
++  const auto fail = [status](std::string message) {
++    if (status)
++      *status = std::move(message);
++    return false;
++  };
++#ifndef HAS_LIBMGBA
++  return fail("this build has no GBA support");
++#else
++  if (!Core::IsUninitialized(Core::System::GetInstance()))
++    return fail("stop the game first -- the emulated GBA owns its save while it runs");
++  const std::string typed = EmeraldSave::SanitizeTrainerName(name);
++  if (typed.empty())
++    return fail("trainer name cannot be empty");
++
++  const std::string save_path = SavePathForDevice(1);
++  if (save_path.empty() || !File::Exists(save_path))
++    return fail("no save on GBA port 2 -- set up the Emerald ROM in the launcher first");
++
++  std::string error;
++  auto save = LoadSaveFile(save_path, &error);
++  if (!save)
++    return fail(fmt::format("could not read the GBA port 2 save ({})", error));
++  if (!save->SetTrainerName(typed, &error))
++    return fail(error);
++
++  // Every Pokemon stores its OWN copy of the OT name; without the re-stamp
++  // the party reads as traded outsiders (disobedience above the badge cap).
++  // The OT *ID* is untouched, so they stay this save's Pokemon.
++  auto party = save->ReadParty(&error);
++  if (!party)
++    return fail(fmt::format("could not read the party ({})", error));
++  const auto ot_bytes = Gen3Text::Encode(save->GetTrainerName(), EmeraldSave::TRAINER_NAME_LEN, &error);
++  if (!ot_bytes)
++    return fail(error);
++  for (Gen3Mon& mon : *party)
++    std::copy(ot_bytes->begin(), ot_bytes->end(), mon.ot_name_raw.begin());
++  if (!save->WriteParty(*party))
++    return fail("party too large");
++  if (!VerifiedWriteSaveFile(save_path, *save, &error))
++    return fail(fmt::format("save NOT written ({})", error));
++
++  if (status)
++  {
++    *status = fmt::format("trainer name set to {} on GBA port 2 -- that is what your opponent sees",
++                          save->GetTrainerName());
+   }
+   return true;
+ #endif
+ }
+ 
+-bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status)
++std::string HostTrainerName()
++{
++#ifndef HAS_LIBMGBA
++  return {};
++#else
++  const std::string save_path = SavePathForDevice(1);
++  if (save_path.empty() || !File::Exists(save_path))
++    return {};
++  const auto save = LoadSaveFile(save_path);
++  return save ? save->GetTrainerName() : std::string{};
++#endif
++}
++
++bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status,
++                       bool raise_to_level_100)
+ {
+   const auto fail = [status](std::string message) {
+     if (status)
+@@ -658,6 +745,31 @@ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* s
+   if (!decoded)
+     return fail(fmt::format("save bundle rejected ({})", error));
+ 
++  // Guest opted in to "raise to Lv. 100": honored only under a level-100
++  // format (the HOST's pick governs the room), only ever raises, and is done
++  // on the ALREADY-VALIDATED mons: each raised mon is re-encoded straight over
++  // its own 100-byte slot in a private copy of the bundle (layout: +4, six
++  // 100-byte party structs -- PartyBundle.h), so BuildSave below writes the
++  // raised party with the identity bytes untouched.
++  std::vector<u8> bundle_to_write = bundle;
++  int raised = 0;
++  if (raise_to_level_100 &&
++      FormatRules::FormatFixedLevel(Config::Get(Config::MAIN_XD_FORMAT)) == 100)
++  {
++    if (const auto raise_data = Gen3Data::LoadBundled())
++    {
++      std::vector<Gen3Mon> mons = decoded->mons;
++      raised = MonFactory::RaisePartyToLevel100(mons, *raise_data);
++      for (size_t i = 0;
++           i < mons.size() && PartyBundle::PARTY_OFFSET + (i + 1) * Gen3Mon::SIZE <= bundle_to_write.size(); i++)
++      {
++        const auto bytes = mons[i].Encode();
++        std::copy(bytes.begin(), bytes.end(),
++                  bundle_to_write.begin() + PartyBundle::PARTY_OFFSET + i * Gen3Mon::SIZE);
++      }
++    }
++  }
++
+   // FORMAT gate (guest submission, bundle form): same contract as the Showdown
+   // gate in InjectGuestTeam -- the HOST's format key governs, the check runs
+   // BEFORE any lifecycle side effect (self-heal/stash), and a refusal goes out
+@@ -719,7 +831,7 @@ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* s
+   if (!ReadFileBytes(GuestTemplatePath(device), &template_bytes))
+     return fail("bundled template missing on the host");
+ 
+-  const auto save = PartyBundle::BuildSave(std::move(template_bytes), bundle, &error);
++  const auto save = PartyBundle::BuildSave(std::move(template_bytes), bundle_to_write, &error);
+   if (!save)
+     return fail(fmt::format("save bundle rejected ({})", error));
+ 
+@@ -738,6 +850,8 @@ bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* s
+     *status = fmt::format("{} Pokemon from the guest's own save written to the guest slot, "
+                           "playing as {}",
+                           decoded->mons.size(), decoded->trainer_name);
++    if (raised > 0)
++      *status += fmt::format(", {} raised to Lv. 100", raised);
+   }
+   return true;
+ #endif
+diff --git a/Source/Core/UICommon/XDNetplay/TeamInjector.h b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+index 2aa2719..0b6437b 100644
+--- a/Source/Core/UICommon/XDNetplay/TeamInjector.h
++++ b/Source/Core/UICommon/XDNetplay/TeamInjector.h
+@@ -81,6 +81,11 @@ struct TeamSubmission
+ {
+   std::string trainer_name;  // "" when the payload carried no Name header
+   std::optional<int> model;  // "Model:" header; nullopt = no preference
++  // "RaiseLevel100: 1" header: the guest asked the host to raise every
++  // under-level mon to Lv. 100 before injecting. Honored ONLY when the host's
++  // format is a level-100 format, and only ever RAISES (never lowers -- that
++  // would break legality). Opt-in: "Level 100 or lower" is legal.
++  bool raise_to_level_100 = false;
+   std::string showdown_text;
+   // Decoded "SaveBundle:" bytes; nullopt when the payload carried no such
+   // header or its base64 was malformed. When set, this payload is a bundle
+@@ -97,7 +102,8 @@ struct TeamSubmission
+ // cannot forge framing; a model without a value (or <= 0) emits no line.
+ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+                                        const std::string& trainer_name,
+-                                       std::optional<int> model = std::nullopt);
++                                       std::optional<int> model = std::nullopt,
++                                       bool raise_to_level_100 = false);
+ 
+ // Joiner side, "Use my save": wrap a party bundle (PartyBundle::Extract's
+ // output) as a bundle payload -- the SaveBundle header, an optional Model
+@@ -105,7 +111,8 @@ std::string BuildTeamSubmissionPayload(const std::string& showdown_text,
+ // bundle's own trainer identity is authoritative. Base64 contains no newline,
+ // so a bundle cannot forge framing.
+ std::string BuildBundleSubmissionPayload(const std::vector<u8>& bundle,
+-                                         std::optional<int> model = std::nullopt);
++                                         std::optional<int> model = std::nullopt,
++                                         bool raise_to_level_100 = false);
+ 
+ // Host side: split a received payload. Never fails -- an unparseable header
+ // block is simply treated as part of the team text.
+@@ -136,7 +143,7 @@ TeamSubmission ParseTeamSubmissionPayload(const std::string& payload);
+ // rejecting the whole team -- the status line always reports the name actually
+ // written, so both players can see it before the battle.
+ bool InjectGuestTeam(const std::string& showdown_text, const std::string& trainer_name, int device,
+-                     std::string* status);
++                     std::string* status, bool raise_to_level_100 = false);
+ 
+ // Host side, bundle counterpart of InjectGuestTeam: validate an untrusted
+ // remote party bundle strictly (PartyBundle::Validate -- exact length, party
+@@ -150,7 +157,22 @@ bool InjectGuestTeam(const std::string& showdown_text, const std::string& traine
+ // RestoreHostTeam takes it back out the same way. Refuses when the guest
+ // slot currently holds an FRLG save, for the same reason InjectGuestTeam
+ // does: that socket's ROM cannot run the Emerald-template disposable save.
+-bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status);
++bool InjectGuestBundle(const std::vector<u8>& bundle, int device, std::string* status,
++                       bool raise_to_level_100 = false);
++
++// The HOST's in-room counterpart of the joiner's "Name:" header: rename the
++// trainer in the GBA port 2 save (the host's own socket -- the one the room
++// syncs at start) and re-stamp every party mon's OT name to match, through
++// the same verified write as every injection. The bundled templates ship as
++// "Player1"/"Player2", and until this existed the only place a host could
++// change that was the team editor's name field, which nobody found -- the
++// field report was "the host is always Player 1". Refuses while a game runs
++// (the mGBA core owns the file). *status always gets a human-readable line.
++bool RenameHostTrainer(const std::string& name, std::string* status);
++
++// Current trainer name of the GBA port 2 save, or "" when unreadable. For
++// prefilling the host's name field.
++std::string HostTrainerName();
+ 
+ // HOST gate for the one-tap FORMAT feature (FormatRules.h): when the host's
+ // MAIN_XD_FORMAT key is Orre Colosseum, validate the parties the HOST brings
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index e7bd7c1..eda305b 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.7";
++constexpr char VERSION[] = "1.5.8";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
