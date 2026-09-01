@@ -1,0 +1,438 @@
+From 53775fefa37634f23adb7f1f127ca5c7f50f3264 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 1 Sep 2026 15:20:58 -0700
+Subject: [PATCH] XD Netplay: shorter launcher and editor notes, no portrait
+ explainer, wrapped notes never clip, link progress logged not shown (v1.5.9)
+
+- Battle Style and Team Editor notes cut to one and two lines on community
+  feedback; the '(no portrait)' explainer removed everywhere (the per-model
+  suffix is the explanation). Detail moved into tooltips.
+- MakeNoteLabel: word-wrapped notes use QSizePolicy::Minimum/Minimum (the
+  upstream ConvertDialog/AchievementBox pattern) so a dialog shown shorter
+  than its preferred height can no longer squash and clip them.
+- GBA link progress goes to the gba_detect log (link-progress events) instead
+  of the on-screen display, per the field.
+---
+ .../features/netplay/ui/NetplayScreen.kt      |  8 ----
+ .../features/xdnetplay/ui/TeamEditorScreen.kt |  4 +-
+ .../features/xdnetplay/ui/XDLauncherScreen.kt |  7 ---
+ .../app/src/main/res/values/strings.xml       |  9 ++--
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 29 ++++++------
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      | 10 ++---
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp  | 18 +++-----
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  | 31 +++++++++----
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 45 ++++++++++---------
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 10 files changed, 80 insertions(+), 83 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+index 1e2bf84..9793645 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/netplay/ui/NetplayScreen.kt
+@@ -274,14 +274,6 @@ fun NetplayScreen(
+                         }
+                         Switch(checked = raiseTo100, onCheckedChange = { raiseTo100 = it })
+                     }
+-                    // Caption under the model control: what "(no portrait)"
+-                    // costs (nothing but the close-up), so nobody reads it as
+-                    // "broken".
+-                    Text(
+-                        stringResource(R.string.xd_style_no_portrait_note),
+-                        style = MaterialTheme.typography.bodySmall,
+-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+-                    )
+                     Spacer(Modifier.height(12.dp))
+                     OutlinedTextField(
+                         value = teamDraft,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+index c550fdd..ab51003 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -101,9 +101,9 @@ fun TeamEditorScreen(
+             // joiners — say it right here, per selected role.
+             Text(
+                 text = if (state.role == TeamRole.HOST)
+-                    "Your team: plays when you host, and it is what \"Use my save\" submits when you join someone else's room."
++                    "Your team when you host, and what \"Use my save\" sends when you join."
+                 else
+-                    "Only used in rooms YOU host (the fallback team a joining guest plays if they never submit one) and in solo play — it does not affect rooms you join.",
++                    "Played by a joiner who submits no team, and in solo play. Not used when you join.",
+                 color = XDColors.TextDim,
+                 fontSize = 12.sp
+             )
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 7b1dabe..73b6bb7 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -383,13 +383,6 @@ private fun BattleStyleCard(
+                 modifier = Modifier.fillMaxWidth(),
+                 supportingText = stringResource(R.string.xd_style_guest_model_hint)
+             )
+-            // One line under the model rows: what "(no portrait)" costs
+-            // (nothing but the close-up), so nobody reads it as "broken".
+-            Text(
+-                text = stringResource(R.string.xd_style_no_portrait_note),
+-                style = MaterialTheme.typography.bodySmall,
+-                color = MaterialTheme.colorScheme.onSurfaceVariant
+-            )
+             BattleStyleDropdown(
+                 label = stringResource(R.string.xd_style_music),
+                 options = musicOptions,
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index a24eadf..14592b9 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1116,7 +1116,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_update_no_browser">No app on this device can open the release page.</string>
+ 
+     <string name="xd_style_section_title">Battle Style</string>
+-    <string name="xd_style_section_hint">HOST-ONLY on this screen: Format, music and battle location come from whoever hosts — your picks here apply to rooms you host and do nothing in rooms you join. JOINING? Everything you control — your team and your trainer model — is set in the NEXT window (Submit Team, inside the room). HOSTING? Your trainer name is set inside the room (or in the team editor).</string>
++    <string name="xd_style_section_hint">The host picks format, music and location. Joiners set team, name and model in Submit Team; hosts set their name in the room or Team Editor.</string>
+     <string name="xd_style_your_model">Your model</string>
+     <string name="xd_style_guest_model">Guest model</string>
+     <string name="xd_style_guest_model_hint">Used only if they don\'t pick one themselves</string>
+@@ -1126,9 +1126,8 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_style_no_preference">No preference</string>
+     <string name="xd_style_experimental">Experimental</string>
+     <string name="xd_style_no_portrait_suffix">%1$s (no portrait)</string>
+-    <string name="xd_style_no_portrait_note">Models marked “(no portrait)” show no close-up on the connection and team screens — the battle model still changes.</string>
+     <string name="xd_style_submit_model_label">Trainer model</string>
+-    <string name="xd_style_submit_model_hint">Cosmetic — how you\'ll appear in the battle.</string>
++    <string name="xd_style_submit_model_hint">How you appear in battle. Your pick here overrides the host\'s Guest model choice.</string>
+ 
+     <!-- One-tap battle Format pick (Free / Orre Colosseum). The option names
+          match FormatRules::FormatDisplayName in shared core so dropdowns and
+@@ -1158,11 +1157,11 @@ It can efficiently compress both junk data and encrypted Wii data.
+          from the shared core and are not duplicated here. -->
+     <string name="xd_submit_use_save">Use my save</string>
+     <string name="xd_host_name_title">Your trainer name (host)</string>
+-    <string name="xd_host_name_hint">What your opponent sees in battle. Written into the GBA port 2 save this room syncs (with an imported save it applies to this session only) — up to 7 characters. Joiners set theirs in Submit Team.</string>
++    <string name="xd_host_name_hint">Up to 7 characters. Your opponent sees this name in battle.</string>
+     <string name="xd_host_name_label">Trainer name</string>
+     <string name="xd_host_name_set">Set name</string>
+     <string name="xd_submit_raise_100">Raise my team to Lv. 100</string>
+-    <string name="xd_submit_raise_100_hint">The host raises any Pokémon below Lv. 100 — only in a level-100 format, and never lowers one.</string>
++    <string name="xd_submit_raise_100_hint">Only in Lv. 100 formats. The host applies it and never lowers a Pokémon.</string>
+     <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID. This sends the Team Editor\'s "Host (GBA 2)" team.</string>
+     <string name="xd_submit_privacy_note">Your save\'s party is sent exactly as it is, and the host\'s machine receives everything in those bytes: exact moves, held items, stats, EVs, IVs, natures, nicknames, met information, ribbons, and your OT name and BOTH trainer IDs, including the secret one. Your opponent would see most of this by battling you — but not the secret ID, so only send your save to hosts you trust.</string>
+     <string name="xd_submit_name_ignored">Your save\'s real trainer name is used instead.</string>
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index c52e9c2..6f1b8e2 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -28,7 +28,6 @@
+ #include "Core/NetPlayProto.h"
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/System.h"
+-#include "VideoCommon/OnScreenDisplay.h"
+ 
+ namespace SerialInterface
+ {
+@@ -548,17 +547,17 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       diag->locked.store(m_battle_locked, std::memory_order_relaxed);
+       diag->last_cmd.store(static_cast<u8>(m_last_cmd), std::memory_order_relaxed);
+ 
+-      // On-screen link progress. The wait players feel is XD's own fixed
++      // Link progress. The wait players feel is XD's own fixed
+       // multiboot ladder per GBA -- ~4 s of key exchange, then a ~26,900-write
+       // upload of the ~108 KB client, then ~1.4 s of client boot -- run for one
+       // socket and then the other, back to back. Nothing is stuck during it,
+       // but with no feedback people back out mid-upload (the field's "GBA
+-      // failed to connect"). So say what is happening: display only, on the
+-      // local OSD, one line per phase and one per 10% of the upload. Reads
+-      // only this device's own synced state; never a control input.
++      // failed to connect"). So record what is happening: one gba_detect log
++      // line per phase and one per 10% of the upload (the field asked for no
++      // on-screen text here). Reads only this device's own synced state; never
++      // a control input.
+       {
+         constexpr u32 UPLOAD_WRITES = 26900;  // measured, bit-identical across sessions
+-        const int port = m_device_number + 1;
+         // m_diag_wr_count is a session-lifetime counter (never reset across a
+         // rematch), so this upload is counted from the lock edge, not from 0.
+         if (m_battle_locked && m_osd_phase < 2)
+@@ -571,16 +570,20 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           phase = 2;
+         else if (m_battle_locked)
+           phase = 3;
++        // Logged, not shown: the field asked for no on-screen text during the
++        // connection screen (the link now succeeds every time); the log keeps
++        // the same phase/percent trail for diagnosing a slow or stuck socket.
+         if (phase != m_osd_phase)
+         {
+           m_osd_phase = phase;
+           m_osd_bucket = -1;
+           if (phase == 1)
+-            OSD::AddMessage(fmt::format("GBA port {}: link found, negotiating (~4 s)", port),
+-                            OSD::Duration::NORMAL);
++            GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "link-progress",
++                                   "negotiating (key exchange, ~4 s)");
+           else if (phase == 3)
+-            OSD::AddMessage(fmt::format("GBA port {}: upload done, client starting", port),
+-                            OSD::Duration::NORMAL);
++            GBADetectLog::LogEvent(
++                m_device_number, m_timestamp_sent, "link-progress",
++                fmt::format("upload done ({} writes), client starting", uploaded));
+         }
+         if (phase == 2)
+         {
+@@ -588,9 +591,9 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+           if (bucket != m_osd_bucket)
+           {
+             m_osd_bucket = bucket;
+-            OSD::AddMessage(fmt::format("GBA port {}: uploading client {}% (~{} s left)", port,
+-                                        bucket * 10, (10 - bucket) * 3 / 2),
+-                            OSD::Duration::NORMAL);
++            GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "link-progress",
++                                   fmt::format("uploading client {}% ({} writes, ~{} s left)",
++                                               bucket * 10, uploaded, (10 - bucket) * 3 / 2));
+           }
+         }
+       }
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 7f3fc87..58c795b 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -132,12 +132,12 @@ private:
+   u32 m_diag_cmd_log_count = 0;   // first-N command-dump budget (<=64)
+   u32 m_diag_cmd_burst = 0;       // extra command lines emitted after a transition
+   u32 m_diag_rd_count = 0;        // I4: ungated READ count (ground truth in sum)
+-  u32 m_diag_wr_count = 0;        // I4: ungated WRITE count (ground truth in sum)
+-  // On-screen link progress (display only, never a control input): last phase
+-  // and last upload-percent bucket announced, so the OSD says each step once.
+-  int m_osd_phase = 0;   // 0 idle, 1 negotiating, 2 uploading, 3 client starting
++  u32 m_diag_wr_count = 0;        // Link-progress trail (logged to gba_detect, never shown on screen, never a
++  // control input): last phase / last 10% bucket announced, so each step is
++  // written once per lock.
++  int m_osd_phase = 0;  // 0 idle, 1 negotiating, 2 uploading, 3 client starting
+   int m_osd_bucket = -1;
+-  u32 m_osd_upload_base = 0;  // m_diag_wr_count at the moment the port locked // last 10% bucket announced during the upload
++  u32 m_osd_upload_base = 0;  // m_diag_wr_count at the moment the port locked
+   u64 m_diag_last_summary_tick = 0;
+   u64 m_diag_window_open_tick = 0;   // rising-edge tick, for window-close dur_ms=
+   u64 m_diag_window_close_tick = 0;  // falling-edge tick, for window-open gap_ms=
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 49beded..384f5f1 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -323,9 +323,7 @@ void NetPlayDialog::CreateChatLayout()
+   m_host_name_edit = new QLineEdit;
+   m_host_name_edit->setPlaceholderText(tr("Your trainer name (what your opponent sees)"));
+   m_host_name_edit->setMaxLength(7);
+-  m_host_name_edit->setToolTip(tr("Up to 7 characters. Written into the GBA port 2 save this room syncs, "
+-                                  "so the next battle shows it (with an imported save it applies to "
+-                                  "this session only). Joiners set theirs in Submit Team."));
++  m_host_name_edit->setToolTip(tr("Up to 7 characters. Your opponent sees this name in battle."));
+   m_host_name_edit->hide();
+   m_host_name_button = new QPushButton(tr("Set Name"));
+   m_host_name_button->setDefault(false);
+@@ -1017,6 +1015,8 @@ void NetPlayDialog::OnSubmitTeam()
+   // the caption under the combo.
+   auto* model_layout = new QHBoxLayout;
+   auto* model_combo = new QComboBox(&dialog);
++  model_combo->setToolTip(tr("How you appear in battle. Your pick here overrides the host's "
++                             "Guest model choice."));
+   model_combo->addItem(tr("No preference"), 0);
+   for (const XDNetplay::BattleCustomizer::StyleOption& option :
+        XDNetplay::BattleCustomizer::ModelTable())
+@@ -1030,12 +1030,6 @@ void NetPlayDialog::OnSubmitTeam()
+   model_layout->addWidget(new QLabel(tr("Trainer model:"), &dialog));
+   model_layout->addWidget(model_combo, 1);
+   dialog_layout->addLayout(model_layout);
+-  auto* portrait_note = new QLabel(
+-      tr("Models marked \"(no portrait)\" show no close-up on the connection and team "
+-         "screens — the battle model still changes."),
+-      &dialog);
+-  portrait_note->setWordWrap(true);
+-  dialog_layout->addWidget(portrait_note);
+ 
+   // "Use my save": submit the party from the player's OWN local save (the
+   // port-2 slot the Team Editor's "Host" role edits -- their slot regardless
+@@ -1056,9 +1050,9 @@ void NetPlayDialog::OnSubmitTeam()
+   // a level-100 format, and it only ever raises (never lowers -- legality).
+   // "Level 100 or lower" is legal, so this is never automatic.
+   auto* raise_check =
+-      new QCheckBox(tr("Raise my team to Lv. 100 (host applies this only in a level-100 "
+-                       "format; never lowers a Pokémon)"),
+-                    &dialog);
++      new QCheckBox(tr("Raise my team to Lv. 100 (Lv. 100 formats only, never lowers)"), &dialog);
++  raise_check->setToolTip(
++      tr("Only in Lv. 100 formats. The host applies it and never lowers a Pokémon."));
+   dialog_layout->addWidget(raise_check);
+ 
+   // Shown only while the box is ticked. The disclosure list is deliberately
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 7f1dd72..794382a 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -47,6 +47,21 @@ using namespace XDNetplay;
+ 
+ namespace
+ {
++// A word-wrapped explanatory line that can never be squashed below its text.
++// QLabel::minimumSizeHint() for a wrapping label is ONE line tall, so with the
++// default Preferred policy a window shorter than the layout's preferred height
++// shrinks the note's row and the text paints clipped (the field report: "have
++// to stretch the window to read it"). Minimum/Minimum -- the pattern upstream
++// uses in ConvertDialog and AchievementBox -- makes the layout's minimum equal
++// the wrapped sizeHint instead, so it wraps correctly at any window size.
++QLabel* MakeNoteLabel(const QString& text)
++{
++  auto* label = new QLabel(text);
++  label->setWordWrap(true);
++  label->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Minimum);
++  return label;
++}
++
+ // Read a whole binary file; empty vector + false on failure.
+ bool ReadFileBytes(const std::string& path, std::vector<u8>* out)
+ {
+@@ -86,13 +101,10 @@ void TeamEditorDialog::CreateMainLayout()
+   // is said right under the selector: JOINING a room only ever sends the
+   // HOST slot's party (the Submit Team sheet's "Use my save" reads GBA port
+   // 2); the Guest slot is the fallback team for rooms YOU host, plus solo.
+-  auto* role_note = new QLabel(
+-      tr("Host — GBA port 2 is YOUR team: it plays when you host, and it is what\n"
+-         "\"Use my save\" submits when you join someone else's room.\n"
+-         "Guest — GBA port 3 only matters in rooms YOU host (the fallback team a\n"
+-         "joining guest plays if they never submit one) and in solo play — editing\n"
+-         "it does not affect rooms you join."));
+-  role_note->setWordWrap(true);
++  auto* role_note = MakeNoteLabel(
++      tr("Host — GBA port 2: your team when you host, and what \"Use my save\" sends when you "
++         "join.\nGuest — GBA port 3: played by a joiner who submits no team, and in solo play. "
++         "Not used when you join."));
+   top_layout->addWidget(new QLabel(tr("Editing team for:")), 0, 0);
+   top_layout->addWidget(m_role_combo, 0, 1);
+   top_layout->addWidget(role_note, 1, 0, 1, 2);
+@@ -112,6 +124,8 @@ void TeamEditorDialog::CreateMainLayout()
+   // (ReloadForRole updates it); "Level 100 or lower" is legal, so this is
+   // opt-in and never automatic.
+   m_raise_button = new NonDefaultQPushButton(tr("Raise all to Lv. 100"));
++  m_raise_button->setToolTip(tr("Lv. 100 formats only. Raises every Pokémon below Lv. 100 in "
++                                "this team and never lowers one."));
+   auto* party_buttons = new QHBoxLayout;
+   party_buttons->addWidget(m_remove_button);
+   party_buttons->addWidget(m_raise_button);
+@@ -144,7 +158,8 @@ void TeamEditorDialog::CreateMainLayout()
+   layout->addWidget(m_log_label);
+ 
+   setLayout(layout);
+-  resize(520, 640);
++  // Never narrower than the wrapped notes' minimum width (MakeNoteLabel).
++  resize(std::max(520, minimumSizeHint().width()), 640);
+ }
+ 
+ void TeamEditorDialog::ConnectWidgets()
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 68bbdb0..bb25b5b 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -55,6 +55,21 @@
+ 
+ namespace
+ {
++// A word-wrapped explanatory line that can never be squashed below its text.
++// QLabel::minimumSizeHint() for a wrapping label is ONE line tall, so with the
++// default Preferred policy a window shorter than the layout's preferred height
++// shrinks the note's row and the text paints clipped (the field report: "have
++// to stretch the window to read it"). Minimum/Minimum -- the pattern upstream
++// uses in ConvertDialog and AchievementBox -- makes the layout's minimum equal
++// the wrapped sizeHint instead, so it wraps correctly at any window size.
++QLabel* MakeNoteLabel(const QString& text)
++{
++  auto* label = new QLabel(text);
++  label->setWordWrap(true);
++  label->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Minimum);
++  return label;
++}
++
+ constexpr size_t GBA_HEADER_TITLE_OFFSET = 0xA0;
+ constexpr size_t GBA_HEADER_FIXED_OFFSET = 0xB2;
+ constexpr u8 GBA_HEADER_FIXED_VALUE = 0x96;
+@@ -308,17 +323,15 @@ void XDLauncherDialog::CreateMainLayout()
+   // DisposableSave swaps in for the room's duration.
+   auto* saves_box = new QGroupBox(tr("Save Files"));
+   auto* saves_layout = new QGridLayout;
+-  auto* saves_caption = new QLabel(
++  auto* saves_caption = MakeNoteLabel(
+       tr("Solo play uses an imported save exactly as it is. Hosting a netplay room does NOT "
+          "share the file: the session runs on a rebuilt save carrying only your party and "
+          "trainer identity, and your own save returns when the room closes. When you join "
+          "someone else's room, use Submit Team instead."));
+-  saves_caption->setWordWrap(true);
+   saves_layout->addWidget(saves_caption, 0, 0, 1, 4);
+   int save_row = 1;
+   const auto add_save_row = [&](SaveSlotRow* target, const QString& label) {
+-    target->state = new QLabel;
+-    target->state->setWordWrap(true);
++    target->state = MakeNoteLabel(QString());
+     target->import_button = new NonDefaultQPushButton(tr("Import my save..."));
+     target->restore_button = new NonDefaultQPushButton(tr("Restore default"));
+     target->restore_button->setToolTip(
+@@ -356,8 +369,7 @@ void XDLauncherDialog::CreateMainLayout()
+   m_team_editor_button = new NonDefaultQPushButton(tr("Team Editor..."));
+   // Empty until a search runs, so the dialog does not grow a permanently blank
+   // row; word wrap because the "hosting and waiting" line is a sentence.
+-  m_match_status = new QLabel;
+-  m_match_status->setWordWrap(true);
++  m_match_status = MakeNoteLabel(QString());
+   m_match_status->hide();
+   battle_layout->addWidget(m_boot_button, 0, 0);
+   battle_layout->addWidget(m_practice_dummy_check, 0, 1);
+@@ -379,8 +391,8 @@ void XDLauncherDialog::CreateMainLayout()
+   // their labels say so; venues whose terrain changes a few moves carry that
+   // in the label too, no extra dialogs. MODELS are field-proven, so their
+   // lists carry no tier presentation at all: instead, models without a
+-  // pre-rendered bust say "(no portrait)" and a one-line note under the model
+-  // rows explains what that means.
++  // pre-rendered bust say "(no portrait)" in their label -- that suffix is the
++  // whole explanation (a separate note was removed on community feedback).
+   //
+   // The first row is the battle FORMAT (v1.4.0) -- the one pick that is not
+   // cosmetic. It is persisted in MAIN_XD_FORMAT exactly like the style keys;
+@@ -394,12 +406,9 @@ void XDLauncherDialog::CreateMainLayout()
+     // picks (they ship in the host-assembled session code both players run);
+     // models are PER PLAYER (a joiner picks theirs in the Submit Team
+     // sheet, and that pick beats the host's fallback dropdown).
+-    auto* who_note = new QLabel(
+-        tr("HOST-ONLY on this screen: Format, music and battle location come from whoever "
+-           "hosts — your picks here apply to rooms you host and do nothing in rooms you join. "
+-           "JOINING? Everything you control — your team and your trainer model — is set in "
+-           "the NEXT window (Submit Team, inside the room). HOSTING? Your trainer name is set inside the room (or in the team editor)."));
+-    who_note->setWordWrap(true);
++    auto* who_note = MakeNoteLabel(
++        tr("The host picks format, music and location. Joiners set team, name and model in "
++           "Submit Team; hosts set their name in the room or Team Editor."));
+     style_layout->addWidget(who_note, style_row, 0, 1, 2);
+     style_row++;
+   }
+@@ -498,14 +507,6 @@ void XDLauncherDialog::CreateMainLayout()
+       tr("Guest model (used only if they don't pick):"),
+       tr("Fallback only: a model the guest picks when submitting\n"
+          "their team always wins over this."));
+-  // One line under the model rows: what "(no portrait)" costs (nothing but the
+-  // close-up), so nobody reads it as "broken".
+-  auto* portrait_note = new QLabel(
+-      tr("Models marked \"(no portrait)\" show no close-up on the connection and team "
+-         "screens — the battle model still changes."));
+-  portrait_note->setWordWrap(true);
+-  style_layout->addWidget(portrait_note, style_row, 0, 1, 2);
+-  style_row++;
+   m_style_music_combo = add_style_combo(tr("Battle music:"), QString());
+   m_style_venue_combo = add_style_combo(
+       tr("Battle location:"), tr("Locations that alter Nature Power, Camouflage or Secret Power\n"
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index eda305b..2347309 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.8";
++constexpr char VERSION[] = "1.5.9";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+

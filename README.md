@@ -184,15 +184,16 @@ the cable's real speed:
   after the first has finished.
 
 So about **45 seconds** from your last menu press to both GBAs linked is normal
-and fixed, not lag. From 1.5.8 the screen shows what is happening: `GBA port 2:
-link found, negotiating`, then `uploading client 40% (~12 s left)`, then
-`client starting`, for each socket in turn.
+and fixed, not lag. Nothing is drawn on screen during it; the session log
+records each phase (`link-progress` lines: negotiating, upload percentage,
+client starting) for each socket in turn, which is what to send if a link ever
+does stall.
 
-- **While those messages are moving, do not press B.** It backs you out of VS
-  mode mid-upload and that link can never complete.
-- **If a socket shows no message at all for well over a minute**, press B, back
-  out of VS mode, go in again, and let it retry. Going back in re-arms the
-  handshake, and the retry has worked every time we have hit it.
+- **During that wait, do not press B.** It backs you out of VS mode mid-upload
+  and that link can never complete.
+- **If nothing has happened for well over a minute**, press B, back out of VS
+  mode, go in again, and let it retry. Going back in re-arms the handshake, and
+  the retry has worked every time we have hit it.
 
 ## Good to know
 
