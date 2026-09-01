@@ -1350,7 +1350,7 @@ index 0000000..75e4502
 +#include "UICommon/XDNetplay/Gen3Mon.h"
 +#include "UICommon/XDNetplay/Gen3Save.h"
 +
-+// Guest save submission via party bundle (community design by the community, adapted).
++// Guest save submission via party bundle (community design, adapted).
 +//
 +// A joiner can bring the team FROM THEIR OWN SAVE instead of a Showdown paste:
 +// the guest extracts a small fixed-size "party bundle" from their local save,
