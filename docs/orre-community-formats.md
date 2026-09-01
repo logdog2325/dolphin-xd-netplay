@@ -1,7 +1,7 @@
 # Orre community formats — canon reference
 
-Settled by Akiak on 2026-08-27 (Discord, relayed by Logan). This SUPERSEDES
-the 2023 Smogon-post format list: Akiak's words on that list were "definitely
+Settled by the community organizers on 2026-08-27 (Discord, relayed by Logan). This SUPERSEDES
+the 2023 Smogon-post format list: their words on that list were "definitely
 dont use that" / "its also incomplete" — do not implement from it.
 
 ## The six formats to build (matches their Showdown side server)
@@ -57,7 +57,7 @@ do not build from it.
 - Validation layer (FormatRules): Unlimited validates nothing; Limited =
   Standard's ban list plus all remaining legendaries (Articuno, Zapdos,
   Moltres, Raikou, Entei, Suicune, Regirock, Regice, Registeel, Latias,
-  Latios — confirm the exact list with Akiak before shipping); Hoenn variants
+  Latios — confirm the exact list with the community before shipping); Hoenn variants
   share their ruleset's validation unchanged.
 - Rules-pin layer (BattleCustomizer): the matrix is {Lv100, Lv50} x
   {entries 4, entries 3}. Lv100/entries-4 is the shipped pin (stock slot 3 of

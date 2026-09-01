@@ -4,7 +4,7 @@ Date: Sun, 16 Aug 2026 10:50:22 -0700
 Subject: [PATCH] Submit your team straight from your save, remember the
  dialog, curate the music
 
-Guest save submission, after the design Akiak built for OrreLink's ancestor:
+Guest save submission, after the design the community built for OrreLink's ancestor:
 instead of a Showdown paste, "Use my save" reads the guest's own save locally,
 extracts a small party-and-identity bundle -- the six party mons byte-for-byte,
 trainer name, gender, TID and SID -- and sends that through the existing team
@@ -722,7 +722,7 @@ index 0727db4..6fb1790 100644
 +  // "Use my save": submit the party from the player's OWN local save (the
 +  // port-2 slot the Team Editor's "Host" role edits -- their slot regardless
 +  // of which side of a room they join) instead of a Showdown paste. Community
-+  // design by Akiak, adapted. The real mon bytes travel as-is and the save's
++  // design by the community, adapted. The real mon bytes travel as-is and the save's
 +  // trainer identity travels with them; that identity match is what keeps the
 +  // party obedient (see PartyBundle.h), so the in-game name field above is
 +  // IGNORED in this mode and greyed out below to say so. The model pick stays
@@ -1350,7 +1350,7 @@ index 0000000..75e4502
 +#include "UICommon/XDNetplay/Gen3Mon.h"
 +#include "UICommon/XDNetplay/Gen3Save.h"
 +
-+// Guest save submission via party bundle (community design by Akiak, adapted).
++// Guest save submission via party bundle (community design by the community, adapted).
 +//
 +// A joiner can bring the team FROM THEIR OWN SAVE instead of a Showdown paste:
 +// the guest extracts a small fixed-size "party bundle" from their local save,

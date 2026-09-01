@@ -3,7 +3,7 @@ From: logdog2325 <loganjayfisher@gmail.com>
 Date: Tue, 1 Sep 2026 12:36:55 -0700
 Subject: [PATCH] Say which team-editor slot matters where
 
-Akiak's question exposed the gap: nothing in the UI says that a JOINER's
+the community's question exposed the gap: nothing in the UI says that a JOINER's
 locally edited "Guest (GBA 3)" save never enters a room they join -- in
 netplay only the host's saves sync, and a guest's team travels exclusively
 through the Submit Team sheet, whose "Use my save" reads the HOST slot
