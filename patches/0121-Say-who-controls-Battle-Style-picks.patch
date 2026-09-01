@@ -1,0 +1,54 @@
+From d6d8c5a672443f4b2cdd257fa75726d71e9293e0 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 1 Sep 2026 12:37:40 -0700
+Subject: [PATCH] Say who controls Battle Style picks
+
+Music and battle location are HOST picks (they ship in the host-assembled
+session code both players run); models are per player -- a joiner picks
+theirs in the Submit Team sheet and that pick beats the host's fallback
+dropdown. Both launchers' style sections now say so.
+---
+ Source/Android/app/src/main/res/values/strings.xml  |  2 +-
+ .../Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp   | 13 +++++++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index eb07657..4d3147c 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1116,7 +1116,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_update_no_browser">No app on this device can open the release page.</string>
+ 
+     <string name="xd_style_section_title">Battle Style</string>
+-    <string name="xd_style_section_hint">Cosmetic only. When you host, these apply to both players.</string>
++    <string name="xd_style_section_hint">Cosmetic only. Music and battle location follow the HOST: your picks apply to rooms you host, and do nothing in rooms you join. Models are per player — you pick yours here when hosting, and in the Submit Team sheet when joining.</string>
+     <string name="xd_style_your_model">Your model</string>
+     <string name="xd_style_guest_model">Guest model</string>
+     <string name="xd_style_guest_model_hint">Used only if they don\'t pick one themselves</string>
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index cda2048..7a19abb 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -389,6 +389,19 @@ void XDLauncherDialog::CreateMainLayout()
+   auto* style_box = new QGroupBox(tr("Battle Style"));
+   auto* style_layout = new QGridLayout;
+   int style_row = 0;
++  {
++    // Who controls what is a recurring question: music/location are HOST
++    // picks (they ship in the host-assembled session code both players run);
++    // models are PER PLAYER (a joiner picks theirs in the Submit Team
++    // sheet, and that pick beats the host's fallback dropdown).
++    auto* who_note = new QLabel(
++        tr("Music and battle location follow the HOST — your picks apply to rooms you host "
++           "and do nothing in rooms you join. Models are per player: pick yours here when "
++           "hosting, or in the Submit Team sheet when joining."));
++    who_note->setWordWrap(true);
++    style_layout->addWidget(who_note, style_row, 0, 1, 2);
++    style_row++;
++  }
+   const auto add_style_combo = [&](const QString& label, const QString& tooltip) {
+     auto* description = new QLabel(label);
+     auto* combo = new QComboBox;
+-- 
+2.39.5 (Apple Git-154)
+
