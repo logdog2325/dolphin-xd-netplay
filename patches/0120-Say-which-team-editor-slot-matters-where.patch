@@ -1,0 +1,107 @@
+From 1dd23e166b8ffb27aecbffcc6bf247e4192d3d40 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 1 Sep 2026 12:36:55 -0700
+Subject: [PATCH] Say which team-editor slot matters where
+
+Akiak's question exposed the gap: nothing in the UI says that a JOINER's
+locally edited "Guest (GBA 3)" save never enters a room they join -- in
+netplay only the host's saves sync, and a guest's team travels exclusively
+through the Submit Team sheet, whose "Use my save" reads the HOST slot
+(GBA port 2, verified at both the send path and the legality-note path).
+
+Both editors now say it at the role selector -- Host slot: "your team:
+plays when you host, and what Use-my-save submits when you join"; Guest
+slot: "only matters in rooms YOU host (the fallback a joining guest plays
+if they never submit) and in solo play" -- and both platforms' "Use my
+save" copy names the slot it sends.
+---
+ .../features/xdnetplay/ui/TeamEditorScreen.kt  | 11 +++++++++++
+ .../app/src/main/res/values/strings.xml        |  2 +-
+ .../Core/DolphinQt/NetPlay/NetPlayDialog.cpp   |  4 +++-
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp   | 18 +++++++++++++++---
+ 4 files changed, 30 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+index 5ddc96c..0a81117 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/TeamEditorScreen.kt
+@@ -94,6 +94,17 @@ fun TeamEditorScreen(
+                     )
+                 }
+             }
++            Spacer(Modifier.height(6.dp))
++            // Which slot matters where is the #1 point of confusion for
++            // joiners — say it right here, per selected role.
++            Text(
++                text = if (state.role == TeamRole.HOST)
++                    "Your team: plays when you host, and it is what \"Use my save\" submits when you join someone else's room."
++                else
++                    "Only used in rooms YOU host (the fallback team a joining guest plays if they never submit one) and in solo play — it does not affect rooms you join.",
++                color = XDColors.TextDim,
++                fontSize = 12.sp
++            )
+             Spacer(Modifier.height(14.dp))
+ 
+             if (!state.ready) {
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 1b9667c..eb07657 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1157,7 +1157,7 @@ It can efficiently compress both junk data and encrypted Wii data.
+          mode. Refusal messages (FireRed/LeafGreen save, empty party, ...) come
+          from the shared core and are not duplicated here. -->
+     <string name="xd_submit_use_save">Use my save</string>
+-    <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID.</string>
++    <string name="xd_submit_use_save_hint">Submit your save\'s party as-is, under your save\'s own trainer name and ID. This sends the Team Editor\'s "Host (GBA 2)" team.</string>
+     <string name="xd_submit_privacy_note">Your save\'s party is sent exactly as it is, and the host\'s machine receives everything in those bytes: exact moves, held items, stats, EVs, IVs, natures, nicknames, met information, ribbons, and your OT name and BOTH trainer IDs, including the secret one. Your opponent would see most of this by battling you — but not the secret ID, so only send your save to hosts you trust.</string>
+     <string name="xd_submit_name_ignored">Your save\'s real trainer name is used instead.</string>
+ 
+diff --git a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+index 040d38d..a0069bc 100644
+--- a/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
++++ b/Source/Core/DolphinQt/NetPlay/NetPlayDialog.cpp
+@@ -1011,7 +1011,9 @@ void NetPlayDialog::OnSubmitTeam()
+   // IGNORED in this mode and greyed out below to say so. The model pick stays
+   // meaningful either way: it rides the payload as its own header.
+   auto* use_save_check =
+-      new QCheckBox(tr("Use my save (send the party from my own save file)"), &dialog);
++      new QCheckBox(tr("Use my save (send the party from my own save file — the Team Editor's "
++                       "\"Host — GBA port 2\" team)"),
++                    &dialog);
+   dialog_layout->addWidget(use_save_check);
+ 
+   // Shown only while the box is ticked. The disclosure list is deliberately
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 4ab2b72..60900d3 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -81,11 +81,23 @@ void TeamEditorDialog::CreateMainLayout()
+   m_trainer_name_edit->setPlaceholderText(tr("Trainer name"));
+ 
+   m_trainer_label = new QLabel(QString());
++  // Which slot matters where is the #1 point of confusion for joiners, so it
++  // is said right under the selector: JOINING a room only ever sends the
++  // HOST slot's party (the Submit Team sheet's "Use my save" reads GBA port
++  // 2); the Guest slot is the fallback team for rooms YOU host, plus solo.
++  auto* role_note = new QLabel(
++      tr("Host — GBA port 2 is YOUR team: it plays when you host, and it is what\n"
++         "\"Use my save\" submits when you join someone else's room.\n"
++         "Guest — GBA port 3 only matters in rooms YOU host (the fallback team a\n"
++         "joining guest plays if they never submit one) and in solo play — editing\n"
++         "it does not affect rooms you join."));
++  role_note->setWordWrap(true);
+   top_layout->addWidget(new QLabel(tr("Editing team for:")), 0, 0);
+   top_layout->addWidget(m_role_combo, 0, 1);
+-  top_layout->addWidget(new QLabel(tr("Trainer name (max 7):")), 1, 0);
+-  top_layout->addWidget(m_trainer_name_edit, 1, 1);
+-  top_layout->addWidget(m_trainer_label, 2, 0, 1, 2);
++  top_layout->addWidget(role_note, 1, 0, 1, 2);
++  top_layout->addWidget(new QLabel(tr("Trainer name (max 7):")), 2, 0);
++  top_layout->addWidget(m_trainer_name_edit, 2, 1);
++  top_layout->addWidget(m_trainer_label, 3, 0, 1, 2);
+   top_layout->setColumnStretch(1, 1);
+   layout->addLayout(top_layout);
+ 
+-- 
+2.39.5 (Apple Git-154)
+
