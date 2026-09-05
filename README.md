@@ -233,6 +233,41 @@ does stall.
   know the item), so OrreLink's team checks are the ban in the formats that
   have it.
 
+## Playing across different kinds of computer
+
+A room that mixes CPU architectures — Apple Silicon or Android on one side,
+Windows or Linux on the other — runs every player on Dolphin's **Cached
+Interpreter** for that battle, and the host's chat says so at Start. Two
+different recompilers split the game's code into blocks differently, which
+skews the emulated clock between the machines, and XD seeds both its link key
+and its battle RNG from that clock; the interpreter is the one core all four
+builds share with identical timing and arithmetic. It is slower than a
+recompiler: fine on an Apple Silicon Mac and a recent Windows laptop, and
+netplay throttles the room to the slower side. Rooms that do not mix (Mac ↔
+Thor, Windows ↔ Linux) keep their recompilers and are unaffected.
+
+If a mixed room cannot hold full speed, the host can opt out with
+`ForceCommonCoreOnMixedArch = False` under `[NetPlay]` in `Dolphin.ini` —
+with the desync risk back.
+
+### Checking a match from the logs
+
+Every session log carries three kinds of proof lines. Comparing the host's
+and the guest's:
+
+- `t=boot cpu ...` — the core that actually ran (`core_eff`), the
+  architecture, and every determinism setting. Everything but `arch`, `hw_*`
+  and `rev` must match; a mixed room shows `core_eff="Cached Interpreter"`
+  on both.
+- `t=boot ar ...` — the Action Replay lines that will run. The host's
+  `ar synced-send` checksum must equal the guest's `ar synced-recv`, and
+  `diff <(grep '^t=boot ar op' host.log) <(grep '^t=boot ar op' guest.log)`
+  must be empty.
+- `xd ...` during the link and battle — RNG seed and battle-state checksums,
+  keyed by link-command sequence number so the two logs line up:
+  `diff <(grep ' xd ' host.log | sed -E 's/^t=[0-9]+ //') <(grep ' xd ' guest.log | sed -E 's/^t=[0-9]+ //')`
+  is empty for a clean match; the first differing line is the divergence.
+
 ## When the network won't let you connect
 
 Some networks block peer-to-peer traffic no matter which connection type you

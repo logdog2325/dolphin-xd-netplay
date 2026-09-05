@@ -1,0 +1,1253 @@
+From 46900b1f0b5fa3884a9ff9895c9526dc6bc9286d Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 5 Sep 2026 11:26:22 -0700
+Subject: [PATCH] XD Netplay: deterministic cross-architecture rooms, state
+ instrumentation, AR-block logging, launcher fits small screens (v1.5.10)
+
+A macOS ARM64 host and a Windows x64 guest desynced on v1.5.9. The host
+sends its CPU core over NetPlay; a build that cannot construct that core
+silently falls back to its own JIT (PowerPC.cpp), so the room ran two
+different recompilers. Different cores split blocks differently, the
+emulated tick only advances at block ends, and XD reads the time base:
+its GBA link key (OSGetTick, 0x8002d430) differed by exactly the observed
+48-cycle skew / 12, and its battle RNG seed is time-derived at boot.
+
+- Clients send their CPU architecture at connect; a host whose room mixes
+  x86_64 and arm64 puts every player on the Cached Interpreter (identical
+  timing and arithmetic on all four builds) and says so in chat. Same-arch
+  rooms are untouched. NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH opts out.
+- Guest-side loud fallback when a received core is unavailable.
+- accurate_fmadds was never serialized (always false on guests): forced
+  on and put on the wire. MAIN_ACCURATE_CPU_CACHE, MAIN_GBA_PRACTICE_DUMMY
+  (local GBA input injection) and MAIN_GPU_DETERMINISM_MODE pinned in the
+  netplay layer. -ffp-contract=off for the interpreter cores.
+- Interpreter cores on ARM64 hosts without FEAT_AFP flush denormal
+  outputs in software instead of letting hardware FZ flush inputs too,
+  matching x86-64 FTZ; FEAT_AFP now detected on macOS.
+- gba_detect: 'cpu' boot line (effective core, arch, every determinism
+  setting), 'xd' state lines (RNG seed, JoyBoot LCG, battle-state CRCs,
+  keyed by WRITE ordinal), 'ar' lines (active codes on every machine,
+  send/receive checksums).
+- Launcher content in a scroll area, first-show height capped to the
+  screen; Team Editor capped likewise.
+---
+ CMakeLists.txt                                |   5 +
+ Source/Core/Common/ArmCPUDetect.cpp           |  10 ++
+ Source/Core/Common/ArmFPURoundMode.cpp        |   9 +-
+ Source/Core/Common/FPURoundMode.h             |   9 +-
+ Source/Core/Common/GenericFPURoundMode.cpp    |   2 +-
+ Source/Core/Common/x64FPURoundMode.cpp        |   2 +-
+ Source/Core/Core/ActionReplay.cpp             |   6 +
+ Source/Core/Core/ActionReplay.h               |   3 +
+ Source/Core/Core/Config/NetplaySettings.cpp   |   2 +
+ Source/Core/Core/Config/NetplaySettings.h     |   4 +
+ .../ConfigLoaders/NetPlayConfigLoader.cpp     |  10 ++
+ Source/Core/Core/Core.cpp                     |  47 +++++
+ Source/Core/Core/HW/GBADetectLog.cpp          |   6 +
+ Source/Core/Core/HW/GBADetectLog.h            |   5 +
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 167 ++++++++++++++++++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |   9 +
+ Source/Core/Core/NetPlayClient.cpp            |  34 +++-
+ Source/Core/Core/NetPlayProto.h               |  18 ++
+ Source/Core/Core/NetPlayServer.cpp            |  91 +++++++++-
+ Source/Core/Core/NetPlayServer.h              |   5 +
+ Source/Core/Core/PatchEngine.cpp              |  36 ++++
+ Source/Core/Core/PowerPC/PowerPC.cpp          |  27 ++-
+ Source/Core/Core/PowerPC/PowerPC.h            |   7 +
+ .../DolphinQt/XDNetplay/TeamEditorDialog.cpp  |  10 +-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 103 ++++++++++-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |   2 +
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 27 files changed, 616 insertions(+), 15 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0d5ebfa..6dde3ce 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -318,6 +318,11 @@ else()
+ 
+   # gcc uses some optimizations which might break stuff without this flag
+   check_and_add_flag(NO_STRICT_ALIASING -fno-strict-aliasing)
++  # The interpreter cores must produce identical bits on x86_64 and arm64. Apple
++  # and NDK clang default to -ffp-contract=on and FMA is baseline on arm64, so any
++  # a*b+c written as one expression would fuse there and not on x86. Audited
++  # contraction-free today; keep it that way. MSVC /fp:precise never contracts.
++  check_and_add_flag(NO_FP_CONTRACT -ffp-contract=off)
+   check_and_add_flag(NO_EXCEPTIONS -fno-exceptions)
+ 
+   check_and_add_flag(VISIBILITY_INLINES_HIDDEN -fvisibility-inlines-hidden)
+diff --git a/Source/Core/Common/ArmCPUDetect.cpp b/Source/Core/Common/ArmCPUDetect.cpp
+index 91b66f8..e950261 100644
+--- a/Source/Core/Common/ArmCPUDetect.cpp
++++ b/Source/Core/Common/ArmCPUDetect.cpp
+@@ -234,6 +234,16 @@ void CPUInfo::Detect()
+   bSHA1 = true;
+   bSHA2 = true;
+   bCRC32 = true;
++  // FEAT_AFP (Apple M4 class and later): with it the hardware can flush denormal
++  // outputs only, exactly like the Gekko; without it (M1-M3) FZ also flushes
++  // inputs, which OrreLink's interpreter-core path works around in software.
++  // macOS 12+ exposes it as an int sysctl.
++  {
++    int afp = 0;
++    size_t len = sizeof(afp);
++    if (sysctlbyname("hw.optional.arm.FEAT_AFP", &afp, &len, nullptr, 0) == 0)
++      bAFP = afp != 0;
++  }
+ #elif defined(_WIN32)
+   // NOTE All this info is from cpu core 0 only.
+ 
+diff --git a/Source/Core/Common/ArmFPURoundMode.cpp b/Source/Core/Common/ArmFPURoundMode.cpp
+index d24cecf..733bd2f 100644
+--- a/Source/Core/Common/ArmFPURoundMode.cpp
++++ b/Source/Core/Common/ArmFPURoundMode.cpp
+@@ -36,7 +36,7 @@ static void SetFPCR(u64 fpcr)
+ static const u64 default_fpcr = GetFPCR();
+ static u64 saved_fpcr = default_fpcr;
+ 
+-void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode)
++void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode, bool software_output_flush)
+ {
+   // When AH is disabled, FZ controls flush-to-zero for both inputs and outputs. When AH is enabled,
+   // FZ controls flush-to-zero for outputs, and FIZ controls flush-to-zero for inputs.
+@@ -49,7 +49,12 @@ void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode)
+   // "non-IEEE mode". Unfortunately, FEAT_AFP didn't exist until 2020, so we can't count on setting
+   // AH actually doing anything. But flushing both inputs and outputs seems to cause less problems
+   // than flushing nothing, so let's just set FZ and AH and roll with whatever behavior we get.
+-  const u32 flush_to_zero_bits = (non_ieee_mode ? FZ | AH : 0);
++  // OrreLink: when the running core does its own output flushing (interpreter
++  // cores, see FPURoundMode.h) and this host lacks FEAT_AFP, leave FZ clear:
++  // FZ without AH would flush inputs too, which neither the Gekko nor an
++  // x86-64 peer (FTZ only) does. With FEAT_AFP the hardware mode is exact.
++  const bool hardware_flush = non_ieee_mode && (cpu_info.bAFP || !software_output_flush);
++  const u32 flush_to_zero_bits = (hardware_flush ? FZ | AH : 0);
+   static bool afp_warning_shown = false;
+   if (!afp_warning_shown && !cpu_info.bAFP && non_ieee_mode)
+   {
+diff --git a/Source/Core/Common/FPURoundMode.h b/Source/Core/Common/FPURoundMode.h
+index 3eb5d2f..6627859 100644
+--- a/Source/Core/Common/FPURoundMode.h
++++ b/Source/Core/Common/FPURoundMode.h
+@@ -15,7 +15,14 @@ enum RoundMode : u32
+   ROUND_DOWN = 3
+ };
+ 
+-void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode);
++// software_output_flush: the running core flushes denormal OUTPUTS itself
++// (interpreter cores on an ARM64 host without FEAT_AFP), so the host FPU must
++// not flush at all -- hardware FZ there would also flush INPUTS, which the
++// Gekko never does and x86-64 (FTZ only) does not either. Keeps the Cached
++// Interpreter bit-identical between x86-64 and Apple M1-M3 class hosts
++// (residual: the FMA tie-correction intermediates in NI_madd_msub are raw host
++// results and can differ for denormal intermediates -- contrived for GC titles).
++void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode, bool software_output_flush = false);
+ 
+ /*
+  * There are two different flavors of float to int conversion:
+diff --git a/Source/Core/Common/GenericFPURoundMode.cpp b/Source/Core/Common/GenericFPURoundMode.cpp
+index 2043ba8..c188c24 100644
+--- a/Source/Core/Common/GenericFPURoundMode.cpp
++++ b/Source/Core/Common/GenericFPURoundMode.cpp
+@@ -8,7 +8,7 @@
+ // Generic, do nothing
+ namespace Common::FPU
+ {
+-void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode)
++void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode, bool /*software_output_flush*/)
+ {
+ }
+ void SaveSIMDState()
+diff --git a/Source/Core/Common/x64FPURoundMode.cpp b/Source/Core/Common/x64FPURoundMode.cpp
+index fdd13d9..9420abb 100644
+--- a/Source/Core/Common/x64FPURoundMode.cpp
++++ b/Source/Core/Common/x64FPURoundMode.cpp
+@@ -12,7 +12,7 @@ namespace Common::FPU
+ static u32 saved_sse_state = _mm_getcsr();
+ static const u32 default_sse_state = _mm_getcsr();
+ 
+-void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode)
++void SetSIMDMode(RoundMode rounding_mode, bool non_ieee_mode, bool /*software_output_flush*/)
+ {
+   // OR-mask for disabling FPU exceptions (bits 7-12 in the MXCSR register)
+   const u32 EXCEPTION_MASK = 0x1F80;
+diff --git a/Source/Core/Core/ActionReplay.cpp b/Source/Core/Core/ActionReplay.cpp
+index 9dbb045..a7083e9 100644
+--- a/Source/Core/Core/ActionReplay.cpp
++++ b/Source/Core/Core/ActionReplay.cpp
+@@ -160,6 +160,12 @@ std::vector<ARCode> ApplyAndReturnCodes(std::span<const ARCode> codes)
+   return s_active_codes;
+ }
+ 
++std::vector<ARCode> GetActiveCodesSnapshot()
++{
++  std::lock_guard guard(s_lock);
++  return s_active_codes;
++}
++
+ void AddCode(ARCode code)
+ {
+   if (!Config::AreCheatsEnabled())
+diff --git a/Source/Core/Core/ActionReplay.h b/Source/Core/Core/ActionReplay.h
+index 694493e..deb88fd 100644
+--- a/Source/Core/Core/ActionReplay.h
++++ b/Source/Core/Core/ActionReplay.h
+@@ -49,6 +49,9 @@ void ApplyCodes(std::span<const ARCode> codes, const std::string& game_id, u16 r
+ void SetSyncedCodesAsActive();
+ void UpdateSyncedCodes(std::span<const ARCode> codes);
+ std::vector<ARCode> ApplyAndReturnCodes(std::span<const ARCode> codes);
++// OrreLink: the codes that will run this session (synced set on a guest, INI set
++// on the host/solo), for the per-session gba_detect log.
++std::vector<ARCode> GetActiveCodesSnapshot();
+ void AddCode(ARCode new_code);
+ size_t CountEnabledCodes();
+ void LoadAndApplyCodes(const Common::IniFile& global_ini, const Common::IniFile& local_ini,
+diff --git a/Source/Core/Core/Config/NetplaySettings.cpp b/Source/Core/Core/Config/NetplaySettings.cpp
+index b591aa8..2f7de9c 100644
+--- a/Source/Core/Core/Config/NetplaySettings.cpp
++++ b/Source/Core/Core/Config/NetplaySettings.cpp
+@@ -60,5 +60,7 @@ const Info<std::string> NETPLAY_NETWORK_MODE{{System::Main, "NetPlay", "NetworkM
+                                              "fixeddelay"};
+ const Info<bool> NETPLAY_GOLF_MODE_OVERLAY{{System::Main, "NetPlay", "GolfModeOverlay"}, true};
+ const Info<bool> NETPLAY_HIDE_REMOTE_GBAS{{System::Main, "NetPlay", "HideRemoteGBAs"}, false};
++const Info<bool> NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH{
++    {System::Main, "NetPlay", "ForceCommonCoreOnMixedArch"}, true};
+ 
+ }  // namespace Config
+diff --git a/Source/Core/Core/Config/NetplaySettings.h b/Source/Core/Core/Config/NetplaySettings.h
+index f6ccfc7..9f817d9 100644
+--- a/Source/Core/Core/Config/NetplaySettings.h
++++ b/Source/Core/Core/Config/NetplaySettings.h
+@@ -52,5 +52,9 @@ extern const Info<bool> NETPLAY_STRICT_SETTINGS_SYNC;
+ extern const Info<std::string> NETPLAY_NETWORK_MODE;
+ extern const Info<bool> NETPLAY_GOLF_MODE_OVERLAY;
+ extern const Info<bool> NETPLAY_HIDE_REMOTE_GBAS;
++// OrreLink: when the room mixes x86_64 and arm64 players, put every player on the
++// Cached Interpreter (the one core all platforms build identically, with identical
++// block-boundary timing). Same-arch rooms are never touched.
++extern const Info<bool> NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH;
+ 
+ }  // namespace Config
+diff --git a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+index db60fb0..f247b22 100644
+--- a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
++++ b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+@@ -87,6 +87,16 @@ public:
+     layer->Set(Config::MAIN_FPRF, m_settings.fprf);
+     layer->Set(Config::MAIN_ACCURATE_NANS, m_settings.accurate_nans);
+     layer->Set(Config::MAIN_ACCURATE_FMADDS, m_settings.accurate_fmadds);
++    // Not in NetSettings; read by PowerPC.cpp / JitBase.cpp and changes both
++    // timing and semantics on the interpreter cores. Pin it off for everyone.
++    layer->Set(Config::MAIN_ACCURATE_CPU_CACHE, false);
++    // OrreLink: the practice dummy injects A/Right/Down into GBA port 3 LOCALLY
++    // (SI_DeviceGBAEmu) -- a host that left it on would feed its copy of the
++    // guest's GBA input nobody else sees. Never under netplay.
++    layer->Set(Config::MAIN_GBA_PRACTICE_DUMMY, false);
++    // Per-machine and never synced upstream; "none" defeats the deterministic
++    // GPU thread while cpu_thread itself is synced. Pin the default for all.
++    layer->Set(Config::MAIN_GPU_DETERMINISM_MODE, std::string("auto"));
+     layer->Set(Config::MAIN_DISABLE_ICACHE, m_settings.disable_icache);
+     layer->Set(Config::MAIN_SYNC_ON_SKIP_IDLE, m_settings.sync_on_skip_idle);
+     layer->Set(Config::MAIN_SYNC_GPU, m_settings.sync_gpu);
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index 6a404de..bd137aa 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -46,6 +46,7 @@
+ #include "Core/BootManager.h"
+ #include "Core/CPUThreadConfigCallback.h"
+ #include "Core/Config/MainSettings.h"
++#include "Core/Config/SessionSettings.h"
+ #include "Core/ConfigManager.h"
+ #include "Core/CoreTiming.h"
+ #include "Core/DSPEmulator.h"
+@@ -57,6 +58,9 @@
+ #include "Core/HW/DSP.h"
+ #include "Core/HW/EXI/EXI.h"
+ #include "Core/HW/GBAPad.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBADetectLog.h"
++#endif
+ #include "Core/HW/GCKeyboard.h"
+ #include "Core/HW/GCPad.h"
+ #include "Core/HW/HW.h"
+@@ -685,6 +689,49 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+     system.GetPowerPC().SetMode(PowerPC::CoreMode::Interpreter);
+   }
+ 
++#ifdef HAS_LIBMGBA
++  // OrreLink: the EFFECTIVE core -- the instantiated object, not the config enum
++  // (PowerPC.cpp falls back silently when the enum names a JIT this architecture
++  // cannot build) -- plus every determinism-relevant knob, one line under the
++  // gba_detect banner. `grep '^t=boot cpu ' gba_detect_*.log` on each side and
++  // diff: any field but arch/hw_*/rev that differs is a desync in waiting. Note
++  // the Cached Interpreter dispatches as "jit" (it is a JitBase); core_eff is the
++  // field that matters.
++  // Only when this boot opened a GBA log: a NoteBoot with no session parks the
++  // line in the pre-boot ring and it would surface under the NEXT session's
++  // banner as a phantom 'cpu' line from an unrelated game.
++  if (GBADetectLog::IsSessionOpen())
++  {
++    const auto& ppc = system.GetPowerPC();
++    GBADetectLog::NoteBoot(fmt::format(
++        "cpu arch={} core_cfg={} core_eff=\"{}\" dispatch={} hw_fma={} hw_afp={} use_fma={} "
++        "accurate_fmadds={} accurate_nans={} fprf={} float_exc={} div0_exc={} disable_icache={} "
++        "accurate_dcache={} fastmem={} follow_branch={} mmu={} cpu_thread={} oc={} "
++        "sync_on_skip_idle={} cheats={} gpu_det={} dsp_hle={} dsp_thread={} practice_dummy={} "
++        "debug={} soft_flush={} netplay={} rev={}",
++        NetPlay::LocalCpuArch(), static_cast<int>(Config::Get(Config::MAIN_CPU_CORE)),
++        ppc.GetCPUName(), ppc.GetMode() == PowerPC::CoreMode::JIT ? "jit" : "interp",
++        cpu_info.bFMA ? 1 : 0, cpu_info.bAFP ? 1 : 0, Config::Get(Config::SESSION_USE_FMA) ? 1 : 0,
++        Config::Get(Config::MAIN_ACCURATE_FMADDS) ? 1 : 0,
++        Config::Get(Config::MAIN_ACCURATE_NANS) ? 1 : 0, Config::Get(Config::MAIN_FPRF) ? 1 : 0,
++        Config::Get(Config::MAIN_FLOAT_EXCEPTIONS) ? 1 : 0,
++        Config::Get(Config::MAIN_DIVIDE_BY_ZERO_EXCEPTIONS) ? 1 : 0,
++        Config::Get(Config::MAIN_DISABLE_ICACHE) ? 1 : 0,
++        Config::Get(Config::MAIN_ACCURATE_CPU_CACHE) ? 1 : 0,
++        Config::Get(Config::MAIN_FASTMEM) ? 1 : 0,
++        Config::Get(Config::MAIN_JIT_FOLLOW_BRANCH) ? 1 : 0,
++        Config::Get(Config::MAIN_MMU) ? 1 : 0, Config::Get(Config::MAIN_CPU_THREAD) ? 1 : 0,
++        Config::Get(Config::MAIN_OVERCLOCK_ENABLE) ? Config::Get(Config::MAIN_OVERCLOCK) : 1.0f,
++        Config::Get(Config::MAIN_SYNC_ON_SKIP_IDLE) ? 1 : 0, Config::AreCheatsEnabled() ? 1 : 0,
++        Config::Get(Config::MAIN_GPU_DETERMINISM_MODE), Config::Get(Config::MAIN_DSP_HLE) ? 1 : 0,
++        Config::Get(Config::MAIN_DSP_THREAD) ? 1 : 0,
++        Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY) ? 1 : 0,
++        Config::Get(Config::MAIN_ENABLE_DEBUGGING) ? 1 : 0,
++        ppc.GetPPCState().software_fpu_flush ? 1 : 0,
++        NetPlay::IsNetPlayRunning() ? 1 : 0,
++        Common::GetScmRevGitStr()));
++  }
++#endif
+   UpdateTitle(system);
+ 
+   // Become the CPU thread.
+diff --git a/Source/Core/Core/HW/GBADetectLog.cpp b/Source/Core/Core/HW/GBADetectLog.cpp
+index 2401160..0ad80be 100644
+--- a/Source/Core/Core/HW/GBADetectLog.cpp
++++ b/Source/Core/Core/HW/GBADetectLog.cpp
+@@ -172,6 +172,12 @@ void OnDeviceDestroyed()
+   }
+ }
+ 
++bool IsSessionOpen()
++{
++  std::lock_guard lock(s_mutex);
++  return s_file.is_open();
++}
++
+ void NoteBoot(const std::string& line)
+ {
+   std::lock_guard lock(s_mutex);
+diff --git a/Source/Core/Core/HW/GBADetectLog.h b/Source/Core/Core/HW/GBADetectLog.h
+index fec8967..fdf6efd 100644
+--- a/Source/Core/Core/HW/GBADetectLog.h
++++ b/Source/Core/Core/HW/GBADetectLog.h
+@@ -62,6 +62,11 @@ void LogSummary(int channel, u64 tick, bool rom, bool gba, bool loc, bool lk, u3
+ // yet: the line is queued (bounded) and flushed right under the banner of the
+ // NEXT session's log, so the log that describes a battle also says what was
+ // configured into it. With a session already open it is written immediately.
++// True while a session file is open (a GBA device exists this boot). Emitters
++// that run after HW::Init use it to avoid parking a line in the pre-boot ring,
++// where it would surface under a later, unrelated session's banner.
++bool IsSessionOpen();
++
+ void NoteBoot(const std::string& line);
+ 
+ // Append one line AFTER the session's log has already been closed.
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 6f1b8e2..2603e49 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -13,6 +13,7 @@
+ 
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
++#include "Common/Hash.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/Config/Config.h"
+ #include "Core/Config/MainSettings.h"
+@@ -21,6 +22,7 @@
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GBADetectLog.h"
+ #include "Core/HW/GBAPad.h"
++#include "Core/HW/Memmap.h"
+ #include "Core/HW/SI/SI.h"
+ #include "Core/HW/SI/SI_DeviceGCController.h"
+ #include "Core/HW/SystemTimers.h"
+@@ -95,6 +97,159 @@ CSIDevice_GBAEmu::~CSIDevice_GBAEmu()
+   GBADetectLog::OnDeviceDestroyed();
+ }
+ 
++namespace
++{
++// Pokemon XD (GXXE01 USA, main.dol sha256 c8659341...78f15) battle state that
++// decides a link battle, reverse-engineered from the binary and cross-checked
++// adversarially. Every fixed address is a .bss/.sbss/.sdata location in MEM1
++// (BAT identity mapping: read directly, no MMU). ~1.6 KB per hook.
++struct XdRange
++{
++  u32 addr;
++  u32 len;
++};
++constexpr u32 XD_DISC_ID_GXXE = 0x47585845;  // "GXXE" at 0x80000000; anything else: no line
++// Main PRNG (the game's own LCG): seed = seed * 0x343FD + 0x269EC3, stepped by
++// every rand_u16 (407 callers) / rand_float (238) call; written once at boot from
++// OSGetTime's low word (0x800efa58). The pointer cell at +4 always reads
++// 0x804E8610 (its only setter has no callers).
++constexpr u32 XD_RNG_SEED = 0x804E8610;
++// SDK JoyBoot LCG state (ANSI LCG, global 0x804e81e0), RE-SEEDED FROM OSGetTick
++// at every GBA key exchange -- the value behind the first divergent JoyBus byte
++// in the v1.5.9 field logs (c7 vs c3). Logged raw; a difference here with equal
++// seed/crcs is the time-base-drift signature.
++constexpr u32 XD_JOYBOOT_LCG = 0x804E81E0;
++constexpr u32 XD_BATTLE_FLAGS = 0x804EB938;  // u32 bit flags, 263 refs in the engine
++// crcA: battle-engine scalars (.sbss: flags, command-ring indices, turn counters,
++// scratch-block pointer) + the .sdata battle event struct.
++constexpr XdRange XD_CRC_A[] = {{0x804EB8D0, 0xB0}, {0x804E85C0, 0x20}};
++// crcB: party state of the LIVE battle context. The context is a runtime
++// pointer (cell 0x804af528) to one of two 0x6ef0-byte objects (ctx[0]=0x804a1744,
++// ctx[1]=0x804a8634); trainer = ctx+0x64+t*0x3744; party entry =
++// trainer+0x97c+i*0x300 (record at +4: species u16, +4 current HP u16, +0x11
++// level, +0x28 status, +0x80 moves/PP, +0x90 max HP); active slot =
++// trainer+0x1b7c+s*0x894. Skipped (crcB=0) when the pointer is not one of the
++// two objects; the pointer is logged as ctx=.
++constexpr u32 XD_CTX_PTR = 0x804AF528;
++constexpr u32 XD_CTX_A = 0x804A1744;
++constexpr u32 XD_CTX_B = 0x804A8634;
++constexpr u32 XD_TRAINER_OFF = 0x64;
++constexpr u32 XD_TRAINER_STRIDE = 0x3744;
++constexpr u32 XD_PARTY_OFF = 0x97C;
++constexpr u32 XD_PARTY_STRIDE = 0x300;
++constexpr u32 XD_SLOT_OFF = 0x1B7C;
++constexpr u32 XD_SLOT_STRIDE = 0x894;
++// crcC (informational, never gates a line): GBA driver per-channel state, .sbss
++// link state, battle mode word, and the ruleset table entry the format pin
++// writes (0x804334C0 = BattleCustomizer's ORRE_RULESET_BASE).
++constexpr XdRange XD_CRC_C[] = {
++    {0x80428338, 0x20}, {0x804EA768, 0x28}, {0x80429A00, 0x04}, {0x804334C0, 0x90}};
++constexpr u32 XD_UPLOAD_WRITES = 26900;  // multiboot client upload, same as the OSD phase logic
++constexpr u32 XD_MAX_LINES_PER_SOCKET = 80000;  // ~6 MB worst case, under the file cap
++
++size_t AppendEmu(const Memory::MemoryManager& memory, u8* dst, size_t at, u32 addr, u32 len)
++{
++  memory.CopyFromEmu(dst + at, addr, len);
++  return at + len;
++}
++}  // namespace
++
++// One gba_detect 'xd' line: RNG seed + CRC32s of the battle state, keyed by
++// wseq = m_diag_wr_count (this socket's session-lifetime GC->GBA WRITE ordinal,
++// identical on every client up to the divergence, unlike the emulated tick).
++// Written on the forced events (link-established, battle-locked, upload-done)
++// and otherwise at a battle-phase WRITE only when seed/crcA/crcB changed since
++// the last line on this socket, at most ~60 lines/s, never during the multiboot
++// upload (26,900 WRITEs that never touch battle state). Two players' logs then
++// carry identical lines at identical wseq until the first divergence:
++//   diff <(grep ' xd ' a.log | sed -E 's/^t=[0-9]+ //') <(... b.log ...)
++// seed equal + crcB different = arithmetic diverged; seed different first = RNG
++// consumption diverged earlier; seed different on the very first line = boot-
++// time time-base divergence (compare the t= of the first 'joy >' lines).
++void CSIDevice_GBAEmu::LogXdState(const u8* request, const char* why, bool forced)
++{
++  if (!Core::IsCPUThread() || m_xd_lines >= XD_MAX_LINES_PER_SOCKET)
++    return;
++  const auto& memory = m_system.GetMemory();
++  if (memory.Read_U32(0x80000000) != XD_DISC_ID_GXXE)
++    return;
++  const u64 tps = m_system.GetSystemTimers().GetTicksPerSecond();
++  if (!forced)
++  {
++    // Not during the client upload (battle-locked but the ~27k-WRITE stream is
++    // the multiboot image, not battle traffic), and never faster than one line
++    // per emulated frame.
++    const bool uploading =
++        m_battle_locked && (m_diag_wr_count - m_osd_upload_base) < XD_UPLOAD_WRITES;
++    if (uploading)
++      return;
++    if (m_xd_last_tick != 0 && m_timestamp_sent - m_xd_last_tick < tps / 60)
++      return;
++  }
++
++  const u32 seed = memory.Read_U32(XD_RNG_SEED);
++  const u32 joyboot = memory.Read_U32(XD_JOYBOOT_LCG);
++  const u32 flags = memory.Read_U32(XD_BATTLE_FLAGS);
++  const u32 ctx = memory.Read_U32(XD_CTX_PTR);
++
++  u8 buf[2048];
++  size_t n = 0;
++  for (const XdRange& r : XD_CRC_A)
++    n = AppendEmu(memory, buf, n, r.addr, r.len);
++  const u32 crc_a = Common::ComputeCRC32(buf, n);
++
++  u32 crc_b = 0;
++  if (ctx == XD_CTX_A || ctx == XD_CTX_B)
++  {
++    n = 0;
++    for (u32 t = 0; t < 2; t++)
++    {
++      const u32 trainer = ctx + XD_TRAINER_OFF + t * XD_TRAINER_STRIDE;
++      for (u32 i = 0; i < 6; i++)
++      {
++        const u32 record = trainer + XD_PARTY_OFF + i * XD_PARTY_STRIDE + 4;
++        n = AppendEmu(memory, buf, n, record, 0x30);
++        n = AppendEmu(memory, buf, n, record + 0x80, 0x20);
++      }
++      for (u32 sl = 0; sl < 2; sl++)
++        n = AppendEmu(memory, buf, n, trainer + XD_SLOT_OFF + sl * XD_SLOT_STRIDE, 0x40);
++    }
++    crc_b = Common::ComputeCRC32(buf, n);
++  }
++
++  n = 0;
++  for (const XdRange& r : XD_CRC_C)
++    n = AppendEmu(memory, buf, n, r.addr, r.len);
++  const u32 crc_c = Common::ComputeCRC32(buf, n);
++
++  // jb (the JoyBoot LCG) participates: it is the very word the v1.5.9 evidence
++  // points at, and both sockets' key exchanges share it.
++  const bool changed = !m_xd_have_last || seed != m_xd_last_seed || joyboot != m_xd_last_jb ||
++                       crc_a != m_xd_last_crc[0] || crc_b != m_xd_last_crc[1];
++  if (!changed && !forced)
++    return;
++  m_xd_have_last = true;
++  m_xd_last_seed = seed;
++  m_xd_last_jb = joyboot;
++  m_xd_last_crc[0] = crc_a;
++  m_xd_last_crc[1] = crc_b;
++  m_xd_last_tick = m_timestamp_sent;
++  ++m_xd_lines;
++
++  std::string data;
++  if (request != nullptr && m_last_cmd == EBufferCommands::CMD_WRITE_GBA)
++  {
++    data = fmt::format(" data={:02x}{:02x}{:02x}{:02x}", request[1], request[2], request[3],
++                       request[4]);
++  }
++  GBADetectLog::LogEvent(
++      m_device_number, m_timestamp_sent, "xd",
++      fmt::format("wseq={} why={}{} seed={:08x} jb={:08x} ctx={:08x} flags={:08x} crcA={:08x} "
++                  "crcB={:08x} crcC={:08x}",
++                  m_diag_wr_count, why, data, seed, joyboot, ctx, flags, crc_a, crc_b, crc_c),
++      false);  // bounded; the <=1/s summary line flushes
++}
++
+ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+ {
+   switch (m_next_action)
+@@ -584,6 +739,8 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+             GBADetectLog::LogEvent(
+                 m_device_number, m_timestamp_sent, "link-progress",
+                 fmt::format("upload done ({} writes), client starting", uploaded));
++          if (phase == 3)
++            LogXdState(buffer, "upload-done", /*forced=*/true);
+         }
+         if (phase == 2)
+         {
+@@ -605,12 +762,16 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       {
+         GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "link-established",
+                                fmt::format("data_cmd_count={}", m_data_cmd_count));
++        LogXdState(buffer, "link-established", /*forced=*/true);
+         if (m_diag_cmd_burst < 16)
+           m_diag_cmd_burst = 16;
+       }
+       if (m_battle_locked && !m_diag_prev_locked)
++      {
+         GBADetectLog::LogEvent(m_device_number, m_timestamp_sent, "battle-locked",
+                                fmt::format("data_cmd_count={}", m_data_cmd_count));
++        LogXdState(buffer, "battle-locked", /*forced=*/true);
++      }
+       m_diag_prev_established = m_link_established;
+       m_diag_prev_locked = m_battle_locked;
+ 
+@@ -677,6 +838,12 @@ int CSIDevice_GBAEmu::RunBuffer(u8* buffer, int request_length)
+       m_diag_log_this_response = true;  // pair the response in ReceiveResponse
+     }
+ 
++    // 'xd' battle-state checksum at battle-phase GC->GBA WRITEs (the command
++    // whose payload first differed between machines in the v1.5.9 report).
++    // Gated inside LogXdState: upload suppressed, changed-state only, <=60/s.
++    if (m_link_established && m_last_cmd == EBufferCommands::CMD_WRITE_GBA)
++      LogXdState(buffer, "write", /*forced=*/false);
++
+     auto& si = m_system.GetSerialInterface();
+     si.RemoveEvent(m_device_number);
+     si.ScheduleEvent(m_device_number,
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 75dc305..635d23d 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -145,6 +145,15 @@ private:
+   u64 m_diag_last_window_dur_ms = 0; // last completed window's duration
+   u64 m_diag_last_press_seen = 0;    // last pad-press tick this socket logged roll-state for
+   bool m_diag_first_cmd_logged = false;  // first-data emitted for the current window
++  // 'xd' state-checksum lines (LogXdState in the .cpp). Diagnostic only, CPU
++  // thread only, not in DoState, never read by a control path.
++  void LogXdState(const u8* request, const char* why, bool forced);
++  bool m_xd_have_last = false;
++  u32 m_xd_last_seed = 0;
++  u32 m_xd_last_jb = 0;
++  u32 m_xd_last_crc[2]{};
++  u32 m_xd_lines = 0;  // per-socket hard cap
++  u64 m_xd_last_tick = 0;
+   u64 m_diag_last_joy_tick = 0;   // Review #1 I4: min-gap rate limit for the H8 class path
+ 
+   std::shared_ptr<HW::GBA::Core> m_core;
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index ba382e7..14d2039 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -31,6 +31,7 @@
+ #include "Common/Crypto/SHA1.h"
+ #include "Common/ENet.h"
+ #include "Common/FileUtil.h"
++#include "Common/Hash.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/NandPaths.h"
+@@ -70,6 +71,7 @@
+ #include "Core/IOS/Uids.h"
+ #include "Core/Movie.h"
+ #include "Core/NetPlayCommon.h"
++#include "Core/PowerPC/PowerPC.h"
+ #include "Core/SyncIdentifier.h"
+ #include "Core/System.h"
+ #include "DiscIO/Blob.h"
+@@ -362,8 +364,12 @@ bool NetPlayClient::Connect()
+   // send connect message
+   sf::Packet packet;
+   packet << Common::GetScmRevGitStr();
+-  packet << Common::GetNetplayDolphinVer();
++  // The Revision column in every room UI then reads e.g. "... Mac arm64" /
++  // "... Win x86_64" with no UI change; the separate arch field below is what
++  // the host's cross-architecture policy uses (NetPlayServer::SetupNetSettings).
++  packet << Common::GetNetplayDolphinVer() + " " + LocalCpuArch();
+   packet << m_player_name;
++  packet << std::string(LocalCpuArch());
+   Send(packet);
+   enet_host_flush(m_client);
+   sf::Packet rpac;
+@@ -421,7 +427,7 @@ bool NetPlayClient::Connect()
+     Player player;
+     player.name = m_player_name;
+     player.pid = m_pid;
+-    player.revision = Common::GetNetplayDolphinVer();
++    player.revision = Common::GetNetplayDolphinVer() + " " + LocalCpuArch();
+ 
+     // add self to player list
+     m_players[m_pid] = player;
+@@ -963,6 +969,18 @@ void NetPlayClient::OnStartGame(sf::Packet& packet)
+     packet >> m_current_game;
+     packet >> m_net_settings.cpu_thread;
+     packet >> m_net_settings.cpu_core;
++    // Never let PowerPC.cpp's silent fallback pick this machine's native JIT when
++    // the host named a core this build cannot construct. Unreachable under the
++    // host's mixed-arch policy; if it ever fires, use the one core every platform
++    // has and say so, so a JIT-vs-JIT mismatch can never hide again.
++    if (std::ranges::find(PowerPC::AvailableCPUCores(), m_net_settings.cpu_core) ==
++        PowerPC::AvailableCPUCores().end())
++    {
++      m_dialog->AppendChat(fmt::format(
++          "Host asked for CPU core {} which this build cannot run; using the Cached Interpreter.",
++          static_cast<int>(m_net_settings.cpu_core)));
++      m_net_settings.cpu_core = PowerPC::CPUCore::CachedInterpreter;
++    }
+     packet >> m_net_settings.enable_cheats;
+     packet >> m_net_settings.enable_hardcore;
+     packet >> m_net_settings.selected_language;
+@@ -1001,6 +1019,7 @@ void NetPlayClient::OnStartGame(sf::Packet& packet)
+     packet >> m_net_settings.divide_by_zero_exceptions;
+     packet >> m_net_settings.fprf;
+     packet >> m_net_settings.accurate_nans;
++    packet >> m_net_settings.accurate_fmadds;
+     packet >> m_net_settings.disable_icache;
+     packet >> m_net_settings.sync_on_skip_idle;
+     packet >> m_net_settings.sync_gpu;
+@@ -1585,6 +1604,17 @@ void NetPlayClient::OnSyncCodesDataAR(sf::Packet& packet)
+     }
+   }
+ 
++#ifdef HAS_LIBMGBA
++  // OrreLink: what this guest received, so the host's 'ar synced-send' and this
++  // 'ar synced-recv' can be compared crc-for-crc in the two gba_detect logs.
++  {
++    std::string blob;
++    for (const ActionReplay::AREntry& op : arcode.ops)
++      blob += fmt::format("{:08X} {:08X}\n", op.cmd_addr, op.value);
++    GBADetectLog::NoteBoot(fmt::format("ar synced-recv lines={} crc32={:08x}", arcode.ops.size(),
++                                       Common::ComputeCRC32(blob)));
++  }
++#endif
+   // Add arcode containing all codes to AR Code vector
+   synced_codes.push_back(std::move(arcode));
+ 
+diff --git a/Source/Core/Core/NetPlayProto.h b/Source/Core/Core/NetPlayProto.h
+index c17695c..fb38cec 100644
+--- a/Source/Core/Core/NetPlayProto.h
++++ b/Source/Core/Core/NetPlayProto.h
+@@ -43,6 +43,24 @@ using PadIndex = s8;
+ using PadMappingArray = std::array<PlayerId, 4>;
+ using GBAConfigArray = std::array<GBAConfig, 4>;
+ 
++// OrreLink: this build's CPU-architecture class, sent at connect so the host can
++// refuse to hand an x86_64 guest a JITARM64 core enum (or an arm64 guest JIT64):
++// PowerPC.cpp's InitializeCPUCore would otherwise fall back to the platform JIT in
++// silence, and two different recompilers are neither timing- nor FP-identical
++// (the v1.5.9 macOS-vs-Windows desync). _M_X86_64 / _M_ARM_64 come from the root
++// CMakeLists.txt (the Android NDK aarch64 build takes the same branch) and from
++// Source/VSProps/Base.Dolphin.props.
++constexpr const char* LocalCpuArch()
++{
++#if defined(_M_X86_64)
++  return "x86_64";
++#elif defined(_M_ARM_64)
++  return "arm64";
++#else
++  return "other";
++#endif
++}
++
+ struct NetSettings
+ {
+   bool cpu_thread = false;
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 0d362c5..b6adf40 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -28,6 +28,7 @@
+ #include "Common/CommonPaths.h"
+ #include "Common/ENet.h"
+ #include "Common/FileUtil.h"
++#include "Common/Hash.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/SFMLHelper.h"
+@@ -65,6 +66,7 @@
+ #include "Core/IOS/Uids.h"
+ #include "Core/NetPlayClient.h"  //for NetPlayUI
+ #include "Core/NetPlayCommon.h"
++#include "Core/PowerPC/PowerPC.h"
+ #include "Core/SyncIdentifier.h"
+ 
+ #include "DiscIO/Enums.h"
+@@ -548,6 +550,7 @@ ConnectionError NetPlayServer::OnConnect(ENetPeer* incoming_connection, sf::Pack
+ 
+   received_packet >> new_player.revision;
+   received_packet >> new_player.name;
++  received_packet >> new_player.arch;  // absent -> stays "" -> treated as "other"
+ 
+   if (StringUTF8CodePointCount(new_player.name) > MAX_NAME_LENGTH)
+     return ConnectionError::NameTooLong;
+@@ -1704,6 +1707,41 @@ bool NetPlayServer::SetupNetSettings()
+   // Copy all relevant settings
+   settings.cpu_thread = Config::Get(Config::MAIN_CPU_THREAD);
+   settings.cpu_core = Config::Get(Config::MAIN_CPU_CORE);
++  // OrreLink cross-architecture determinism. The enum above is only portable
++  // between machines of the same architecture: an x86_64 build cannot construct
++  // JITARM64 (JitInterface.cpp), PowerPC.cpp then silently substitutes JIT64,
++  // and two different recompilers split blocks differently -- so the emulated
++  // tick a time-base read sees differs by a few dozen cycles, XD's link key and
++  // battle RNG are time-base derived, and the two games drift apart from the
++  // first GBA link (the v1.5.9 macOS-vs-Windows desync, proven from both logs).
++  // Same-arch rooms keep the host's core untouched: macOS arm64 and Android
++  // arm64 both run JITARM64, and the AYN Thor cannot afford anything slower.
++  {
++    const bool mixed = RoomMixesCpuArchitectures();
++    const bool override_on = Config::Get(Config::NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH);
++    const std::string archs = DescribeRoomArchitectures();
++    std::string line;
++    if (mixed && override_on && settings.cpu_core != PowerPC::CPUCore::Interpreter)
++    {
++      settings.cpu_core = PowerPC::CPUCore::CachedInterpreter;
++      line = fmt::format("Mixed CPU architectures ({}): all players use the Cached Interpreter "
++                         "this battle so both sides compute identical results (slower than JIT).",
++                         archs);
++    }
++    else if (mixed && !override_on)
++    {
++      line = fmt::format("Mixed CPU architectures ({}) with the common-core override OFF: the "
++                         "two recompilers are not identical, a desync is likely.",
++                         archs);
++    }
++    if (!line.empty())
++      SendChatMessage(line);  // pid 0 notice; the host's own loopback client shows it too
++#ifdef HAS_LIBMGBA
++    GBADetectLog::NoteBoot(
++        fmt::format("netplay corepolicy archs=\"{}\" mixed={} override={} cpu_core={}", archs,
++                    mixed ? 1 : 0, override_on ? 1 : 0, static_cast<int>(settings.cpu_core)));
++#endif
++  }
+   settings.enable_cheats = Config::AreCheatsEnabled();
+   settings.enable_hardcore = AchievementManager::GetInstance().IsHardcoreModeActive();
+   settings.selected_language = Config::Get(Config::MAIN_GC_LANGUAGE);
+@@ -1762,7 +1800,11 @@ bool NetPlayServer::SetupNetSettings()
+   settings.divide_by_zero_exceptions = Config::Get(Config::MAIN_DIVIDE_BY_ZERO_EXCEPTIONS);
+   settings.fprf = Config::Get(Config::MAIN_FPRF);
+   settings.accurate_nans = Config::Get(Config::MAIN_ACCURATE_NANS);
+-  settings.accurate_fmadds = Config::Get(Config::MAIN_ACCURATE_FMADDS);
++  // Forced, not synced: true is Dolphin's default and makes both JITs and the
++  // interpreter agree on single-precision fused ops. It was silently false on
++  // every netplay client until v1.5.10 because the field was never serialized
++  // (see StartGame / OnStartGame).
++  settings.accurate_fmadds = true;
+   settings.disable_icache = Config::Get(Config::MAIN_DISABLE_ICACHE);
+   settings.sync_on_skip_idle = Config::Get(Config::MAIN_SYNC_ON_SKIP_IDLE);
+   settings.sync_gpu = Config::Get(Config::MAIN_SYNC_GPU);
+@@ -1824,6 +1866,36 @@ bool NetPlayServer::DoAllPlayersHaveHardwareFMA() const
+   return std::ranges::all_of(m_players, [](const auto& p) { return p.second.has_hardware_fma; });
+ }
+ 
++// The room's distinct CPU-architecture classes in join order. The host is pid 1
++// and is included: it connects through OnConnect like everyone else.
++std::string NetPlayServer::DescribeRoomArchitectures()
++{
++  std::lock_guard lkp(m_crit.players);
++  std::vector<std::string> seen;
++  for (const auto& p : std::views::values(m_players))
++  {
++    const std::string a = p.arch.empty() ? "other" : p.arch;
++    if (std::ranges::find(seen, a) == seen.end())
++      seen.push_back(a);
++  }
++  return fmt::format("{}", fmt::join(seen, " + "));
++}
++
++bool NetPlayServer::RoomMixesCpuArchitectures()
++{
++  std::lock_guard lkp(m_crit.players);
++  std::optional<std::string> first;
++  for (const auto& p : std::views::values(m_players))
++  {
++    const std::string a = p.arch.empty() ? "other" : p.arch;
++    if (!first)
++      first = a;
++    else if (*first != a)
++      return true;
++  }
++  return false;
++}
++
+ struct SaveSyncInfo
+ {
+   u8 save_count = 0;
+@@ -1972,6 +2044,7 @@ bool NetPlayServer::StartGame()
+   spac << m_settings.divide_by_zero_exceptions;
+   spac << m_settings.fprf;
+   spac << m_settings.accurate_nans;
++  spac << m_settings.accurate_fmadds;  // v1.5.10: was never serialized (always false on clients)
+   spac << m_settings.disable_icache;
+   spac << m_settings.sync_on_skip_idle;
+   spac << m_settings.sync_gpu;
+@@ -2480,6 +2553,22 @@ bool NetPlayServer::SyncCodes()
+ #endif  // USE_RETRO_ACHIEVEMENTS
+     // Create an AR Code Vector with just the active codes
+     std::vector<ActionReplay::ARCode> active_codes = ActionReplay::ApplyAndReturnCodes(codes);
++#ifdef HAS_LIBMGBA
++    {
++      std::string blob;
++      size_t lines = 0;
++      for (const ActionReplay::ARCode& active_code : active_codes)
++      {
++        for (const ActionReplay::AREntry& op : active_code.ops)
++        {
++          blob += fmt::format("{:08X} {:08X}\n", op.cmd_addr, op.value);
++          ++lines;
++        }
++      }
++      GBADetectLog::NoteBoot(
++          fmt::format("ar synced-send lines={} crc32={:08x}", lines, Common::ComputeCRC32(blob)));
++    }
++#endif
+ 
+     // Determine Codelist Size
+     u16 codelines = 0;
+diff --git a/Source/Core/Core/NetPlayServer.h b/Source/Core/Core/NetPlayServer.h
+index f4b5fb9..d7a331d 100644
+--- a/Source/Core/Core/NetPlayServer.h
++++ b/Source/Core/Core/NetPlayServer.h
+@@ -50,6 +50,10 @@ public:
+ 
+   bool DoAllPlayersHaveIPLDump() const;
+   bool DoAllPlayersHaveHardwareFMA() const;
++  // OrreLink cross-architecture policy (see SetupNetSettings). Non-const: they
++  // take m_crit.players, which the const helper above does not.
++  bool RoomMixesCpuArchitectures();
++  std::string DescribeRoomArchitectures();
+   bool StartGame();
+   bool RequestStartGame();
+   void AbortGameStart();
+@@ -96,6 +100,7 @@ private:
+     PlayerId pid{};
+     std::string name;
+     std::string revision;
++    std::string arch;  // "x86_64" | "arm64" | "other" (empty if a peer ever omits it)
+     SyncIdentifierComparison game_status = SyncIdentifierComparison::Unknown;
+     bool has_ipl_dump = false;
+     bool has_hardware_fma = false;
+diff --git a/Source/Core/Core/PatchEngine.cpp b/Source/Core/Core/PatchEngine.cpp
+index e162b6e..adf0483 100644
+--- a/Source/Core/Core/PatchEngine.cpp
++++ b/Source/Core/Core/PatchEngine.cpp
+@@ -19,6 +19,7 @@
+ #include <fmt/format.h>
+ 
+ #include "Common/Assert.h"
++#include "Common/Hash.h"
+ #include "Common/Debug/MemoryPatches.h"
+ #include "Common/IniFile.h"
+ #include "Common/StringUtil.h"
+@@ -31,7 +32,11 @@
+ #include "Core/Core.h"
+ #include "Core/Debugger/PPCDebugInterface.h"
+ #include "Core/GeckoCode.h"
++#include "Core/Config/MainSettings.h"
+ #include "Core/GeckoCodeConfig.h"
++#ifdef HAS_LIBMGBA
++#include "Core/HW/GBADetectLog.h"
++#endif
+ #include "Core/PowerPC/MMU.h"
+ #include "Core/PowerPC/PowerPC.h"
+ #include "Core/System.h"
+@@ -202,6 +207,37 @@ void LoadPatches()
+                                     sconfig.GetRevision());
+   }
+ 
++#ifdef HAS_LIBMGBA
++  // OrreLink: the AR set that will actually run this session -- what a guest
++  // received from the host (SESSION_CODE_SYNC_OVERRIDE) or what this machine
++  // loaded from its own INIs. Address/value only, no code names, so the host's
++  // "$OrreLink Battle Style" and the guest's "Synced Codes" diff clean:
++  //   diff <(grep '^t=boot ar op' host.log) <(grep '^t=boot ar op' guest.log)
++  // must be empty and the two 'ar active' crc32= values equal. cheats=0 means
++  // the listed codes never run (ActionReplay::RunAllActive is gated on it).
++  if (GBADetectLog::IsSessionOpen())  // same phantom-line guard as the 'cpu' boot line
++  {
++    const std::vector<ActionReplay::ARCode> active = ActionReplay::GetActiveCodesSnapshot();
++    std::string blob;
++    size_t lines = 0;
++    for (const ActionReplay::ARCode& code : active)
++    {
++      for (const ActionReplay::AREntry& op : code.ops)
++      {
++        blob += fmt::format("{:08X} {:08X}\n", op.cmd_addr, op.value);
++        ++lines;
++      }
++    }
++    GBADetectLog::NoteBoot(fmt::format(
++        "ar active source={} cheats={} codes={} lines={} crc32={:08x}",
++        Config::Get(Config::SESSION_CODE_SYNC_OVERRIDE) ? "synced" : "local",
++        Config::AreCheatsEnabled() ? 1 : 0, active.size(), lines, Common::ComputeCRC32(blob)));
++    for (const ActionReplay::ARCode& code : active)
++      for (const ActionReplay::AREntry& op : code.ops)
++        GBADetectLog::NoteBoot(fmt::format("ar op {:08X} {:08X}", op.cmd_addr, op.value));
++  }
++#endif
++
+   const size_t enabled_patch_count =
+       std::ranges::count_if(s_on_frame, [](const Patch& patch) { return patch.enabled; });
+   if (enabled_patch_count > 0)
+diff --git a/Source/Core/Core/PowerPC/PowerPC.cpp b/Source/Core/Core/PowerPC/PowerPC.cpp
+index 564d74d..864c0bb 100644
+--- a/Source/Core/Core/PowerPC/PowerPC.cpp
++++ b/Source/Core/Core/PowerPC/PowerPC.cpp
+@@ -9,6 +9,7 @@
+ #include <cstring>
+ 
+ #include "Common/Assert.h"
++#include "Common/CPUDetect.h"
+ #include "Common/ChunkFile.h"
+ #include "Common/CommonTypes.h"
+ #include "Common/FPURoundMode.h"
+@@ -205,6 +206,7 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
+   auto& interpreter = m_system.GetInterpreter();
+   interpreter.Init();
+ 
++  [[maybe_unused]] CPUCore effective = cpu_core;  // what actually got instantiated
+   switch (cpu_core)
+   {
+   case CPUCore::Interpreter:
+@@ -217,12 +219,33 @@ void PowerPCManager::InitializeCPUCore(CPUCore cpu_core)
+     {
+       WARN_LOG_FMT(POWERPC, "CPU core {} not available. Falling back to default.",
+                    static_cast<int>(cpu_core));
+-      m_cpu_core_base = m_system.GetJitInterface().InitJitCore(DefaultCPUCore());
++      effective = DefaultCPUCore();
++      m_cpu_core_base = m_system.GetJitInterface().InitJitCore(effective);
+     }
+     break;
+   }
+ 
+   m_mode = m_cpu_core_base == &interpreter ? CoreMode::Interpreter : CoreMode::JIT;
++
++  // OrreLink cross-architecture determinism: interpreter cores must produce the
++  // same bits on x86-64 (host FTZ: outputs only) and ARM64. Hosts without
++  // FEAT_AFP (Apple M1-M3, Snapdragon 8 Gen 2) can only flush inputs+outputs in
++  // hardware, so for those cores switch to the interpreter's software output
++  // flush (ForceSingle/ForceDouble consult cpu_info.bFlushToZero) and keep the
++  // host FPU from flushing (see SetSIMDMode). The JITs never read
++  // bFlushToZero, so a later JIT session is unaffected; the detected value is
++  // restored anyway.
++  {
++    static const bool detected_flush_to_zero = cpu_info.bFlushToZero;
++#ifdef _M_ARM_64
++    const bool interpreter_core =
++        m_cpu_core_base == &interpreter || effective == CPUCore::CachedInterpreter;
++    m_ppc_state.software_fpu_flush = interpreter_core && !cpu_info.bAFP;
++#else
++    m_ppc_state.software_fpu_flush = false;
++#endif
++    cpu_info.bFlushToZero = m_ppc_state.software_fpu_flush ? false : detected_flush_to_zero;
++  }
+ }
+ 
+ std::span<const CPUCore> AvailableCPUCores()
+@@ -701,7 +724,7 @@ void RoundingModeUpdated(PowerPCState& ppc_state)
+   // The rounding mode is separate for each thread, so this must run on the CPU thread
+   ASSERT(Core::IsCPUThread());
+ 
+-  Common::FPU::SetSIMDMode(ppc_state.fpscr.RN, ppc_state.fpscr.NI);
++  Common::FPU::SetSIMDMode(ppc_state.fpscr.RN, ppc_state.fpscr.NI, ppc_state.software_fpu_flush);
+ }
+ 
+ void MMCRUpdated(PowerPCState& ppc_state)
+diff --git a/Source/Core/Core/PowerPC/PowerPC.h b/Source/Core/Core/PowerPC/PowerPC.h
+index 8d84ed1..93a00e2 100644
+--- a/Source/Core/Core/PowerPC/PowerPC.h
++++ b/Source/Core/Core/PowerPC/PowerPC.h
+@@ -192,6 +192,13 @@ struct PowerPCState
+   InstructionCache iCache;
+   Cache dCache;
+ 
++  // OrreLink: true when the running core flushes denormal outputs in software
++  // (interpreter cores on an ARM64 host without FEAT_AFP); RoundingModeUpdated
++  // then keeps the host FPU from flushing inputs. Not saved in state. Kept LAST:
++  // never JIT-addressed, and anything placed before `ps` pushes
++  // above_fits_in_first_0x100 past 0x100 on x86-64 (static_assert below).
++  bool software_fpu_flush = false;
++
+   void UpdateCR1()
+   {
+     cr.SetField(1, (fpscr.FX << 3) | (fpscr.FEX << 2) | (fpscr.VX << 1) | fpscr.OX);
+diff --git a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+index 794382a..6a4691f 100644
+--- a/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/TeamEditorDialog.cpp
+@@ -10,6 +10,7 @@
+ #include <QComboBox>
+ #include <QDesktopServices>
+ #include <QGridLayout>
++#include <QGuiApplication>
+ #include <QGroupBox>
+ #include <QLabel>
+ #include <QLineEdit>
+@@ -21,6 +22,7 @@
+ #include <QShowEvent>
+ #include <QUrl>
+ #include <QHBoxLayout>
++#include <QScreen>
+ #include <QVBoxLayout>
+ 
+ #include "Common/Config/Config.h"
+@@ -158,8 +160,12 @@ void TeamEditorDialog::CreateMainLayout()
+   layout->addWidget(m_log_label);
+ 
+   setLayout(layout);
+-  // Never narrower than the wrapped notes' minimum width (MakeNoteLabel).
+-  resize(std::max(520, minimumSizeHint().width()), 640);
++  // Never narrower than the wrapped notes' minimum width (MakeNoteLabel); never
++  // taller than the screen's working area minus window chrome (720-px displays).
++  const QRect avail =
++      (screen() ? screen() : QGuiApplication::primaryScreen())->availableGeometry();
++  resize(std::max(520, minimumSizeHint().width()),
++         std::max(minimumSizeHint().height(), std::min(640, avail.height() - 48)));
+ }
+ 
+ void TeamEditorDialog::ConnectWidgets()
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index bb25b5b..55d2cc3 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -4,6 +4,7 @@
+ #include "DolphinQt/XDNetplay/XDLauncherDialog.h"
+ 
+ #include <array>
++#include <algorithm>
+ #include <initializer_list>
+ #include <map>
+ #include <optional>
+@@ -19,14 +20,19 @@
+ #include <QComboBox>
+ #include <QFileDialog>
+ #include <QGridLayout>
++#include <QGuiApplication>
+ #include <QGroupBox>
+ #include <QLabel>
+ #include <QLineEdit>
+ #include <QPointer>
+ #include <QPushButton>
++#include <QScreen>
++#include <QScrollArea>
++#include <QScrollBar>
+ #include <QShowEvent>
+ #include <QSignalBlocker>
+ #include <QVBoxLayout>
++#include <QWidget>
+ 
+ #include "Common/Config/Config.h"
+ #include "Common/FileUtil.h"
+@@ -70,6 +76,50 @@ QLabel* MakeNoteLabel(const QString& text)
+   return label;
+ }
+ 
++// Frameless, vertical-only scroll area whose size hints come from its content:
++// preferred = content + one scrollbar width (so the bar never steals width from
++// the wrapped notes), minimum WIDTH = content minimum + scrollbar (the horizontal
++// bar is off, so a narrower viewport would clip), minimum HEIGHT stays tiny so
++// the window can always be shrunk to fit a short screen (the field report: a
++// 768-px laptop could not show the bottom of the launcher, and Windows will not
++// let a title bar be dragged above the screen edge).
++class LauncherScrollArea final : public QScrollArea
++{
++public:
++  LauncherScrollArea()
++  {
++    setWidgetResizable(true);
++    setFrameStyle(QFrame::NoFrame);
++    setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
++    setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
++    setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
++    // Paint the dialog's Window colour, not QPalette::Base (white on Windows).
++    viewport()->setAutoFillBackground(false);
++  }
++
++  QSize sizeHint() const override
++  {
++    if (!widget())
++      return QScrollArea::sizeHint();
++    return widget()->sizeHint() + QSize(verticalScrollBar()->sizeHint().width(), 0) +
++           QSize(2 * frameWidth(), 2 * frameWidth());
++  }
++
++  QSize minimumSizeHint() const override
++  {
++    const QSize base = QScrollArea::minimumSizeHint();
++    if (!widget())
++      return base;
++    return QSize(widget()->minimumSizeHint().width() + verticalScrollBar()->sizeHint().width() +
++                     2 * frameWidth(),
++                 base.height());
++  }
++};
++
++// Windows 11 frame: ~31-39 px title bar + 8 px bottom border (logical px);
++// macOS/Linux are smaller. Pre-show, frameGeometry() is unreliable, so reserve.
++constexpr int WINDOW_CHROME_HEIGHT = 48;
++
+ constexpr size_t GBA_HEADER_TITLE_OFFSET = 0xA0;
+ constexpr size_t GBA_HEADER_FIXED_OFFSET = 0xB2;
+ constexpr u8 GBA_HEADER_FIXED_VALUE = 0x96;
+@@ -522,14 +572,58 @@ void XDLauncherDialog::CreateMainLayout()
+   style_box->setLayout(style_layout);
+   layout->addWidget(style_box);
+ 
++  // The group boxes live inside a scroll area so the window can be shorter than
++  // its content on small (768-px) laptop screens; the startup checkbox stays
++  // outside as a fixed footer so the bottom edge always reads as "end of window".
++  auto* content = new QWidget;
++  content->setAutoFillBackground(false);
++  content->setLayout(layout);
++
++  auto* scroll = new LauncherScrollArea;
++  scroll->setWidget(content);
++
+   // Same setting the hub's own checkbox writes. Reworded because the hub, not
+   // this launcher, is what actually opens at startup now -- a checkbox that
+   // names the wrong window is worse than no checkbox.
+   m_show_on_startup_check = new QCheckBox(tr("Show the Pokémon Hub at startup"));
+   m_show_on_startup_check->setChecked(ShowOnStartup());
+-  layout->addWidget(m_show_on_startup_check);
++  auto* footer = new QVBoxLayout;
++  const QMargins m = layout->contentsMargins();
++  footer->setContentsMargins(m.left(), 0, m.right(), m.bottom());
++  footer->addWidget(m_show_on_startup_check);
++
++  auto* outer = new QVBoxLayout;
++  outer->setContentsMargins(0, 0, 0, 0);
++  outer->setSpacing(0);
++  outer->addWidget(scroll, 1);
++  outer->addLayout(footer);
++  setLayout(outer);
++}
+ 
+-  setLayout(layout);
++// First-show sizing: preferred width, preferred height capped to the screen's
++// working area minus window chrome, recentred on the main window and clamped
++// on-screen. On a large screen this is exactly the layout's own size (no
++// scrollbar); on a short one the content scrolls. showEvent precedes the
++// system show, so there is no flicker, and resize() sets WA_Resized so later
++// opens keep the user's size.
++void XDLauncherDialog::FitToScreen()
++{
++  QScreen* scr = screen();
++  if (scr == nullptr)
++    scr = QGuiApplication::primaryScreen();
++  const QRect avail = scr->availableGeometry();
++
++  const QSize preferred = sizeHint();
++  const int max_height =
++      std::max(minimumSizeHint().height(), avail.height() - WINDOW_CHROME_HEIGHT);
++  resize(preferred.width(), std::min(preferred.height(), max_height));
++
++  QRect r(QPoint(), size());
++  r.moveCenter(parentWidget() ? parentWidget()->frameGeometry().center() : avail.center());
++  const int top_min = avail.top() + (WINDOW_CHROME_HEIGHT - 8);
++  r.moveLeft(std::clamp(r.left(), avail.left(), std::max(avail.left(), avail.right() - r.width())));
++  r.moveTop(std::clamp(r.top(), top_min, std::max(top_min, avail.bottom() - 8 - r.height())));
++  move(r.topLeft());
+ }
+ 
+ void XDLauncherDialog::ConnectWidgets()
+@@ -626,6 +720,11 @@ bool XDLauncherDialog::ShowOnStartup()
+ void XDLauncherDialog::showEvent(QShowEvent* event)
+ {
+   QDialog::showEvent(event);
++  if (!m_first_show_sized)
++  {
++    m_first_show_sized = true;
++    FitToScreen();
++  }
+   // Boundary heal for a killed session's leftovers (an opponent's team in a
+   // socket save, a disposable over an import): the launcher opening is the
+   // first thing a player does after a crash, and everything it leads to --
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 8bd792d..c4f05e0 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -75,6 +75,7 @@ private:
+   void RefreshChecklist();
+   void RefreshSaveSlots();
+   void AutoDiscoverFromGameFolder();
++  void FitToScreen();
+ 
+   std::shared_ptr<const UICommon::GameFile> FindXdGame() const;
+ 
+@@ -144,5 +145,6 @@ private:
+   // The worker thread is detached and only ever touches the GUI through
+   // QueueOnObject, so this flag lives on the GUI thread alone.
+   bool m_searching = false;
++  bool m_first_show_sized = false;
+   TeamEditorDialog* m_team_editor = nullptr;
+ };
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 2347309..3e00857 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.9";
++constexpr char VERSION[] = "1.5.10";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
