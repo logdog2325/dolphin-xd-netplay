@@ -34,7 +34,8 @@ alone; **OU** applies the community's OU cheat set instead. Rooms show their
 format in the lobby name (`[Orre]`, `[Hoenn-L]`, …).
 
 **Team Editor.** Import a Showdown export or a pokepast.es link, set your
-in-game name, save. One button raises every Pokémon to Lv. 100 in level-100
+in-game name, save. Imports assume maximum happiness unless the paste has a
+`Happiness:` line. One button raises every Pokémon to Lv. 100 in level-100
 formats (it never lowers one — a Lv. 70 team is legal, a Lv. 50 team leveled
 *down* from 100 is not, so that direction does not exist).
 
@@ -43,7 +44,8 @@ team, or send the party from your own Emerald save, choose your trainer model,
 and it is in the host's GBA save before the battle starts.
 
 **Battle Style.** The host picks the battle music — including **no music** —
-and the battle location (unused Phenac and Orre colosseum stages, story venues).
+and the battle location (unused Phenac and Orre colosseum stages, story venues);
+XD's own stage row is then pinned blank so it cannot contradict the pick.
 Each player picks their own trainer model; the joiner's ride along with the
 team submission.
 
@@ -246,8 +248,9 @@ In those rooms OrreLink serves XD's clock itself: a value built from the
 game's own frame counter plus a per-session number the host picks and syncs,
 identical on every machine, while each machine keeps its own recompiler at
 full speed. The host's chat says so at Start ("recompilers stay on; OrreLink
-serves XD's clock this battle"), and the main menu is skipped. Rooms that do
-not mix (Mac ↔ Thor, Windows ↔ Linux) and solo play are untouched.
+serves XD's clock this battle"); the main menu is skipped and dual core is
+off for that battle. Rooms that do not mix (Mac ↔ Thor, Windows ↔ Linux) and
+solo play are untouched.
 
 `ForceCommonCoreOnMixedArch = True` under `[NetPlay]` in `Dolphin.ini` is an
 opt-in "safest" mode that instead runs everyone on the Cached Interpreter —
@@ -269,8 +272,9 @@ and the guest's:
 - `xd ...` during the link and battle — frame counter, logical time base, RNG
   seed and battle-state checksums, keyed by link-command sequence number so
   the two logs line up:
-  `diff <(grep ' xd ' host.log | sed -E 's/^t=[0-9]+ //') <(grep ' xd ' guest.log | sed -E 's/^t=[0-9]+ //')`
-  is empty for a clean match; the first differing line is the divergence.
+  `diff <(grep ' xd ' host.log | tr -d '\r' | sed -E 's/^t=[0-9]+ //') <(grep ' xd ' guest.log | tr -d '\r' | sed -E 's/^t=[0-9]+ //')`
+  is empty for a clean match (Windows logs are CRLF, hence the `tr`); the
+  first differing line is the divergence.
 
 ## When the network won't let you connect
 
