@@ -1,0 +1,376 @@
+From b7030ce67e4e55adc2543b2652b593dbd0713f99 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 6 Sep 2026 16:32:21 -0700
+Subject: [PATCH] XD Netplay: fix the Android abort at team preview,
+ keyboard-bound GBA defaults on every slot, desktop Share Log button (v1.5.13)
+
+- ControlGroupContainer::SetInputOverrideFunction/ClearInputOverrideFunction
+  ran unlocked while GetInput() read the std::function under
+  s_get_state_mutex on the CPU thread; libc++'s move-assign nulls the
+  target before cloning, so a poll in that window called an empty function
+  and aborted (bad_function_call at team preview on the Thor, symbolized
+  from the shipped library). Writers now take the same lock. Android's
+  GbaInputFocusManager registered the GameCube override on every touch
+  event; it now registers once per port and only flips the atomic enable.
+- Launcher 'Use defaults' binds the GBA mapping to the platform keyboard
+  device on all four GBA slots (Dolphin's default device is the first by
+  sort priority, i.e. a gamepad when one is attached, where the key names
+  do not exist); the checklist verifies slots 0 and 1 and that the device
+  exists. The joiner's GBA is slot 0 ('GBA 1'), the host's is slot 1.
+- Share Log... in the launcher footer: newest gba_detect log, save-as
+  (Desktop by default), then opens the folder.
+---
+ .../dualscreen/GbaInputFocusManager.kt        | 10 ++-
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 75 +++++++++++++++++--
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  2 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   | 66 +++++++++++++---
+ .../ControllerEmu/ControllerEmu.cpp           |  7 ++
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 6 files changed, 145 insertions(+), 17 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
+index 4f5a874..a94ee25 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
+@@ -6,6 +6,7 @@ import org.dolphinemu.dolphinemu.features.input.model.InputOverrider
+ 
+ object GbaInputFocusManager {
+     private var focusedDevice = GbaHostBridge.NO_DEVICE
++    private val registeredGameCubePorts = mutableSetOf<Int>()
+     private var blockedGameCubePorts = IntArray(0)
+ 
+     fun onGbaInputRegistered(deviceNumber: Int) {
+@@ -17,6 +18,7 @@ object GbaInputFocusManager {
+     }
+ 
+     fun requestFocus(deviceNumber: Int) {
++        if (focusedDevice == deviceNumber) return  // already focused: nothing to redo per event
+         if (deviceNumber !in GBA_DEVICE_RANGE) {
+             return
+         }
+@@ -51,7 +53,13 @@ object GbaInputFocusManager {
+ 
+     private fun setGameCubeInputEnabled(controllerIndices: IntArray, enabled: Boolean) {
+         for (controllerIndex in controllerIndices) {
+-            InputOverrider.registerGameCube(controllerIndex)
++            // Register the override ONCE per port. registerGameCube re-assigns the core's
++            // std::function; the enable flag below is an atomic store and is all that has to
++            // run per event. (Re-registering on every ACTION_MOVE raced the CPU thread's pad
++            // poll and aborted the app at team preview.)
++            if (registeredGameCubePorts.add(controllerIndex)) {
++                InputOverrider.registerGameCube(controllerIndex)
++            }
+             InputOverrider.setGameCubeInputEnabled(controllerIndex, enabled)
+         }
+     }
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 55d2cc3..a9606ba 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -17,8 +17,11 @@
+ 
+ #include <QAbstractItemModel>
+ #include <QCheckBox>
++#include <QDesktopServices>
++#include <QDir>
+ #include <QComboBox>
+ #include <QFileDialog>
++#include <QFileInfo>
+ #include <QGridLayout>
+ #include <QGuiApplication>
+ #include <QGroupBox>
+@@ -29,9 +32,11 @@
+ #include <QScreen>
+ #include <QScrollArea>
+ #include <QScrollBar>
++#include <QStandardPaths>
+ #include <QShowEvent>
+ #include <QSignalBlocker>
+ #include <QVBoxLayout>
++#include <QUrl>
+ #include <QWidget>
+ 
+ #include "Common/Config/Config.h"
+@@ -587,10 +592,23 @@ void XDLauncherDialog::CreateMainLayout()
+   // names the wrong window is worse than no checkbox.
+   m_show_on_startup_check = new QCheckBox(tr("Show the Pokémon Hub at startup"));
+   m_show_on_startup_check->setChecked(ShowOnStartup());
++  // Share Log: the desktop counterpart of Android's Share button. Every session
++  // writes GBA/gba_detect_<date>.log under the user folder -- on Windows that is
++  // %APPDATA%\Dolphin Emulator, a hidden folder people cannot find -- so this
++  // saves the newest one where the player picks (Desktop by default) and opens
++  // that folder, ready to drop into Discord.
++  m_share_log_button = new NonDefaultQPushButton(tr("Share Log..."));
++  m_share_log_button->setToolTip(
++      tr("Save the newest session log (gba_detect_*.log) to a place of your choice and open "
++         "that folder, so you can send it. Send the newest one after a problem."));
++  auto* footer_row = new QHBoxLayout;
++  footer_row->addWidget(m_show_on_startup_check);
++  footer_row->addStretch(1);
++  footer_row->addWidget(m_share_log_button);
+   auto* footer = new QVBoxLayout;
+   const QMargins m = layout->contentsMargins();
+   footer->setContentsMargins(m.left(), 0, m.right(), m.bottom());
+-  footer->addWidget(m_show_on_startup_check);
++  footer->addLayout(footer_row);
+ 
+   auto* outer = new QVBoxLayout;
+   outer->setContentsMargins(0, 0, 0, 0);
+@@ -626,6 +644,49 @@ void XDLauncherDialog::FitToScreen()
+   move(r.topLeft());
+ }
+ 
++void XDLauncherDialog::OnShareLog()
++{
++  const QString dir = QString::fromStdString(File::GetUserPath(D_GBAUSER_IDX));
++  const QDir logs(dir);
++  // QDir::Time lists the most recently modified first.
++  const QStringList files =
++      logs.entryList({QStringLiteral("gba_detect_*.log")}, QDir::Files, QDir::Time);
++  if (files.isEmpty())
++  {
++    ModalMessageBox::information(
++        this, tr("Share Log"),
++        tr("No session log yet. One is written every time a game with GBAs runs, under:\n%1")
++            .arg(QDir::toNativeSeparators(dir)));
++    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
++    return;
++  }
++  const QString newest = logs.filePath(files.first());
++  const QString desktop = QStandardPaths::writableLocation(QStandardPaths::DesktopLocation);
++  const QString suggested = QDir(desktop).filePath(files.first());
++  const QString target = QFileDialog::getSaveFileName(this, tr("Save the newest session log as..."),
++                                                      suggested, tr("Log files (*.log)"));
++  if (target.isEmpty())
++    return;
++  if (QFileInfo(target).absoluteFilePath() == QFileInfo(newest).absoluteFilePath())
++  {
++    // They picked the log itself: nothing to copy, just show it.
++    QDesktopServices::openUrl(QUrl::fromLocalFile(logs.absolutePath()));
++    return;
++  }
++  if (QFile::exists(target) && !QFile::remove(target))
++  {
++    ModalMessageBox::critical(this, tr("Share Log"), tr("Could not replace %1").arg(target));
++    return;
++  }
++  if (!QFile::copy(newest, target))
++  {
++    ModalMessageBox::critical(this, tr("Share Log"),
++                              tr("Could not copy the log to %1").arg(target));
++    return;
++  }
++  QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(target).absolutePath()));
++}
++
+ void XDLauncherDialog::ConnectWidgets()
+ {
+   // The game scan is asynchronous: without this the XD row stays red until the
+@@ -705,6 +766,7 @@ void XDLauncherDialog::ConnectWidgets()
+   connect_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
+   connect_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
+ 
++  connect(m_share_log_button, &QPushButton::clicked, this, &XDLauncherDialog::OnShareLog);
+   connect(m_show_on_startup_check, &QCheckBox::toggled, this, [](bool checked) {
+     Settings::GetQSettings().setValue(QStringLiteral("xdnetplay/showlauncheronstartup"), checked);
+   });
+@@ -788,7 +850,8 @@ void XDLauncherDialog::RefreshChecklist()
+   const bool input_mapped = XDNetplay::GbaInputMapped();
+   SetRowState(m_gba_input_row.status, input_mapped);
+   m_gba_input_row.description->setText(
+-      input_mapped ? tr("GBA controls mapped (your GBA is \"GBA 1\" in Controllers)") :
++      input_mapped ?
++          tr("GBA controls mapped (you are \"GBA 1\" when joining, \"GBA 2\" when hosting)") :
+                      tr("GBA controls not mapped — your GBA will not respond to input"));
+   RefreshSaveSlots();
+ }
+@@ -974,15 +1037,17 @@ void XDLauncherDialog::OnFixGbaInput()
+   {
+     ModalMessageBox::warning(
+         this, tr("OrreLink"),
+-        tr("Could not set default GBA controls. Map them under Controllers > GBA Ports > GBA 1."));
++        tr("Could not set default GBA controls. Map them under Controllers > GBA Ports: GBA 1 "
++           "(joining) and GBA 2 (hosting)."));
+     return;
+   }
+   ModalMessageBox::information(
+       this, tr("OrreLink"),
+-      tr("Default GBA controls applied to GBA 1:\n\n"
++      tr("Default GBA controls applied to every GBA slot (you are GBA 1 when joining, GBA 2 "
++         "when hosting):\n\n"
+          "A = X,  B = Z,  Start = Enter,  Select = Backspace\n"
+          "D-Pad = T / G / F / H,  L = Q,  R = W\n\n"
+-         "Change them any time under Controllers > GBA Ports > GBA 1."));
++         "Change them any time under Controllers > GBA Ports."));
+   RefreshChecklist();
+ }
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index c4f05e0..f43f7c2 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -76,6 +76,7 @@ private:
+   void RefreshSaveSlots();
+   void AutoDiscoverFromGameFolder();
+   void FitToScreen();
++  void OnShareLog();
+ 
+   std::shared_ptr<const UICommon::GameFile> FindXdGame() const;
+ 
+@@ -146,5 +147,6 @@ private:
+   // QueueOnObject, so this flag lives on the GUI thread alone.
+   bool m_searching = false;
+   bool m_first_show_sized = false;
++  QPushButton* m_share_log_button = nullptr;
+   TeamEditorDialog* m_team_editor = nullptr;
+ };
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index da4be1f..06fe14c 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "DolphinQt/XDNetplay/XDNetplayConfig.h"
+ 
++#include <optional>
+ #include <string>
+ #include <string_view>
+ #include <vector>
+@@ -17,6 +18,7 @@
+ #include "InputCommon/ControllerEmu/ControlGroup/ControlGroup.h"
+ #include "InputCommon/ControllerEmu/ControllerEmu.h"
+ #include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/ControllerInterface/CoreDevice.h"
+ #include "InputCommon/ControlReference/ControlReference.h"
+ #include "InputCommon/InputConfig.h"
+ 
+@@ -268,15 +270,39 @@ bool AutoImportOfficialBios(const std::string& directory)
+   return false;
+ }
+ 
+-bool GbaInputMapped()
++namespace
+ {
+-  if (!Pad::IsGBAInitialized())
+-    return false;
++// The keyboard device of this platform: DInput "Keyboard Mouse" on Windows, Quartz on
++// macOS, XInput2 on Linux (the same three InputConfig treats as keyboard sources).
++// EmulatedController::LoadDefaults binds to whatever device sorts FIRST, which is a
++// gamepad whenever one is plugged in -- and the GBA defaults are key names ("X", "Z",
++// "RETURN") that do not exist on a gamepad, so the GBA silently reads nothing. That was
++// the field report: a Windows joiner with a controller attached had no GBA input.
++std::optional<ciface::Core::DeviceQualifier> KeyboardDevice()
++{
++  for (const std::string& device : g_controller_interface.GetAllDeviceStrings())
++  {
++    ciface::Core::DeviceQualifier q;
++    q.FromString(device);
++    if (q.source == "Quartz" || q.source == "XInput2" ||
++        (q.source == "DInput" && q.name == "Keyboard Mouse"))
++    {
++      return q;
++    }
++  }
++  return std::nullopt;
++}
+ 
+-  const ControllerEmu::ControlGroup* buttons = Pad::GetGBAGroup(0, GBAPadGroup::Buttons);
++// Mapped = the slot's default device currently exists AND at least one button has an
++// expression. A mapping to an unplugged gamepad is not "mapped".
++bool GbaSlotMapped(int slot)
++{
++  const ControllerEmu::EmulatedController* controller = Pad::GetGBAConfig()->GetController(slot);
++  if (!controller || !g_controller_interface.FindDevice(controller->GetDefaultDevice()))
++    return false;
++  const ControllerEmu::ControlGroup* buttons = Pad::GetGBAGroup(slot, GBAPadGroup::Buttons);
+   if (!buttons)
+     return false;
+-
+   for (const auto& control : buttons->controls)
+   {
+     if (control->control_ref && !control->control_ref->GetExpression().empty())
+@@ -284,22 +310,42 @@ bool GbaInputMapped()
+   }
+   return false;
+ }
++}  // namespace
+ 
+-bool ApplyDefaultGbaInput()
++// Which local GBA slot a player's own GBA reads from is decided by NetPlay's pad map
++// (NetPlayClient InGameToLocal counts the SI channels assigned to you, in order): the
++// HOST owns channel 0 (GameCube controller) and channel 1 (GBA port 2), so the host's
++// GBA is local slot 1 = "GBA 2"; a JOINER owns only channel 2 (GBA port 3), so theirs
++// is local slot 0 = "GBA 1". Both must be mapped for the checklist to be honest.
++bool GbaInputMapped()
+ {
+   if (!Pad::IsGBAInitialized())
+     return false;
++  return GbaSlotMapped(0) && GbaSlotMapped(1);
++}
+ 
+-  InputConfig* const config = Pad::GetGBAConfig();
+-  ControllerEmu::EmulatedController* const controller = config->GetController(0);
+-  if (!controller)
++bool ApplyDefaultGbaInput()
++{
++  if (!Pad::IsGBAInitialized())
+     return false;
+ 
+-  controller->LoadDefaults(g_controller_interface);
++  InputConfig* const config = Pad::GetGBAConfig();
++  const std::optional<ciface::Core::DeviceQualifier> keyboard = KeyboardDevice();
++  for (int slot = 0; slot < 4; ++slot)
++  {
++    ControllerEmu::EmulatedController* const controller = config->GetController(slot);
++    if (!controller)
++      return false;
++    controller->LoadDefaults(g_controller_interface);
++    if (keyboard)
++      controller->SetDefaultDevice(*keyboard);
++    controller->UpdateReferences(g_controller_interface);
++  }
+   config->SaveConfig();
+   return GbaInputMapped();
+ }
+ 
++
+ bool SeedTeamSaves()
+ {
+ #ifdef HAS_LIBMGBA
+diff --git a/Source/Core/InputCommon/ControllerEmu/ControllerEmu.cpp b/Source/Core/InputCommon/ControllerEmu/ControllerEmu.cpp
+index ce0105b..509a673 100644
+--- a/Source/Core/InputCommon/ControllerEmu/ControllerEmu.cpp
++++ b/Source/Core/InputCommon/ControllerEmu/ControllerEmu.cpp
+@@ -158,11 +158,18 @@ void EmulatedController::LoadDefaults(const ControllerInterface& ciface)
+ 
+ void ControlGroupContainer::SetInputOverrideFunction(InputOverrideFunction override_func)
+ {
++  // Writers ran unlocked while GCPad::GetInput()/GBAPad::GetInput() read the function on the
++  // CPU thread under s_get_state_mutex; libc++'s move-assign nulls the target before cloning
++  // the new one, so a poll landing in that window called an empty std::function and aborted
++  // (Android, bad_function_call at team preview -- the touch overlay re-registered per touch
++  // event). Take the same lock the readers hold.
++  const auto lock = EmulatedController::GetStateLock();
+   m_input_override_function = std::move(override_func);
+ }
+ 
+ void ControlGroupContainer::ClearInputOverrideFunction()
+ {
++  const auto lock = EmulatedController::GetStateLock();
+   m_input_override_function = {};
+ }
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 98e6e56..456b52e 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.12";
++constexpr char VERSION[] = "1.5.13";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+

@@ -214,10 +214,13 @@ does stall.
   direct with UDP **2626** forwarded on the host is the way in — and when the
   network allows neither, see [When the network won't let you
   connect](#when-the-network-wont-let-you-connect).
-- **Your GBA is "GBA 1"** in the desktop Controllers window, even when you are
-  the joiner on socket 3. Default keys: `A`=X, `B`=Z, Start=Enter,
+- **Which GBA slot is yours** in the desktop Controllers window: **GBA 1 when
+  you join, GBA 2 when you host** (the host also owns the GameCube controller,
+  which takes the first slot). Default keys: `A`=X, `B`=Z, Start=Enter,
   Select=Backspace, D-pad=T/G/F/H, L/R=Q/W. The launcher's *GBA controls* row
-  applies these in one click.
+  binds these to your keyboard on every GBA slot in one click — press it if a
+  gamepad is plugged in, because Dolphin's own defaults bind to the first
+  device it finds, which is then the gamepad and the keys do nothing.
 - **macOS**: the app needs **Input Monitoring** permission to read the keyboard
   at all. It asks on first launch; if it was denied, enable *OrreLink* under
   System Settings → Privacy & Security → Input Monitoring and relaunch.
@@ -316,9 +319,10 @@ shows exactly where detection stopped. **Send the newest one.**
 | | |
 |---|---|
 | **Android** | Use the **Share Log** button in the app |
-| **Windows** | `%USERPROFILE%\Documents\Dolphin Emulator\GBA\` — paste that into the File Explorer address bar |
-| **macOS** | `~/Library/Application Support/Dolphin/GBA/` — in Finder press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> and paste it |
-| **Linux** | `~/.local/share/dolphin-emu/GBA/` |
+| **Windows / macOS / Linux** | Use the **Share Log…** button at the bottom of the launcher: it saves the newest log where you choose and opens that folder |
+| **Windows (by hand)** | `%APPDATA%\Dolphin Emulator\GBA\` — press Win+R and paste that (AppData is hidden, which is why browsing to it fails) |
+| **macOS (by hand)** | `~/Library/Application Support/Dolphin/GBA/` — in Finder press <kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>G</kbd> and paste it |
+| **Linux (by hand)** | `~/.local/share/dolphin-emu/GBA/` |
 
 Files are named `gba_detect_YYYYMMDD_HHMMSS.log`; the two previous sessions are
 kept alongside the current one. If a battle failed to start, the log from *that*
