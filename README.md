@@ -216,11 +216,14 @@ does stall.
   connect](#when-the-network-wont-let-you-connect).
 - **Which GBA slot is yours** in the desktop Controllers window: **GBA 1 when
   you join, GBA 2 when you host** (the host also owns the GameCube controller,
-  which takes the first slot). Default keys: `A`=X, `B`=Z, Start=Enter,
-  Select=Backspace, D-pad=T/G/F/H, L/R=Q/W. The launcher's *GBA controls* row
+  which takes the first slot). Default keys: D-pad=W/A/S/D, `A`=X, `B`=Z,
+  L=Q, R=E, Start=Enter, Select=Backspace. The launcher's *GBA controls* row
   binds these to your keyboard on every GBA slot in one click — press it if a
   gamepad is plugged in, because Dolphin's own defaults bind to the first
   device it finds, which is then the gamepad and the keys do nothing.
+  **Customize…** next to it opens the GBA mapping window directly (Dolphin's
+  own Controllers window hides it unless a port is set to GBA) and applies
+  your mapping to every slot.
 - **macOS**: the app needs **Input Monitoring** permission to read the keyboard
   at all. It asks on first launch; if it was denied, enable *OrreLink* under
   System Settings → Privacy & Security → Input Monitoring and relaunch.

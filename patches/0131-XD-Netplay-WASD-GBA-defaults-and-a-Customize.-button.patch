@@ -1,0 +1,159 @@
+From e3735198c89171aeac91910a5c97ca0c0d466ec4 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 6 Sep 2026 16:42:05 -0700
+Subject: [PATCH] XD Netplay: WASD GBA defaults and a Customize... button that
+ maps the GBA slot directly and mirrors it to every slot
+
+- GBAPad::LoadDefaults: D-pad W/A/S/D, R moves to E (W is Up); A=X, B=Z,
+  L=Q, Start/Select unchanged.
+- Launcher: 'Customize...' next to 'Use defaults' opens Dolphin's GBA
+  mapping window for slot 0 (the joiner's GBA) regardless of the port
+  type -- the Controllers window only exposes a GBA mapping for ports set
+  to GBA (Integrated), which the joiner's port 1 never is -- then copies
+  the result to slots 1-3 so it holds when hosting too.
+---
+ Source/Core/Core/HW/GBAPadEmu.cpp             | 11 ++--
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 50 +++++++++++++++++--
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  2 +
+ 3 files changed, 55 insertions(+), 8 deletions(-)
+
+diff --git a/Source/Core/Core/HW/GBAPadEmu.cpp b/Source/Core/Core/HW/GBAPadEmu.cpp
+index fd68bc9..f552bf7 100644
+--- a/Source/Core/Core/HW/GBAPadEmu.cpp
++++ b/Source/Core/Core/HW/GBAPadEmu.cpp
+@@ -95,8 +95,9 @@ void GBAPad::LoadDefaults(const ControllerInterface& ciface)
+   // Buttons
+   m_buttons->SetControlExpression(0, "`Z`");  // B
+   m_buttons->SetControlExpression(1, "`X`");  // A
++  // OrreLink layout: WASD moves, so R moves off W.
+   m_buttons->SetControlExpression(2, "`Q`");  // L
+-  m_buttons->SetControlExpression(3, "`W`");  // R
++  m_buttons->SetControlExpression(3, "`E`");  // R
+ #ifdef _WIN32
+   m_buttons->SetControlExpression(4, "`BACK`");    // Select
+   m_buttons->SetControlExpression(5, "`RETURN`");  // Start
+@@ -109,9 +110,9 @@ void GBAPad::LoadDefaults(const ControllerInterface& ciface)
+ #endif
+ 
+   // D-Pad
+-  m_dpad->SetControlExpression(0, "`T`");  // Up
+-  m_dpad->SetControlExpression(1, "`G`");  // Down
+-  m_dpad->SetControlExpression(2, "`F`");  // Left
+-  m_dpad->SetControlExpression(3, "`H`");  // Right
++  m_dpad->SetControlExpression(0, "`W`");  // Up
++  m_dpad->SetControlExpression(1, "`S`");  // Down
++  m_dpad->SetControlExpression(2, "`A`");  // Left
++  m_dpad->SetControlExpression(3, "`D`");  // Right
+ #endif
+ }
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index a9606ba..4ff168d 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -41,6 +41,7 @@
+ 
+ #include "Common/Config/Config.h"
+ #include "Common/FileUtil.h"
++#include "Common/IniFile.h"
+ #include "Common/IOFile.h"
+ #include "Common/StringUtil.h"
+ #include "Common/Version.h"
+@@ -49,6 +50,11 @@
+ #include "Core/Config/NetplaySettings.h"
+ #include "Core/HW/GBACore.h"
+ 
++#include "Core/HW/GBAPad.h"
++#include "InputCommon/ControllerEmu/ControllerEmu.h"
++#include "InputCommon/ControllerInterface/ControllerInterface.h"
++#include "InputCommon/InputConfig.h"
++#include "DolphinQt/Config/Mapping/MappingWindow.h"
+ #include "DolphinQt/QtUtils/ModalMessageBox.h"
+ #include "DolphinQt/QtUtils/NonDefaultQPushButton.h"
+ #include "DolphinQt/QtUtils/QueueOnObject.h"
+@@ -363,6 +369,15 @@ void XDLauncherDialog::CreateMainLayout()
+   add_row(&m_team_saves_row, tr("Team saves installed"), tr("Install"));
+   add_row(&m_vs_save_row, tr("XD VS-mode save (memory card)"), tr("Install"));
+   add_row(&m_gba_input_row, tr("GBA controls"), tr("Use defaults"));
++  // A real remap for the GBA slot you actually play on. Dolphin's own Controllers window
++  // only exposes a GBA mapping for ports set to "GBA (Integrated)", and the joiner's slot
++  // (GBA 1) sits on port 1, which the launcher keeps as a Standard Controller -- so from
++  // there the mapping was unreachable. This opens the GBA mapping window directly and
++  // then copies the result to every GBA slot, so it holds whether you join or host.
++  m_gba_customize_button = new NonDefaultQPushButton(tr("Customize..."));
++  m_gba_customize_button->setToolTip(tr("Remap the GBA buttons. Applies to every GBA slot, so it "
++                                        "works whether you join or host."));
++  checklist_layout->addWidget(m_gba_customize_button, row - 1, 3);  // beside 'Use defaults'
+   checklist_layout->setColumnStretch(1, 1);
+   checklist_box->setLayout(checklist_layout);
+   layout->addWidget(checklist_box);
+@@ -767,6 +782,8 @@ void XDLauncherDialog::ConnectWidgets()
+   connect_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
+ 
+   connect(m_share_log_button, &QPushButton::clicked, this, &XDLauncherDialog::OnShareLog);
++  connect(m_gba_customize_button, &QPushButton::clicked, this,
++          &XDLauncherDialog::OnCustomizeGbaInput);
+   connect(m_show_on_startup_check, &QCheckBox::toggled, this, [](bool checked) {
+     Settings::GetQSettings().setValue(QStringLiteral("xdnetplay/showlauncheronstartup"), checked);
+   });
+@@ -1045,9 +1062,36 @@ void XDLauncherDialog::OnFixGbaInput()
+       this, tr("OrreLink"),
+       tr("Default GBA controls applied to every GBA slot (you are GBA 1 when joining, GBA 2 "
+          "when hosting):\n\n"
+-         "A = X,  B = Z,  Start = Enter,  Select = Backspace\n"
+-         "D-Pad = T / G / F / H,  L = Q,  R = W\n\n"
+-         "Change them any time under Controllers > GBA Ports."));
++         "D-Pad = W / A / S / D,  A = X,  B = Z\n"
++         "L = Q,  R = E,  Start = Enter,  Select = Backspace\n\n"
++         "Change them with Customize... (they apply whether you join or host)."));
++  RefreshChecklist();
++}
++
++void XDLauncherDialog::OnCustomizeGbaInput()
++{
++  if (!Pad::IsGBAInitialized())
++    return;
++  // Slot 0 ("GBA 1") is what a joiner plays on; map it here, then mirror it.
++  MappingWindow window(this, MappingWindow::Type::MAPPING_GC_GBA, 0);
++  window.exec();
++
++  InputConfig* const config = Pad::GetGBAConfig();
++  ControllerEmu::EmulatedController* const source = config->GetController(0);
++  if (source)
++  {
++    Common::IniFile::Section section;
++    source->SaveConfig(&section);
++    for (int slot = 1; slot < 4; ++slot)
++    {
++      ControllerEmu::EmulatedController* const target = config->GetController(slot);
++      if (!target)
++        continue;
++      target->LoadConfig(&section);
++      target->UpdateReferences(g_controller_interface);
++    }
++    config->SaveConfig();
++  }
+   RefreshChecklist();
+ }
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index f43f7c2..1cf5c63 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -77,6 +77,7 @@ private:
+   void AutoDiscoverFromGameFolder();
+   void FitToScreen();
+   void OnShareLog();
++  void OnCustomizeGbaInput();
+ 
+   std::shared_ptr<const UICommon::GameFile> FindXdGame() const;
+ 
+@@ -148,5 +149,6 @@ private:
+   bool m_searching = false;
+   bool m_first_show_sized = false;
+   QPushButton* m_share_log_button = nullptr;
++  QPushButton* m_gba_customize_button = nullptr;
+   TeamEditorDialog* m_team_editor = nullptr;
+ };
+-- 
+2.39.5 (Apple Git-154)
+
