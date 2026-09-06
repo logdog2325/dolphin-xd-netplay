@@ -1,0 +1,53 @@
+From 514b29ce1b2433a9ece525f9b10488c20da0c53f Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 6 Sep 2026 16:33:33 -0700
+Subject: [PATCH] Android: keep GbaInputFocusManager's per-event override
+ registration
+
+The core lock in ControlGroupContainer::SetInputOverrideFunction is the
+fix for the team-preview abort; the register-once shortcut added with it
+could go stale when the input overlay unregisters a GameCube port behind
+it (on resume) and would then stop blocking that pad while a GBA has
+focus. Per-event re-registration is cheap under the lock and self-heals.
+---
+ .../features/dualscreen/GbaInputFocusManager.kt        | 10 +---------
+ 1 file changed, 1 insertion(+), 9 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
+index a94ee25..4f5a874 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/dualscreen/GbaInputFocusManager.kt
+@@ -6,7 +6,6 @@ import org.dolphinemu.dolphinemu.features.input.model.InputOverrider
+ 
+ object GbaInputFocusManager {
+     private var focusedDevice = GbaHostBridge.NO_DEVICE
+-    private val registeredGameCubePorts = mutableSetOf<Int>()
+     private var blockedGameCubePorts = IntArray(0)
+ 
+     fun onGbaInputRegistered(deviceNumber: Int) {
+@@ -18,7 +17,6 @@ object GbaInputFocusManager {
+     }
+ 
+     fun requestFocus(deviceNumber: Int) {
+-        if (focusedDevice == deviceNumber) return  // already focused: nothing to redo per event
+         if (deviceNumber !in GBA_DEVICE_RANGE) {
+             return
+         }
+@@ -53,13 +51,7 @@ object GbaInputFocusManager {
+ 
+     private fun setGameCubeInputEnabled(controllerIndices: IntArray, enabled: Boolean) {
+         for (controllerIndex in controllerIndices) {
+-            // Register the override ONCE per port. registerGameCube re-assigns the core's
+-            // std::function; the enable flag below is an atomic store and is all that has to
+-            // run per event. (Re-registering on every ACTION_MOVE raced the CPU thread's pad
+-            // poll and aborted the app at team preview.)
+-            if (registeredGameCubePorts.add(controllerIndex)) {
+-                InputOverrider.registerGameCube(controllerIndex)
+-            }
++            InputOverrider.registerGameCube(controllerIndex)
+             InputOverrider.setGameCubeInputEnabled(controllerIndex, enabled)
+         }
+     }
+-- 
+2.39.5 (Apple Git-154)
+
