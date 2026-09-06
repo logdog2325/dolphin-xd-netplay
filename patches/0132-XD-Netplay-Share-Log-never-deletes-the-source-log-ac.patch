@@ -1,0 +1,93 @@
+From bcde891dc29645e1bf14bb9c72d92d420fea448d Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sun, 6 Sep 2026 16:46:40 -0700
+Subject: [PATCH] XD Netplay: Share Log never deletes the source log; accurate
+ comment on GBA default binding
+
+- OnShareLog: compare canonical paths (case folding and symlinks on
+  Windows/macOS) so picking the live log itself is always detected, and
+  copy to a .tmp sibling before swapping it in, so a failed copy cannot
+  remove the target and the source is never touched.
+- XDNetplayConfig: the comment claimed LoadDefaults binds to a gamepad
+  when one is attached; keyboards sort first, so it does not. Say what
+  the earlier code actually got wrong (slot 0 only, no UpdateReferences,
+  stale device counted as mapped).
+---
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 21 +++++++++++++------
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   | 12 ++++++-----
+ 2 files changed, 22 insertions(+), 11 deletions(-)
+
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 4ff168d..bbad9a0 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -682,21 +682,30 @@ void XDLauncherDialog::OnShareLog()
+                                                       suggested, tr("Log files (*.log)"));
+   if (target.isEmpty())
+     return;
+-  if (QFileInfo(target).absoluteFilePath() == QFileInfo(newest).absoluteFilePath())
++  // canonicalFilePath resolves symlinks and case (empty for a file that does not exist
++  // yet, which then compares unequal as it should).
++  const QString canonical_target = QFileInfo(target).canonicalFilePath();
++  if (!canonical_target.isEmpty() && canonical_target == QFileInfo(newest).canonicalFilePath())
+   {
+     // They picked the log itself: nothing to copy, just show it.
+     QDesktopServices::openUrl(QUrl::fromLocalFile(logs.absolutePath()));
+     return;
+   }
+-  if (QFile::exists(target) && !QFile::remove(target))
++  // Copy to a sibling first, then swap it in, so a failed copy never removes anything
++  // and the source log is never touched.
++  const QString staging = target + QStringLiteral(".tmp");
++  QFile::remove(staging);
++  if (!QFile::copy(newest, staging))
+   {
+-    ModalMessageBox::critical(this, tr("Share Log"), tr("Could not replace %1").arg(target));
++    QFile::remove(staging);
++    ModalMessageBox::critical(this, tr("Share Log"),
++                              tr("Could not copy the log to %1").arg(target));
+     return;
+   }
+-  if (!QFile::copy(newest, target))
++  if ((QFile::exists(target) && !QFile::remove(target)) || !QFile::rename(staging, target))
+   {
+-    ModalMessageBox::critical(this, tr("Share Log"),
+-                              tr("Could not copy the log to %1").arg(target));
++    QFile::remove(staging);
++    ModalMessageBox::critical(this, tr("Share Log"), tr("Could not replace %1").arg(target));
+     return;
+   }
+   QDesktopServices::openUrl(QUrl::fromLocalFile(QFileInfo(target).absolutePath()));
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 06fe14c..b67bf21 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -274,10 +274,13 @@ namespace
+ {
+ // The keyboard device of this platform: DInput "Keyboard Mouse" on Windows, Quartz on
+ // macOS, XInput2 on Linux (the same three InputConfig treats as keyboard sources).
+-// EmulatedController::LoadDefaults binds to whatever device sorts FIRST, which is a
+-// gamepad whenever one is plugged in -- and the GBA defaults are key names ("X", "Z",
+-// "RETURN") that do not exist on a gamepad, so the GBA silently reads nothing. That was
+-// the field report: a Windows joiner with a controller attached had no GBA input.
++// Keyboards sort first in ControllerInterface (DEFAULT_DEVICE_SORT_PRIORITY), so
++// LoadDefaults normally lands on one already; picking it explicitly guards the cases
++// where it does not (a backend that failed to enumerate the keyboard at startup), since
++// the GBA defaults are key names ("X", "Z", "RETURN") that no gamepad has. The actual
++// field failure (a Windows joiner with no GBA input) came from the older version of this
++// file: it only defaulted slot 0, never called UpdateReferences, and treated a mapping
++// to a device that no longer exists as "mapped".
+ std::optional<ciface::Core::DeviceQualifier> KeyboardDevice()
+ {
+   for (const std::string& device : g_controller_interface.GetAllDeviceStrings())
+@@ -345,7 +348,6 @@ bool ApplyDefaultGbaInput()
+   return GbaInputMapped();
+ }
+ 
+-
+ bool SeedTeamSaves()
+ {
+ #ifdef HAS_LIBMGBA
+-- 
+2.39.5 (Apple Git-154)
+
