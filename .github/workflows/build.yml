@@ -163,6 +163,33 @@ jobs:
           wrong="$(awk -F/ '/^lib\//{print $2}' <<< "$entries" | sort -u | grep -vx arm64-v8a || true)"
           if [ -n "$wrong" ]; then echo "unexpected ABI(s): $wrong" >&2; exit 1; fi
           echo "APK contents OK"
+      - name: Collect native symbols
+        # AGP strips every packaged .so (no keepDebugSymbols), so the APK's libmain.so has no
+        # .symtab and a crash dump cannot be read. Keep the pre-strip copy (same BuildId) as its
+        # own artifact: unzip it, then llvm-symbolizer --obj=libmain.so -f -C -i -p <pcs>.
+        run: |
+          set -euo pipefail
+          readelf="$(find "$ANDROID_HOME/ndk" -path '*/prebuilt/linux-x86_64/bin/llvm-readelf' | sort -V | tail -1)"
+          sym="Source/Android/app/build/intermediates/merged_native_libs/debug/mergeDebugNativeLibs/out/lib/arm64-v8a/libmain.so"
+          if [ ! -f "$sym" ]; then
+            sym="$(find Source/Android/app/build/intermediates -path '*/arm64-v8a/libmain.so' -print0 | xargs -0 ls -S | head -1)"
+          fi
+          "$readelf" -S "$sym" | grep -q ' \.symtab' || { echo "::error::$sym is stripped"; exit 1; }
+          mkdir -p symbols/arm64-v8a
+          cp "$sym" symbols/arm64-v8a/libmain.so
+          "$readelf" -n symbols/arm64-v8a/libmain.so | awk '/Build ID/ {print $NF}' > symbols/BuildId.txt
+          apk="$(ls Source/Android/app/build/outputs/apk/debug/*.apk | head -1)"
+          unzip -p "$apk" lib/arm64-v8a/libmain.so > "$RUNNER_TEMP/packaged-libmain.so"
+          "$readelf" -n "$RUNNER_TEMP/packaged-libmain.so" | awk '/Build ID/ {print $NF}' > symbols/BuildId.apk.txt
+          diff symbols/BuildId.txt symbols/BuildId.apk.txt
+          git rev-parse HEAD > symbols/COMMIT
+          ls -la symbols symbols/arm64-v8a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-android-symbols
+          path: symbols/
+          compression-level: 9
+          retention-days: 90
       - name: Rename APK
         run: |
           SHORT_SHA=$(git rev-parse --short HEAD)
