@@ -236,19 +236,22 @@ does stall.
 ## Playing across different kinds of computer
 
 A room that mixes CPU architectures — Apple Silicon or Android on one side,
-Windows or Linux on the other — runs every player on Dolphin's **Cached
-Interpreter** for that battle, and the host's chat says so at Start. Two
-different recompilers split the game's code into blocks differently, which
-skews the emulated clock between the machines, and XD seeds both its link key
-and its battle RNG from that clock; the interpreter is the one core all four
-builds share with identical timing and arithmetic. It is slower than a
-recompiler: fine on an Apple Silicon Mac and a recent Windows laptop, and
-netplay throttles the room to the slower side. Rooms that do not mix (Mac ↔
-Thor, Windows ↔ Linux) keep their recompilers and are unaffected.
+Windows or Linux on the other — runs two different recompilers, which split
+the game's code into blocks differently and skew Dolphin's clock between the
+machines by a few dozen cycles. XD reads that clock to build its GBA link key
+and to seed its battle RNG, which is enough to make the same attack miss on
+one machine and hit on the other.
 
-If a mixed room cannot hold full speed, the host can opt out with
-`ForceCommonCoreOnMixedArch = False` under `[NetPlay]` in `Dolphin.ini` —
-with the desync risk back.
+In those rooms OrreLink serves XD's clock itself: a value built from the
+game's own frame counter plus a per-session number the host picks and syncs,
+identical on every machine, while each machine keeps its own recompiler at
+full speed. The host's chat says so at Start ("recompilers stay on; OrreLink
+serves XD's clock this battle"), and the main menu is skipped. Rooms that do
+not mix (Mac ↔ Thor, Windows ↔ Linux) and solo play are untouched.
+
+`ForceCommonCoreOnMixedArch = True` under `[NetPlay]` in `Dolphin.ini` is an
+opt-in "safest" mode that instead runs everyone on the Cached Interpreter —
+correct, but much slower; useful only as an A/B test.
 
 ### Checking a match from the logs
 
@@ -256,15 +259,16 @@ Every session log carries three kinds of proof lines. Comparing the host's
 and the guest's:
 
 - `t=boot cpu ...` — the core that actually ran (`core_eff`), the
-  architecture, and every determinism setting. Everything but `arch`, `hw_*`
-  and `rev` must match; a mixed room shows `core_eff="Cached Interpreter"`
-  on both.
+  architecture, and every determinism setting. Everything but `arch`,
+  `core_*`, `hw_*` and `rev` must match; a mixed room shows `xd_clock=on`
+  with the same `xd_salt`/`xd_seed` on both.
 - `t=boot ar ...` — the Action Replay lines that will run. The host's
   `ar synced-send` checksum must equal the guest's `ar synced-recv`, and
   `diff <(grep '^t=boot ar op' host.log) <(grep '^t=boot ar op' guest.log)`
   must be empty.
-- `xd ...` during the link and battle — RNG seed and battle-state checksums,
-  keyed by link-command sequence number so the two logs line up:
+- `xd ...` during the link and battle — frame counter, logical time base, RNG
+  seed and battle-state checksums, keyed by link-command sequence number so
+  the two logs line up:
   `diff <(grep ' xd ' host.log | sed -E 's/^t=[0-9]+ //') <(grep ' xd ' guest.log | sed -E 's/^t=[0-9]+ //')`
   is empty for a clean match; the first differing line is the divergence.
 

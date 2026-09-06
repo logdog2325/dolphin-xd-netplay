@@ -1,0 +1,856 @@
+From 37f9a874e76f3879085563d38ee2a36e0bdd4dbe Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Sat, 5 Sep 2026 18:59:08 -0700
+Subject: [PATCH] XD Netplay: deterministic XD clock keeps the recompilers in
+ mixed-architecture rooms (v1.5.11)
+
+v1.5.10 put mixed rooms on the Cached Interpreter, which is correct but far
+too slow to play. XD reads time through exactly two functions; two
+recompilers split blocks differently so those reads differed by a few
+dozen cycles between machines, and XD builds its GBA link key and battle
+RNG seed from them.
+
+- HLE Replace hooks on OSGetTick (0x800b225c) and OSGetTime (0x800b2244)
+  for GXXE01, installed from PatchFixedFunctions when the netplay-synced
+  session flag is on: value = synced TB start + salt + 675675 * XD's own
+  frame counter (0x804EA8A8) + a per-call step for spin-waits; frame-exact
+  for the stamps that feed game state, real time base for alarms, audio,
+  save timestamps, reset and crash paths; host-synced RNG seed and link
+  key; per-site ordinals for the CARD LCG seeds.
+- Host policy: mixed room + XD -> clock on, recompilers kept, random salt
+  and seed per session, apploader boot forced, accurate NaNs pinned, chat
+  notice. ForceCommonCoreOnMixedArch is now the opt-in 'safest' mode.
+- Wire: three NetSettings fields appended after the SRAM bytes; guest
+  fallback uses its own recompiler when the clock is on.
+- Time-base desync detector tolerates the recompiler skew when the clock
+  is on.
+- Logs: cpu line xd_clock/xd_salt/xd_seed/xd_period/xd_inc, xd lines lf/lt,
+  xdclk lines on link events.
+---
+ Source/Core/Core/CMakeLists.txt               |   2 +
+ Source/Core/Core/Config/NetplaySettings.cpp   |   2 +-
+ Source/Core/Core/Config/NetplaySettings.h     |   8 +-
+ Source/Core/Core/Config/SessionSettings.cpp   |   4 +
+ Source/Core/Core/Config/SessionSettings.h     |   5 +
+ .../ConfigLoaders/NetPlayConfigLoader.cpp     |   3 +
+ Source/Core/Core/Core.cpp                     |   9 +-
+ Source/Core/Core/HLE/HLE.cpp                  |  13 +-
+ Source/Core/Core/HLE/HLE_XD.cpp               | 282 ++++++++++++++++++
+ Source/Core/Core/HLE/HLE_XD.h                 |  34 +++
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    |  35 ++-
+ Source/Core/Core/NetPlayClient.cpp            |  33 +-
+ Source/Core/Core/NetPlayProto.h               |   5 +
+ Source/Core/Core/NetPlayServer.cpp            |  78 +++--
+ Source/Core/DolphinLib.props                  |   2 +
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 16 files changed, 467 insertions(+), 50 deletions(-)
+ create mode 100644 Source/Core/Core/HLE/HLE_XD.cpp
+ create mode 100644 Source/Core/Core/HLE/HLE_XD.h
+
+diff --git a/Source/Core/Core/CMakeLists.txt b/Source/Core/Core/CMakeLists.txt
+index 8a49218..a0d184e 100644
+--- a/Source/Core/Core/CMakeLists.txt
++++ b/Source/Core/Core/CMakeLists.txt
+@@ -135,6 +135,8 @@ add_library(core
+   HLE/HLE_OS.h
+   HLE/HLE_VarArgs.cpp
+   HLE/HLE_VarArgs.h
++  HLE/HLE_XD.cpp
++  HLE/HLE_XD.h
+   HLE/HLE.cpp
+   HLE/HLE.h
+   Host.h
+diff --git a/Source/Core/Core/Config/NetplaySettings.cpp b/Source/Core/Core/Config/NetplaySettings.cpp
+index 2f7de9c..4ad6bf5 100644
+--- a/Source/Core/Core/Config/NetplaySettings.cpp
++++ b/Source/Core/Core/Config/NetplaySettings.cpp
+@@ -61,6 +61,6 @@ const Info<std::string> NETPLAY_NETWORK_MODE{{System::Main, "NetPlay", "NetworkM
+ const Info<bool> NETPLAY_GOLF_MODE_OVERLAY{{System::Main, "NetPlay", "GolfModeOverlay"}, true};
+ const Info<bool> NETPLAY_HIDE_REMOTE_GBAS{{System::Main, "NetPlay", "HideRemoteGBAs"}, false};
+ const Info<bool> NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH{
+-    {System::Main, "NetPlay", "ForceCommonCoreOnMixedArch"}, true};
++    {System::Main, "NetPlay", "ForceCommonCoreOnMixedArch"}, false};
+ 
+ }  // namespace Config
+diff --git a/Source/Core/Core/Config/NetplaySettings.h b/Source/Core/Core/Config/NetplaySettings.h
+index 9f817d9..71c344d 100644
+--- a/Source/Core/Core/Config/NetplaySettings.h
++++ b/Source/Core/Core/Config/NetplaySettings.h
+@@ -52,9 +52,11 @@ extern const Info<bool> NETPLAY_STRICT_SETTINGS_SYNC;
+ extern const Info<std::string> NETPLAY_NETWORK_MODE;
+ extern const Info<bool> NETPLAY_GOLF_MODE_OVERLAY;
+ extern const Info<bool> NETPLAY_HIDE_REMOTE_GBAS;
+-// OrreLink: when the room mixes x86_64 and arm64 players, put every player on the
+-// Cached Interpreter (the one core all platforms build identically, with identical
+-// block-boundary timing). Same-arch rooms are never touched.
++// OrreLink: opt-in "safest" override. When the room mixes x86_64 and arm64 players AND
++// this is true, every player runs the Cached Interpreter (the v1.5.10 behaviour; unusably
++// slow on the field's machines). Default (false): recompilers stay on and Pokemon XD gets
++// the HLE deterministic clock (Core/HLE/HLE_XD.cpp) instead. Same-arch rooms are never
++// touched.
+ extern const Info<bool> NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH;
+ 
+ }  // namespace Config
+diff --git a/Source/Core/Core/Config/SessionSettings.cpp b/Source/Core/Core/Config/SessionSettings.cpp
+index 0e3deac..2f1c2ea 100644
+--- a/Source/Core/Core/Config/SessionSettings.cpp
++++ b/Source/Core/Core/Config/SessionSettings.cpp
+@@ -15,4 +15,8 @@ const Info<bool> SESSION_CODE_SYNC_OVERRIDE{{System::Session, "Core", "CheatSync
+ const Info<bool> SESSION_SAVE_DATA_WRITABLE{{System::Session, "Core", "SaveDataWritable"}, true};
+ const Info<bool> SESSION_SHOULD_FAKE_ERROR_001{{System::Session, "Core", "ShouldFakeError001"},
+                                                false};
++const Info<bool> SESSION_XD_DETERMINISTIC_CLOCK{{System::Session, "Core", "XDDeterministicClock"},
++                                                false};
++const Info<u32> SESSION_XD_CLOCK_SALT{{System::Session, "Core", "XDClockSalt"}, 0u};
++const Info<u32> SESSION_XD_RNG_SEED{{System::Session, "Core", "XDRngSeed"}, 0u};
+ }  // namespace Config
+diff --git a/Source/Core/Core/Config/SessionSettings.h b/Source/Core/Core/Config/SessionSettings.h
+index a81235c..db0fa27 100644
+--- a/Source/Core/Core/Config/SessionSettings.h
++++ b/Source/Core/Core/Config/SessionSettings.h
+@@ -14,4 +14,9 @@ extern const Info<bool> SESSION_GCI_FOLDER_CURRENT_GAME_ONLY;
+ extern const Info<bool> SESSION_CODE_SYNC_OVERRIDE;
+ extern const Info<bool> SESSION_SAVE_DATA_WRITABLE;
+ extern const Info<bool> SESSION_SHOULD_FAKE_ERROR_001;
++// OrreLink v1.5.11: set only by the NetPlay config layer (NetPlayConfigLoader); read by
++// HLE_XD::Install. Defaults mean "no hook" for solo play and same-architecture rooms.
++extern const Info<bool> SESSION_XD_DETERMINISTIC_CLOCK;
++extern const Info<u32> SESSION_XD_CLOCK_SALT;
++extern const Info<u32> SESSION_XD_RNG_SEED;
+ }  // namespace Config
+diff --git a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+index f247b22..e0449fc 100644
+--- a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
++++ b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+@@ -116,6 +116,9 @@ public:
+     layer->Set(Config::GFX_HACK_EFB_DEFER_INVALIDATION, m_settings.efb_access_defer_invalidation);
+ 
+     layer->Set(Config::SESSION_USE_FMA, m_settings.use_fma);
++    layer->Set(Config::SESSION_XD_DETERMINISTIC_CLOCK, m_settings.xd_deterministic_clock);
++    layer->Set(Config::SESSION_XD_CLOCK_SALT, m_settings.xd_clock_salt);
++    layer->Set(Config::SESSION_XD_RNG_SEED, m_settings.xd_rng_seed);
+ 
+     layer->Set(Config::MAIN_BLUETOOTH_PASSTHROUGH_ENABLED, false);
+ 
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index bd137aa..420019c 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -54,6 +54,7 @@
+ #include "Core/FifoPlayer/FifoPlayer.h"
+ #include "Core/FreeLookManager.h"
+ #include "Core/HLE/HLE.h"
++#include "Core/HLE/HLE_XD.h"
+ #include "Core/HW/CPU.h"
+ #include "Core/HW/DSP.h"
+ #include "Core/HW/EXI/EXI.h"
+@@ -612,6 +613,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+ 
+     PatchEngine::Shutdown();
+     HLE::Clear();
++    HLE_XD::Shutdown();
+ 
+     CPUThreadGuard guard(system);
+     system.GetPowerPC().GetDebugInterface().Clear(guard);
+@@ -708,7 +710,8 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+         "accurate_fmadds={} accurate_nans={} fprf={} float_exc={} div0_exc={} disable_icache={} "
+         "accurate_dcache={} fastmem={} follow_branch={} mmu={} cpu_thread={} oc={} "
+         "sync_on_skip_idle={} cheats={} gpu_det={} dsp_hle={} dsp_thread={} practice_dummy={} "
+-        "debug={} soft_flush={} netplay={} rev={}",
++        "debug={} soft_flush={} netplay={} xd_clock={} xd_clock_cfg={} xd_salt={:08x} "
++        "xd_seed={:08x} xd_period={} xd_inc={} rev={}",
+         NetPlay::LocalCpuArch(), static_cast<int>(Config::Get(Config::MAIN_CPU_CORE)),
+         ppc.GetCPUName(), ppc.GetMode() == PowerPC::CoreMode::JIT ? "jit" : "interp",
+         cpu_info.bFMA ? 1 : 0, cpu_info.bAFP ? 1 : 0, Config::Get(Config::SESSION_USE_FMA) ? 1 : 0,
+@@ -728,7 +731,9 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+         Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY) ? 1 : 0,
+         Config::Get(Config::MAIN_ENABLE_DEBUGGING) ? 1 : 0,
+         ppc.GetPPCState().software_fpu_flush ? 1 : 0,
+-        NetPlay::IsNetPlayRunning() ? 1 : 0,
++        NetPlay::IsNetPlayRunning() ? 1 : 0, HLE_XD::IsInstalled() ? "on" : "off",
++        Config::Get(Config::SESSION_XD_DETERMINISTIC_CLOCK) ? 1 : 0, HLE_XD::GetSalt(),
++        HLE_XD::GetSeed(), HLE_XD::GetPeriod(), HLE_XD::DefaultIncrement(),
+         Common::GetScmRevGitStr()));
+   }
+ #endif
+diff --git a/Source/Core/Core/HLE/HLE.cpp b/Source/Core/Core/HLE/HLE.cpp
+index 31b6c2d..ae120d6 100644
+--- a/Source/Core/Core/HLE/HLE.cpp
++++ b/Source/Core/Core/HLE/HLE.cpp
+@@ -14,6 +14,7 @@
+ #include "Core/GeckoCode.h"
+ #include "Core/HLE/HLE_Misc.h"
+ #include "Core/HLE/HLE_OS.h"
++#include "Core/HLE/HLE_XD.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/Host.h"
+ #include "Core/PowerPC/PPCSymbolDB.h"
+@@ -26,7 +27,7 @@ namespace HLE
+ static std::map<u32, u32> s_hooked_addresses;
+ 
+ // clang-format off
+-constexpr std::array<Hook, 23> os_patches{{
++constexpr std::array<Hook, 25> os_patches{{
+     // Placeholder, os_patches[0] is the "non-existent function" index
+     {"FAKE_TO_SKIP_0",               HLE_Misc::UnimplementedFunction,       HookType::Replace, HookFlag::Generic},
+ 
+@@ -58,7 +59,12 @@ constexpr std::array<Hook, 23> os_patches{{
+ 
+     {"GeckoCodehandler",             HLE_Misc::GeckoCodeHandlerICacheFlush, HookType::Start,   HookFlag::Fixed},
+     {"GeckoHandlerReturnTrampoline", HLE_Misc::GeckoReturnTrampoline,       HookType::Replace, HookFlag::Fixed},
+-    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed} // apploader needs OSReport-like function
++    {"AppLoaderReport",              HLE_OS::HLE_GeneralDebugPrint,         HookType::Start,   HookFlag::Fixed}, // apploader needs OSReport-like function
++
++    // OrreLink: Pokemon XD (GXXE01) deterministic clock; installed by HLE_XD::Install from
++    // PatchFixedFunctions only when the netplay-synced session flag is on.
++    {"XD_OSGetTick",                 HLE_XD::OSGetTick,                     HookType::Replace, HookFlag::Fixed},
++    {"XD_OSGetTime",                 HLE_XD::OSGetTime,                     HookType::Replace, HookFlag::Fixed}
+ }};
+ // clang-format on
+ 
+@@ -104,6 +110,9 @@ void PatchFixedFunctions(Core::System& system)
+   // This has to always be installed even if cheats are not enabled because of the possibility of
+   // loading a savestate where PC is inside the code handler while cheats are disabled.
+   Patch(system, Gecko::HLE_TRAMPOLINE_ADDRESS, "GeckoHandlerReturnTrampoline");
++
++  // OrreLink v1.5.11: XD deterministic clock (no-op unless SESSION_XD_DETERMINISTIC_CLOCK).
++  HLE_XD::Install(system);
+ }
+ 
+ void PatchFunctions(Core::System& system)
+diff --git a/Source/Core/Core/HLE/HLE_XD.cpp b/Source/Core/Core/HLE/HLE_XD.cpp
+new file mode 100644
+index 0000000..0b1ac58
+--- /dev/null
++++ b/Source/Core/Core/HLE/HLE_XD.cpp
+@@ -0,0 +1,282 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Core/HLE/HLE_XD.h"
++
++#include <array>
++
++#include "Common/CommonTypes.h"
++#include "Common/Config/Config.h"
++#include "Common/Logging/Log.h"
++
++#include "Core/Config/SessionSettings.h"
++#include "Core/Core.h"
++#include "Core/CoreTiming.h"
++#include "Core/HLE/HLE.h"
++#include "Core/HW/Memmap.h"
++#include "Core/HW/SystemTimers.h"
++#include "Core/PowerPC/PowerPC.h"
++#include "Core/System.h"
++
++namespace HLE_XD
++{
++namespace
++{
++// Pokemon XD GXXE01 (NTSC-U) main.dol. Every address below is fixed in that binary; Install()
++// refuses any other disc/DOL by checking the disc ID and the two hooked opcodes.
++constexpr u32 XD_DISC_ID = 0x47585845;      // "GXXE" at 0x80000000
++constexpr u32 ADDR_OSGETTIME = 0x800b2244;  // mftbu r3; mftb r4; mftbu r5; cmpw; bne; blr
++constexpr u32 ADDR_OSGETTICK = 0x800b225c;  // mftb r3; blr
++constexpr u32 OP_MFTBU_R3 = 0x7C6D42E6;
++constexpr u32 OP_MFTB_R3 = 0x7C6C42E6;
++// XD's main-loop frame counter, r13-21880: zeroed once at 0x8005c330 (entry of the main-loop
++// function 0x8005c2fc), incremented at 0x8005c6f4 (end of every pass of 0x8005c6a0..0x8005c6f8),
++// read only by 0x8005c6e4 / 0x80150e54 / 0x80151018. Pure game state: identical on every
++// machine that executes the same instruction stream.
++constexpr u32 ADDR_FRAME_COUNTER = 0x804EA8A8;
++
++// Call sites (LR = bl address + 4) with special values; everything else is "Default".
++constexpr u32 LR_RNG_SEEDER = 0x800efaa4;     // bl OSGetTime @0x800efaa0; stw r4 -> RNG 0x804E8610
++constexpr u32 LR_JOYBOOT_KEY = 0x8002d45c;  // bl OSGetTick @0x8002d458; key=(r3&0xFFFFFF)|0xDD<<24
++constexpr u32 LR_VI_INIT_STAMP = 0x802af138;  // bl OSGetTime @0x802af134; first VI-module stamp
++constexpr u32 LR_MAIN_PRELOOP_STAMP = 0x8005c68c;  // main loop pre-loop stamp: one period back
++// Stamps that feed game-visible timing get the frame-exact value (no per-call term).
++constexpr std::array<u32, 6> FRAME_EXACT_LRS = {
++    0x8005c6ac, 0x8005c6e4,  // main loop 0x8005c2fc: now / prev stamps -> per-frame us delta
++    0x802ae5b0, 0x802ae9b0,  // VI swap stamps (0x802ae490 / 0x802ae898) -> +0x74 frame ratio
++    0x8005c7bc,              // 0x8005c71c: allocator base += OSGetTime.lo & 0x7e0
++    0x800e8364,              // __EXIProbe: 100 ms units gating memory-card attach (300 ms window)
++};
++// Per-site call ordinal within the frame: deterministic and still varies per object.
++constexpr std::array<u32, 4> ORDINAL_LRS = {
++    0x801e3028,                          // 0x801e2b04: obj+0x17 = OSGetTick() % tmpl->0x5c
++    0x800c0a74, 0x800c0aa4, 0x800c0b58,  // CARD DummyLen / __CARDUnlock LCG seeds (0x804E81E0)
++};
++// Sites that must see the real time base (alarms, audio, real-date stamps, reset, crash).
++constexpr std::array<u32, 14> PASSTHROUGH_LRS = {
++    0x800b2288,                          // __OSGetSystemTime: OSAlarm/decrementer, DVD, SI, CARD
++    0x800bc8b0, 0x800bc8f4, 0x800bc9dc,  // __AI_SRC_INIT measurement + spin (boot, before VI)
++    0x801cc528,                          // save-file calendar timestamp
++    0x800c4b78, 0x800c533c, 0x800c5bc4,  // CARD directory entry time (seconds since epoch)
++    0x800c3ea8,                          // __CARDFormatRegionAsync formatTime / serial
++    0x800ad0d4, 0x800ad114,              // OSResetSystem waits
++    0x800abf4c,                          // __OSUnhandledException report
++    0x80181c2c, 0x80182014,              // AI DMA callback stamp / mixer elapsed-us (IRQ context)
++};
++// Default-class reads (JoyBoot polls/timeouts, boot spins) advance a per-boot counter by this
++// much per call: a spin that waits N ticks exits after about N/3 reads, close to the ~3.3 TB
++// ticks one poll iteration costs on hardware. Never reaches game state (see Read()).
++constexpr u64 DEFAULT_INCREMENT = 3;
++
++enum class Site
++{
++  Default,
++  FrameExact,
++  InitStamp,
++  PreLoopStamp,
++  Ordinal,
++  Passthrough,
++};
++
++struct Ordinal
++{
++  u32 frame = 0;
++  u32 count = 0;
++};
++
++bool s_installed = false;
++u32 s_salt = 0;
++u32 s_seed = 0;
++u64 s_period = 0;
++u64 s_calls = 0;
++std::array<Ordinal, ORDINAL_LRS.size()> s_ordinals{};
++
++Site Classify(u32 lr, size_t* ordinal_index)
++{
++  for (const u32 x : PASSTHROUGH_LRS)
++  {
++    if (lr == x)
++      return Site::Passthrough;
++  }
++  for (const u32 x : FRAME_EXACT_LRS)
++  {
++    if (lr == x)
++      return Site::FrameExact;
++  }
++  if (lr == LR_VI_INIT_STAMP)
++    return Site::InitStamp;
++  if (lr == LR_MAIN_PRELOOP_STAMP)
++    return Site::PreLoopStamp;
++  for (size_t i = 0; i < ORDINAL_LRS.size(); ++i)
++  {
++    if (lr == ORDINAL_LRS[i])
++    {
++      *ordinal_index = i;
++      return Site::Ordinal;
++    }
++  }
++  return Site::Default;
++}
++
++u64 Base(Core::System& system)
++{
++  // fake_TB_start_value derives from the host's initial RTC that NetPlay already syncs
++  // (NetPlayServer::GetInitialNetPlayRTC -> NetPlayClient::m_initial_rtc -> SystemTimers::Init).
++  return system.GetCoreTiming().GetFakeTBStartValue() + s_salt;
++}
++
++u64 Read(Core::System& system, u32 lr)
++{
++  size_t ord = 0;
++  switch (Classify(lr, &ord))
++  {
++  case Site::Passthrough:
++    return system.GetSystemTimers().GetFakeTimeBase();
++  case Site::FrameExact:
++    return FrameExactTimeBase(system);
++  case Site::InitStamp:
++    // Hardware follows this stamp with two VIWaitForRetrace before the first swap; give the
++    // first measured frame the same 2-field delta instead of 0.
++    return FrameExactTimeBase(system) - 2 * s_period;
++  case Site::PreLoopStamp:
++    // The main loop's pre-loop stamp: one period back so pass 1's delta is exactly one field
++    // (16683 us), as on hardware, instead of 0.
++    return FrameExactTimeBase(system) - s_period;
++  case Site::Ordinal:
++  {
++    const u32 frame = GetFrame(system);
++    Ordinal& o = s_ordinals[ord];
++    if (o.frame != frame)
++    {
++      o.frame = frame;
++      o.count = 0;
++    }
++    return Base(system) + s_period * frame + o.count++;
++  }
++  case Site::Default:
++  default:
++    // The per-call term only exists so that spin-waits (SI transfer polls, the OSInit DSP
++    // spin, GX abort spins) make progress. Its exact value never reaches game state: every
++    // game-visible stamp is FrameExact/Ordinal/Seed/Key above, and every Default consumer is
++    // an elapsed-time comparison against a threshold of 100 ms or more, or a fixed-count spin.
++    s_calls += DEFAULT_INCREMENT;
++    return Base(system) + s_period * GetFrame(system) + s_calls;
++  }
++}
++
++u32 KeyMaterial()
++{
++  // Six nibbles with exactly two bits each: popcount(low 24) = 12. The generator ORs in 0xDD
++  // (6 bits) and gates popcount(key) to 10..24 (0x8002d47c..0x8002d534): 18 passes on the first
++  // read on every machine, so the retry loop never re-reads.
++  static constexpr u8 NIBBLES[4] = {0x3, 0x5, 0x6, 0x9};
++  u32 k = 0;
++  for (u32 i = 0; i < 6; ++i)
++    k |= static_cast<u32>(NIBBLES[(s_salt >> (2 * i)) & 3]) << (4 * i);
++  return k;
++}
++}  // namespace
++
++bool IsInstalled()
++{
++  return s_installed;
++}
++
++u32 GetSalt()
++{
++  return s_salt;
++}
++
++u32 GetSeed()
++{
++  return s_seed;
++}
++
++u64 GetPeriod()
++{
++  return s_period;
++}
++
++u64 CallCount()
++{
++  return s_calls;
++}
++
++u64 DefaultIncrement()
++{
++  return DEFAULT_INCREMENT;
++}
++
++u32 GetFrame(Core::System& system)
++{
++  return system.GetMemory().Read_U32(ADDR_FRAME_COUNTER);
++}
++
++u64 FrameExactTimeBase(Core::System& system)
++{
++  return Base(system) + s_period * GetFrame(system);
++}
++
++void Install(Core::System& system)
++{
++  if (!Config::Get(Config::SESSION_XD_DETERMINISTIC_CLOCK))
++    return;
++  auto& memory = system.GetMemory();
++  if (memory.Read_U32(0x80000000) != XD_DISC_ID ||
++      memory.Read_U32(ADDR_OSGETTIME) != OP_MFTBU_R3 ||
++      memory.Read_U32(ADDR_OSGETTICK) != OP_MFTB_R3)
++  {
++    ERROR_LOG_FMT(OSHLE, "XD clock requested but this is not the GXXE01 DOL; hooks NOT installed");
++    return;
++  }
++  if (!s_installed)
++  {
++    // First install of this emulation session. HLE::Reload may run again later (symbol
++    // loads); the counters must survive that.
++    s_salt = Config::Get(Config::SESSION_XD_CLOCK_SALT);
++    s_seed = Config::Get(Config::SESSION_XD_RNG_SEED);
++    const u64 tb_hz = static_cast<u64>(system.GetSystemTimers().GetTicksPerSecond()) /
++                      SystemTimers::TIMER_RATIO;
++    s_period = tb_hz * 1001 / 60000;  // 40,500,000 * 1001 / 60000 = 675,675 = one NTSC field
++    s_calls = 0;
++    s_ordinals = {};
++    s_installed = true;
++  }
++  HLE::Patch(system, ADDR_OSGETTICK, "XD_OSGetTick");
++  HLE::Patch(system, ADDR_OSGETTIME, "XD_OSGetTime");
++  INFO_LOG_FMT(OSHLE, "XD deterministic clock installed: salt={:08x} seed={:08x} period={} inc={}",
++               s_salt, s_seed, s_period, DEFAULT_INCREMENT);
++}
++
++void Shutdown()
++{
++  s_installed = false;
++  s_salt = 0;
++  s_seed = 0;
++  s_period = 0;
++  s_calls = 0;
++  s_ordinals = {};
++}
++
++void OSGetTick(const Core::CPUThreadGuard& guard)
++{
++  auto& system = guard.GetSystem();
++  auto& ppc_state = system.GetPPCState();
++  const u32 lr = LR(ppc_state);
++  const u64 value = (lr == LR_JOYBOOT_KEY) ? KeyMaterial() : Read(system, lr);
++  ppc_state.gpr[3] = static_cast<u32>(value);
++  ppc_state.npc = lr;  // Replace hooks return by writing npc (see HLE_Misc::UnimplementedFunction)
++}
++
++void OSGetTime(const Core::CPUThreadGuard& guard)
++{
++  auto& system = guard.GetSystem();
++  auto& ppc_state = system.GetPPCState();
++  const u32 lr = LR(ppc_state);
++  u64 value = Read(system, lr);
++  if (lr == LR_RNG_SEEDER)
++    value = (value & 0xFFFFFFFF00000000ull) | s_seed;  // stw r4 -> 0x804E8610 = battle RNG seed
++  ppc_state.gpr[3] = static_cast<u32>(value >> 32);
++  ppc_state.gpr[4] = static_cast<u32>(value);
++  ppc_state.npc = lr;
++}
++}  // namespace HLE_XD
+diff --git a/Source/Core/Core/HLE/HLE_XD.h b/Source/Core/Core/HLE/HLE_XD.h
+new file mode 100644
+index 0000000..09a83e5
+--- /dev/null
++++ b/Source/Core/Core/HLE/HLE_XD.h
+@@ -0,0 +1,34 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include "Common/CommonTypes.h"
++
++namespace Core
++{
++class CPUThreadGuard;
++class System;
++}  // namespace Core
++
++// OrreLink: deterministic clock for Pokemon XD (GXXE01) netplay rooms that mix CPU
++// architectures. HLE Replace hooks on OSGetTick/OSGetTime return a value that is a pure
++// function of game state plus a host-synced salt instead of Dolphin's block-granular time
++// base, which differs by a few dozen cycles between JIT64 and JITARM64 because the two
++// recompilers split blocks differently and the tick only advances at block ends. XD seeds
++// its battle RNG and its GBA link key from that time base (the v1.5.9 field desyncs).
++namespace HLE_XD
++{
++void Install(Core::System& system);  // called from HLE::PatchFixedFunctions (every HLE::Reload)
++void Shutdown();                     // called when the emulation session ends (Core::EmuThread)
++bool IsInstalled();
++u32 GetSalt();
++u32 GetSeed();
++u64 GetPeriod();
++u64 CallCount();
++u64 DefaultIncrement();  // per-call step of the Default-class counter (logged next to the period)
++u32 GetFrame(Core::System& system);            // XD's main-loop frame counter (0x804EA8A8)
++u64 FrameExactTimeBase(Core::System& system);  // T0 + period * frame (no per-call term)
++
++void OSGetTick(const Core::CPUThreadGuard& guard);  // hooks 0x800b225c
++void OSGetTime(const Core::CPUThreadGuard& guard);  // hooks 0x800b2244
++}  // namespace HLE_XD
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 2603e49..2501279 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -21,6 +21,7 @@
+ #include "Core/CoreTiming.h"
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GBADetectLog.h"
++#include "Core/HLE/HLE_XD.h"
+ #include "Core/HW/GBAPad.h"
+ #include "Core/HW/Memmap.h"
+ #include "Core/HW/SI/SI.h"
+@@ -114,10 +115,10 @@ constexpr u32 XD_DISC_ID_GXXE = 0x47585845;  // "GXXE" at 0x80000000; anything e
+ // OSGetTime's low word (0x800efa58). The pointer cell at +4 always reads
+ // 0x804E8610 (its only setter has no callers).
+ constexpr u32 XD_RNG_SEED = 0x804E8610;
+-// SDK JoyBoot LCG state (ANSI LCG, global 0x804e81e0), RE-SEEDED FROM OSGetTick
+-// at every GBA key exchange -- the value behind the first divergent JoyBus byte
+-// in the v1.5.9 field logs (c7 vs c3). Logged raw; a difference here with equal
+-// seed/crcs is the time-base-drift signature.
++// SDK CARD unlock LCG state (ANSI LCG, 0x804e81e0 = r13-31808), seeded from OSGetTick by
++// CARD DummyLen 0x800c0a50 / __CARDUnlock 0x800c0b14 (all 12 references) -- NOT JoyBoot: it
++// only moves on memory-card mount/unlock. Logged raw as jb= (name kept for log compatibility);
++// under the v1.5.11 clock those three reads are per-site ordinals, so it stays identical.
+ constexpr u32 XD_JOYBOOT_LCG = 0x804E81E0;
+ constexpr u32 XD_BATTLE_FLAGS = 0x804EB938;  // u32 bit flags, 263 refs in the engine
+ // crcA: battle-engine scalars (.sbss: flags, command-ring indices, turn counters,
+@@ -191,6 +192,12 @@ void CSIDevice_GBAEmu::LogXdState(const u8* request, const char* why, bool force
+   const u32 joyboot = memory.Read_U32(XD_JOYBOOT_LCG);
+   const u32 flags = memory.Read_U32(XD_BATTLE_FLAGS);
+   const u32 ctx = memory.Read_U32(XD_CTX_PTR);
++  // OrreLink v1.5.11: XD's own main-loop frame counter and the frame-exact logical time base
++  // (HLE_XD, no per-call term). Identical on every machine at the same wseq while the games are
++  // in step; lt=00000000 when the clock is not installed (solo, same-arch room).
++  const u32 lf = HLE_XD::GetFrame(m_system);
++  const u32 lt =
++      HLE_XD::IsInstalled() ? static_cast<u32>(HLE_XD::FrameExactTimeBase(m_system)) : 0;
+ 
+   u8 buf[2048];
+   size_t n = 0;
+@@ -242,11 +249,25 @@ void CSIDevice_GBAEmu::LogXdState(const u8* request, const char* why, bool force
+     data = fmt::format(" data={:02x}{:02x}{:02x}{:02x}", request[1], request[2], request[3],
+                        request[4]);
+   }
++  if (forced)
++  {
++    // Clock state on the forced events only ('xdclk' never matches grep ' xd '). n= is
++    // EXPECTED to differ slightly between machines: it counts jittered poll iterations that
++    // by design reach no game state.
++    GBADetectLog::LogEvent(
++        m_device_number, m_timestamp_sent, "xdclk",
++        fmt::format("why={} mode={} F={} n={} inc={} salt={:08x} seed_cfg={:08x} period={}", why,
++                    HLE_XD::IsInstalled() ? "on" : "off", lf, HLE_XD::CallCount(),
++                    HLE_XD::DefaultIncrement(), HLE_XD::GetSalt(), HLE_XD::GetSeed(),
++                    HLE_XD::GetPeriod()),
++        false);
++  }
+   GBADetectLog::LogEvent(
+       m_device_number, m_timestamp_sent, "xd",
+-      fmt::format("wseq={} why={}{} seed={:08x} jb={:08x} ctx={:08x} flags={:08x} crcA={:08x} "
+-                  "crcB={:08x} crcC={:08x}",
+-                  m_diag_wr_count, why, data, seed, joyboot, ctx, flags, crc_a, crc_b, crc_c),
++      fmt::format("wseq={} why={}{} lf={} lt={:08x} seed={:08x} jb={:08x} ctx={:08x} "
++                  "flags={:08x} crcA={:08x} crcB={:08x} crcC={:08x}",
++                  m_diag_wr_count, why, data, lf, lt, seed, joyboot, ctx, flags, crc_a, crc_b,
++                  crc_c),
+       false);  // bounded; the <=1/s summary line flushes
+ }
+ 
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index 14d2039..fde2392 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -969,18 +969,6 @@ void NetPlayClient::OnStartGame(sf::Packet& packet)
+     packet >> m_current_game;
+     packet >> m_net_settings.cpu_thread;
+     packet >> m_net_settings.cpu_core;
+-    // Never let PowerPC.cpp's silent fallback pick this machine's native JIT when
+-    // the host named a core this build cannot construct. Unreachable under the
+-    // host's mixed-arch policy; if it ever fires, use the one core every platform
+-    // has and say so, so a JIT-vs-JIT mismatch can never hide again.
+-    if (std::ranges::find(PowerPC::AvailableCPUCores(), m_net_settings.cpu_core) ==
+-        PowerPC::AvailableCPUCores().end())
+-    {
+-      m_dialog->AppendChat(fmt::format(
+-          "Host asked for CPU core {} which this build cannot run; using the Cached Interpreter.",
+-          static_cast<int>(m_net_settings.cpu_core)));
+-      m_net_settings.cpu_core = PowerPC::CPUCore::CachedInterpreter;
+-    }
+     packet >> m_net_settings.enable_cheats;
+     packet >> m_net_settings.enable_hardcore;
+     packet >> m_net_settings.selected_language;
+@@ -1071,6 +1059,27 @@ void NetPlayClient::OnStartGame(sf::Packet& packet)
+     for (size_t i = 0; i < sizeof(m_net_settings.sram); ++i)
+       packet >> m_net_settings.sram[i];
+ 
++    // OrreLink v1.5.11 -- LAST fields, same order as NetPlayServer::StartGame.
++    packet >> m_net_settings.xd_deterministic_clock;
++    packet >> m_net_settings.xd_clock_salt;
++    packet >> m_net_settings.xd_rng_seed;
++
++    // Never let PowerPC.cpp's silent fallback pick a core nobody announced. A host on the
++    // other architecture names a JIT this build cannot construct: with the XD clock on that
++    // is expected and this machine's own recompiler is the right answer; without it, use the
++    // one core every platform has and say so.
++    if (std::ranges::find(PowerPC::AvailableCPUCores(), m_net_settings.cpu_core) ==
++        PowerPC::AvailableCPUCores().end())
++    {
++      const bool clock = m_net_settings.xd_deterministic_clock;
++      m_dialog->AppendChat(fmt::format(
++          "Host asked for CPU core {} which this build cannot run; using {}.",
++          static_cast<int>(m_net_settings.cpu_core),
++          clock ? "this machine's recompiler (XD clock on)" : "the Cached Interpreter"));
++      m_net_settings.cpu_core =
++          clock ? PowerPC::DefaultCPUCore() : PowerPC::CPUCore::CachedInterpreter;
++    }
++
+     m_net_settings.is_hosting = m_local_player->IsHost();
+   }
+ 
+diff --git a/Source/Core/Core/NetPlayProto.h b/Source/Core/Core/NetPlayProto.h
+index fb38cec..05e16fe 100644
+--- a/Source/Core/Core/NetPlayProto.h
++++ b/Source/Core/Core/NetPlayProto.h
+@@ -140,6 +140,11 @@ struct NetSettings
+   bool golf_mode = false;
+   bool use_fma = false;
+   bool hide_remote_gbas = false;
++  // OrreLink v1.5.11: XD deterministic clock (Core/HLE/HLE_XD.cpp). Serialized LAST in the
++  // StartGame packet, after the SRAM bytes, in this order.
++  bool xd_deterministic_clock = false;
++  u32 xd_clock_salt = 0;
++  u32 xd_rng_seed = 0;
+ 
+   Sram sram;
+ 
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index b6adf40..d69f08f 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -31,6 +31,7 @@
+ #include "Common/Hash.h"
+ #include "Common/Logging/Log.h"
+ #include "Common/MsgHandler.h"
++#include "Common/Random.h"
+ #include "Common/SFMLHelper.h"
+ #include "Common/StringUtil.h"
+ #include "Common/UPnP.h"
+@@ -1409,9 +1410,14 @@ unsigned int NetPlayServer::OnData(sf::Packet& packet, Client& player)
+     {
+       // we have all records for this frame
+ 
+-      if (!std::ranges::all_of(timebases, [&](std::pair<PlayerId, u64> pair) {
+-            return pair.second == timebases[0].second;
+-          }))
++      // OrreLink v1.5.11: with the XD clock on, JIT64 vs JITARM64 raw time bases differ by a
++      // few ticks by design (block-boundary skew); only a real divergence (>=1e5 ticks within
++      // seconds in the field logs) counts.
++      const auto mm =
++          std::ranges::minmax_element(timebases, {}, &std::pair<PlayerId, u64>::second);
++      const u64 spread = mm.max->second - mm.min->second;
++      const u64 tolerance = m_settings.xd_deterministic_clock ? 4096 : 0;
++      if (spread > tolerance)
+       {
+         int pid_to_blame = 0;
+         for (auto pair : timebases)
+@@ -1707,39 +1713,53 @@ bool NetPlayServer::SetupNetSettings()
+   // Copy all relevant settings
+   settings.cpu_thread = Config::Get(Config::MAIN_CPU_THREAD);
+   settings.cpu_core = Config::Get(Config::MAIN_CPU_CORE);
+-  // OrreLink cross-architecture determinism. The enum above is only portable
+-  // between machines of the same architecture: an x86_64 build cannot construct
+-  // JITARM64 (JitInterface.cpp), PowerPC.cpp then silently substitutes JIT64,
+-  // and two different recompilers split blocks differently -- so the emulated
+-  // tick a time-base read sees differs by a few dozen cycles, XD's link key and
+-  // battle RNG are time-base derived, and the two games drift apart from the
+-  // first GBA link (the v1.5.9 macOS-vs-Windows desync, proven from both logs).
+-  // Same-arch rooms keep the host's core untouched: macOS arm64 and Android
+-  // arm64 both run JITARM64, and the AYN Thor cannot afford anything slower.
++  // OrreLink cross-architecture determinism. The enum above is only portable between
++  // machines of the same architecture: an x86_64 build cannot construct JITARM64 and two
++  // recompilers split blocks differently, so a time-base read sees a tick that differs by a
++  // few dozen cycles (the v1.5.9 macOS-vs-Windows desync). v1.5.11: mixed rooms keep their
++  // recompilers and XD's OSGetTick/OSGetTime are served by HLE_XD from game state plus a
++  // per-session salt (clock=1 below). ForceCommonCoreOnMixedArch is the opt-in "safest"
++  // fallback (Cached Interpreter, clock off). Same-arch rooms are never touched.
++  settings.xd_deterministic_clock = false;
++  settings.xd_clock_salt = 0;
++  settings.xd_rng_seed = 0;
+   {
+     const bool mixed = RoomMixesCpuArchitectures();
+-    const bool override_on = Config::Get(Config::NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH);
++    const bool safest = Config::Get(Config::NETPLAY_FORCE_COMMON_CORE_ON_MIXED_ARCH);
++    const bool is_xd = game->GetGameID() == "GXXE01";
+     const std::string archs = DescribeRoomArchitectures();
+     std::string line;
+-    if (mixed && override_on && settings.cpu_core != PowerPC::CPUCore::Interpreter)
++    if (mixed && safest && settings.cpu_core != PowerPC::CPUCore::Interpreter)
+     {
+       settings.cpu_core = PowerPC::CPUCore::CachedInterpreter;
+-      line = fmt::format("Mixed CPU architectures ({}): all players use the Cached Interpreter "
+-                         "this battle so both sides compute identical results (slower than JIT).",
++      line = fmt::format("Mixed CPU architectures ({}): 'safest' override is on, all players use "
++                         "the Cached Interpreter this battle (slower than JIT).",
+                          archs);
+     }
+-    else if (mixed && !override_on)
++    else if (mixed && is_xd)
+     {
+-      line = fmt::format("Mixed CPU architectures ({}) with the common-core override OFF: the "
+-                         "two recompilers are not identical, a desync is likely.",
++      settings.xd_deterministic_clock = true;
++      settings.xd_clock_salt = Common::Random::GenerateValue<u32>();
++      settings.xd_rng_seed = Common::Random::GenerateValue<u32>();
++      line = fmt::format("Mixed CPU architectures ({}): recompilers stay on; OrreLink serves XD's "
++                         "clock this battle so both sides compute identical results (main menu "
++                         "skipped).",
++                         archs);
++    }
++    else if (mixed)
++    {
++      line = fmt::format("Mixed CPU architectures ({}) on a game without the XD clock: a desync "
++                         "is possible. The host can set ForceCommonCoreOnMixedArch = True.",
+                          archs);
+     }
+     if (!line.empty())
+       SendChatMessage(line);  // pid 0 notice; the host's own loopback client shows it too
+ #ifdef HAS_LIBMGBA
+-    GBADetectLog::NoteBoot(
+-        fmt::format("netplay corepolicy archs=\"{}\" mixed={} override={} cpu_core={}", archs,
+-                    mixed ? 1 : 0, override_on ? 1 : 0, static_cast<int>(settings.cpu_core)));
++    GBADetectLog::NoteBoot(fmt::format(
++        "netplay corepolicy archs=\"{}\" mixed={} override={} cpu_core={} clock={} salt={:08x} "
++        "seed={:08x}",
++        archs, mixed ? 1 : 0, safest ? 1 : 0, static_cast<int>(settings.cpu_core),
++        settings.xd_deterministic_clock ? 1 : 0, settings.xd_clock_salt, settings.xd_rng_seed));
+ #endif
+   }
+   settings.enable_cheats = Config::AreCheatsEnabled();
+@@ -1805,6 +1825,10 @@ bool NetPlayServer::SetupNetSettings()
+   // every netplay client until v1.5.10 because the field was never serialized
+   // (see StartGame / OnStartGame).
+   settings.accurate_fmadds = true;
++  // OrreLink v1.5.11: x86-64 and ARM64 produce default NaNs of opposite sign; with the
++  // recompilers kept on in mixed rooms, pin accurate NaNs so a NaN's bits match on both sides.
++  if (RoomMixesCpuArchitectures())
++    settings.accurate_nans = true;
+   settings.disable_icache = Config::Get(Config::MAIN_DISABLE_ICACHE);
+   settings.sync_on_skip_idle = Config::Get(Config::MAIN_SYNC_ON_SKIP_IDLE);
+   settings.sync_gpu = Config::Get(Config::MAIN_SYNC_GPU);
+@@ -1816,6 +1840,11 @@ bool NetPlayServer::SetupNetSettings()
+   settings.mmu = Config::Get(Config::MAIN_MMU);
+   settings.fastmem = Config::Get(Config::MAIN_FASTMEM);
+   settings.skip_ipl = Config::Get(Config::MAIN_SKIP_IPL) || !DoAllPlayersHaveIPLDump();
++  // OrreLink v1.5.11: the HLE_XD hooks are installed from HLE::Reload at OnTitleDirectlyBooted,
++  // which for an IPL (main menu) boot runs before main.dol is in RAM and is never re-run. The
++  // deterministic clock therefore requires the apploader (skip-IPL) boot path.
++  if (settings.xd_deterministic_clock)
++    settings.skip_ipl = true;
+   settings.load_ipl_dump = Config::Get(Config::SESSION_LOAD_IPL_DUMP) && DoAllPlayersHaveIPLDump();
+   settings.vertex_rounding = Config::Get(Config::GFX_HACK_VERTEX_ROUNDING);
+   settings.internal_resolution = Config::Get(Config::GFX_EFB_SCALE);
+@@ -2089,6 +2118,11 @@ bool NetPlayServer::StartGame()
+   for (size_t i = 0; i < sizeof(m_settings.sram); ++i)
+     spac << m_settings.sram[i];
+ 
++  // OrreLink v1.5.11 -- keep these LAST; NetPlayClient::OnStartGame reads them in this order.
++  spac << m_settings.xd_deterministic_clock;
++  spac << m_settings.xd_clock_salt;
++  spac << m_settings.xd_rng_seed;
++
+   SendAsyncToClients(std::move(spac));
+ 
+   m_start_pending = false;
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 7c8a7bc..3a93cdb 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -256,6 +256,7 @@
+     <ClInclude Include="Core\HLE\HLE_Misc.h" />
+     <ClInclude Include="Core\HLE\HLE_OS.h" />
+     <ClInclude Include="Core\HLE\HLE_VarArgs.h" />
++    <ClInclude Include="Core\HLE\HLE_XD.h" />
+     <ClInclude Include="Core\HLE\HLE.h" />
+     <ClInclude Include="Core\Host.h" />
+     <ClInclude Include="Core\HotkeyManager.h" />
+@@ -982,6 +983,7 @@
+     <ClCompile Include="Core\HLE\HLE_Misc.cpp" />
+     <ClCompile Include="Core\HLE\HLE_OS.cpp" />
+     <ClCompile Include="Core\HLE\HLE_VarArgs.cpp" />
++    <ClCompile Include="Core\HLE\HLE_XD.cpp" />
+     <ClCompile Include="Core\HLE\HLE.cpp" />
+     <ClCompile Include="Core\HotkeyManager.cpp" />
+     <ClCompile Include="Core\HW\AddressSpace.cpp" />
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 3e00857..6e3e02c 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.10";
++constexpr char VERSION[] = "1.5.11";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
