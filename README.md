@@ -221,7 +221,7 @@ does stall.
   binds these to your keyboard on every GBA slot in one click and applies
   them immediately; the row only reads *mapped* when the bound device really
   exists. If you had the older T/G/F/H keys saved, press it once to switch.
-  **Customize…** next to it opens the GBA mapping window directly (Dolphin's
+  **Change GBA controls…** next to it opens the GBA mapping window directly (Dolphin's
   own Controllers window hides it unless a port is set to GBA) and applies
   your mapping to every slot.
 - **macOS**: the app needs **Input Monitoring** permission to read the keyboard
