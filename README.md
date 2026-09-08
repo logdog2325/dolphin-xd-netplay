@@ -281,6 +281,14 @@ and the guest's:
   `diff <(grep ' xd ' host.log | tr -d '\r' | sed -E 's/^t=[0-9]+ //') <(grep ' xd ' guest.log | tr -d '\r' | sed -E 's/^t=[0-9]+ //')`
   is empty for a clean match (Windows logs are CRLF, hence the `tr`); the
   first differing line is the divergence.
+- `keys-local ...` and `keys ...` — what each player's own keyboard or
+  controller produced for their GBA (`keys-local`, with `gate=0` meaning
+  Dolphin was ignoring input because no game window was focused) and what
+  the emulated GBA actually received after netplay (`keys`, identical on
+  both machines). One line per change, e.g. `keys 001 A` / `keys 000 -`.
+  A player who "can't do anything on the GBA" shows up here in one look:
+  no `keys-local` lines means nothing reached Dolphin; `keys-local` without
+  matching `keys` means the press was lost between the machines.
 
 ## When the network won't let you connect
 
@@ -330,6 +338,11 @@ shows exactly where detection stopped. **Send the newest one.**
 Files are named `gba_detect_YYYYMMDD_HHMMSS.log`; the two previous sessions are
 kept alongside the current one. If a battle failed to start, the log from *that*
 session is the one worth sending, not the one after it.
+
+**If OrreLink itself crashed** (the window vanished, or the OS said it stopped
+working), the same folder gets a `crash_YYYYMMDD_HHMMSS.txt` with the crash
+type and a stack trace. Send it together with the session log; the release keeps
+the symbol files that turn its `OrreLink+0x…` lines into function names.
 
 In a netplay session both sides see only half of what happened, so a report is
 much stronger with **both players' logs**.

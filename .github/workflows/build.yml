@@ -214,6 +214,28 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: Build
         run: msbuild Source/dolphin-emu.sln /m /v:m /p:Configuration=Release /p:Platform=x64
+      - name: Collect symbols
+        # crash_*.txt (written next to the session logs when OrreLink dies) lists
+        # frames as OrreLink.exe+0xOFFSET. The linker map turns an offset into a
+        # function by hand (Rva+Base column minus the preferred base 0x140000000);
+        # the PDB does it with any Windows debugger. Neither ships in the zip.
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p symbols
+          pdb="$(find Build -name 'OrreLink.pdb' | head -1)"
+          map="$(find Build -name 'OrreLink.map' | head -1)"
+          [ -n "$pdb" ] || { echo "::error::OrreLink.pdb not produced"; exit 1; }
+          [ -n "$map" ] || { echo "::error::OrreLink.map not produced"; exit 1; }
+          cp "$pdb" "$map" symbols/
+          git rev-parse HEAD > symbols/COMMIT
+          ls -la symbols
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-win64-symbols
+          path: symbols/
+          compression-level: 9
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: dolphin-xd-netplay-win64
@@ -279,6 +301,23 @@ jobs:
           mkdir -p out
           ditto -c -k --keepParent "$APP" "out/dolphin-xd-netplay-macos-arm64.zip"
           ls -la out
+      - name: Collect symbols
+        # crash_*.txt frames read OrreLink+0xOFFSET (offset from the image base);
+        # 'nm -n' lists link-time addresses, which start at 0x100000000 on macOS
+        # (__PAGEZERO), so look up 0x100000000 + OFFSET to find the function.
+        run: |
+          set -euo pipefail
+          APP="$(find build -name 'OrreLink.app' -type d 2>/dev/null | head -1)"
+          mkdir -p symbols
+          nm -n "$APP/Contents/MacOS/OrreLink" > symbols/OrreLink.nm.txt
+          git rev-parse HEAD > symbols/COMMIT
+          wc -l symbols/OrreLink.nm.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-macos-symbols
+          path: symbols/
+          compression-level: 9
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: dolphin-xd-netplay-macos
@@ -329,6 +368,12 @@ jobs:
           BIN="$(find build/Binaries -maxdepth 1 -type f -perm -111 | head -1)"
           if [ -z "$BIN" ]; then echo "no binary produced" >&2; ls -la build/Binaries >&2; exit 1; fi
           BINNAME="$(basename "$BIN")"
+          # Symbols for crash_*.txt (frames are <binary>+0xOFFSET): the pre-deploy
+          # binary keeps its symbol table; 'nm -n' maps an offset to a function.
+          mkdir -p symbols
+          nm -n "$BIN" > "symbols/$BINNAME.nm.txt"
+          cp "$BIN" "symbols/$BINNAME.unstripped"
+          git rev-parse HEAD > symbols/COMMIT
           mkdir -p AppDir/usr/bin
           cp "$BIN" AppDir/usr/bin/
           # LINUX_LOCAL_DEV makes data lookups executable-relative: Sys rides
@@ -362,6 +407,12 @@ jobs:
           mkdir -p out
           mv OrreLink*.AppImage out/ 2>/dev/null || mv *.AppImage out/
           ls -la out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-xd-netplay-linux-symbols
+          path: symbols/
+          compression-level: 9
+          retention-days: 90
       - uses: actions/upload-artifact@v4
         with:
           name: dolphin-xd-netplay-linux

@@ -1,0 +1,937 @@
+From 560df4a95d61a510193163c7abc8a6f90310864d Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 7 Sep 2026 18:02:17 -0700
+Subject: [PATCH] Desktop crash reports, GBA key logging on both sides of
+ netplay, old GBA default keys migrated to WASD
+
+- Common/CrashReport: a last-chance handler on Windows (unhandled-exception
+  filter, RtlVirtualUnwind walk) and macOS/Linux (fatal-signal handlers on
+  an alternate stack, backtrace + dladdr) that writes crash_<stamp>.txt next
+  to the session logs with every frame as module+offset, then hands the
+  crash back to the OS. Installed from DolphinQt main; stubbed on Android
+  (tombstones). MemTools chains its previous handler with the original
+  siginfo and grows its alternate stack to 64 KiB so the report fits.
+- gba_detect log: 'keys-local' lines (what this machine's own keyboard or
+  controller produced for its GBA, plus whether the input gate was open)
+  and 'keys' lines (what the emulated GBA received after netplay), one per
+  change, 30 per second per socket, overflow counted.
+- Launcher: a GBA slot still holding the old T/G/F/H + Q/W defaults gets
+  those six keys moved to W/S/A/D + Q/E once; anything else is untouched.
+- VS: linker map next to the PDB for offline symbolization.
+---
+ Source/Core/Common/CMakeLists.txt             |   2 +
+ Source/Core/Common/CrashReport.cpp            | 404 ++++++++++++++++++
+ Source/Core/Common/CrashReport.h              |  21 +
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    |  87 +++-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h      |  17 +
+ Source/Core/Core/MemTools.cpp                 |  18 +-
+ Source/Core/Core/NetPlayClient.cpp            |  60 +++
+ Source/Core/DolphinLib.props                  |   2 +
+ Source/Core/DolphinQt/Main.cpp                |   4 +
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |   4 +
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   |  49 +++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     |   7 +
+ Source/VSProps/Base.props                     |   2 +
+ 13 files changed, 658 insertions(+), 19 deletions(-)
+ create mode 100644 Source/Core/Common/CrashReport.cpp
+ create mode 100644 Source/Core/Common/CrashReport.h
+
+diff --git a/Source/Core/Common/CMakeLists.txt b/Source/Core/Common/CMakeLists.txt
+index 97d8ad8..31626f6 100644
+--- a/Source/Core/Common/CMakeLists.txt
++++ b/Source/Core/Common/CMakeLists.txt
+@@ -37,6 +37,8 @@ add_library(common
+   Config/Layer.h
+   Contains.h
+   CPUDetect.h
++  CrashReport.cpp
++  CrashReport.h
+   Crypto/AES.cpp
+   Crypto/AES.h
+   Crypto/bn.cpp
+diff --git a/Source/Core/Common/CrashReport.cpp b/Source/Core/Common/CrashReport.cpp
+new file mode 100644
+index 0000000..6d7bda4
+--- /dev/null
++++ b/Source/Core/Common/CrashReport.cpp
+@@ -0,0 +1,404 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#include "Common/CrashReport.h"
++
++#include <cstddef>
++#include <cstring>
++#include <ctime>
++#include <string>
++
++#if defined(_WIN32)
++#include <windows.h>
++#elif !defined(ANDROID)
++#include <dlfcn.h>
++#include <execinfo.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <unistd.h>
++#endif
++
++#include "Common/CommonTypes.h"
++#include "Common/FileUtil.h"
++#include "Common/Version.h"
++
++namespace Common::CrashReport
++{
++#ifdef ANDROID
++// Android has tombstones (and the CI keeps the unstripped libmain.so), and
++// bionic has no <execinfo.h>: nothing to install.
++void Install(const std::string& /*directory*/)
++{
++}
++#else
++namespace
++{
++// Fixed at Install() so the handlers never allocate, lock, or call into
++// anything that may be mid-crash. Every buffer below lives on the stack or in
++// static storage; the formatting helpers are deliberately trivial.
++char s_directory[1024] = {};
++char s_version[128] = {};
++
++size_t Put(char* buf, size_t cap, size_t pos, const char* s)
++{
++  while (*s != '\0' && pos + 1 < cap)
++    buf[pos++] = *s++;
++  buf[pos] = '\0';
++  return pos;
++}
++
++size_t PutHex(char* buf, size_t cap, size_t pos, u64 value)
++{
++  static const char digits[] = "0123456789abcdef";
++  char tmp[19];
++  int n = 0;
++  do
++  {
++    tmp[n++] = digits[value & 0xF];
++    value >>= 4;
++  } while (value != 0 && n < 16);
++  pos = Put(buf, cap, pos, "0x");
++  while (n > 0 && pos + 1 < cap)
++    buf[pos++] = tmp[--n];
++  buf[pos] = '\0';
++  return pos;
++}
++
++size_t PutDec(char* buf, size_t cap, size_t pos, u64 value)
++{
++  char tmp[21];
++  int n = 0;
++  do
++  {
++    tmp[n++] = static_cast<char>('0' + value % 10);
++    value /= 10;
++  } while (value != 0 && n < 20);
++  while (n > 0 && pos + 1 < cap)
++    buf[pos++] = tmp[--n];
++  buf[pos] = '\0';
++  return pos;
++}
++
++const char* BaseName(const char* path)
++{
++  const char* base = path;
++  for (const char* p = path; *p != '\0'; ++p)
++  {
++    if (*p == '/' || *p == '\\')
++      base = p + 1;
++  }
++  return base;
++}
++
++// <directory>/crash_YYYYMMDD_HHMMSS.txt -- the same naming as the session logs
++// in that folder, so "the newest file" is the crash when one just happened.
++void BuildPath(char* out, size_t cap)
++{
++  const std::time_t now = std::time(nullptr);
++  std::tm tm{};
++#ifdef _WIN32
++  localtime_s(&tm, &now);
++#else
++  localtime_r(&now, &tm);
++#endif
++  char stamp[32] = "unknown";
++  std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &tm);
++  size_t pos = Put(out, cap, 0, s_directory);
++  pos = Put(out, cap, pos, "crash_");
++  pos = Put(out, cap, pos, stamp);
++  Put(out, cap, pos, ".txt");
++}
++
++#ifdef _WIN32
++void Write(HANDLE file, const char* s)
++{
++  DWORD written = 0;
++  WriteFile(file, s, static_cast<DWORD>(std::strlen(s)), &written, nullptr);
++}
++
++const char* ExceptionName(DWORD code)
++{
++  switch (code)
++  {
++  case EXCEPTION_ACCESS_VIOLATION:
++    return "access violation";
++  case EXCEPTION_STACK_OVERFLOW:
++    return "stack overflow";
++  case EXCEPTION_ILLEGAL_INSTRUCTION:
++    return "illegal instruction";
++  case EXCEPTION_PRIV_INSTRUCTION:
++    return "privileged instruction";
++  case EXCEPTION_IN_PAGE_ERROR:
++    return "in-page error";
++  case EXCEPTION_INT_DIVIDE_BY_ZERO:
++    return "integer divide by zero";
++  case EXCEPTION_BREAKPOINT:
++    return "breakpoint";
++  case 0xE06D7363:
++    return "unhandled C++ exception";
++  case 0x40000015:
++    return "abort() (fatal app exit)";
++  default:
++    return "exception";
++  }
++}
++
++LONG WINAPI Filter(EXCEPTION_POINTERS* info)
++{
++  char path[1200];
++  BuildPath(path, sizeof(path));
++  const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
++                                  FILE_ATTRIBUTE_NORMAL, nullptr);
++  if (file == INVALID_HANDLE_VALUE)
++    return EXCEPTION_CONTINUE_SEARCH;
++
++  char line[600];
++  size_t pos = Put(line, sizeof(line), 0, "OrreLink crash report (windows)\nversion=");
++  pos = Put(line, sizeof(line), pos, s_version);
++  pos = Put(line, sizeof(line), pos, "\nthread=");
++  pos = PutDec(line, sizeof(line), pos, GetCurrentThreadId());
++  Put(line, sizeof(line), pos, "\n");
++  Write(file, line);
++
++  const EXCEPTION_RECORD* record = info->ExceptionRecord;
++  pos = Put(line, sizeof(line), 0, "exception=");
++  pos = PutHex(line, sizeof(line), pos, record->ExceptionCode);
++  pos = Put(line, sizeof(line), pos, " (");
++  pos = Put(line, sizeof(line), pos, ExceptionName(record->ExceptionCode));
++  pos = Put(line, sizeof(line), pos, ") at ");
++  pos = PutHex(line, sizeof(line), pos, reinterpret_cast<u64>(record->ExceptionAddress));
++  if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
++       record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
++      record->NumberParameters >= 2)
++  {
++    pos = Put(line, sizeof(line), pos,
++              record->ExceptionInformation[0] == 1 ? " writing " :
++              record->ExceptionInformation[0] == 8 ? " executing " :
++                                                     " reading ");
++    pos = PutHex(line, sizeof(line), pos, record->ExceptionInformation[1]);
++  }
++  Put(line, sizeof(line), pos, "\n");
++  Write(file, line);
++
++#ifdef _M_X64
++  // Walk the faulting thread with the OS unwinder. Each frame prints as
++  // module+offset (offset from the module's load address), which the .map/PDB
++  // of the same build turns into a function name. The walk itself may fault on
++  // a corrupted stack; __try keeps whatever was written so far (the file is
++  // written line by line). A stack overflow usually gets no report at all:
++  // this filter runs on the exhausted stack.
++  CONTEXT ctx = *info->ContextRecord;
++  __try
++  {
++    pos = Put(line, sizeof(line), 0, "rip=");
++    pos = PutHex(line, sizeof(line), pos, ctx.Rip);
++    pos = Put(line, sizeof(line), pos, " rsp=");
++    pos = PutHex(line, sizeof(line), pos, ctx.Rsp);
++    pos = Put(line, sizeof(line), pos, " rbp=");
++    pos = PutHex(line, sizeof(line), pos, ctx.Rbp);
++    Put(line, sizeof(line), pos, "\nbacktrace:\n");
++    Write(file, line);
++
++    for (int frame = 0; frame < 64; ++frame)
++    {
++      const DWORD64 pc = ctx.Rip;
++      if (pc == 0)
++        break;
++
++      HMODULE hmodule = nullptr;
++      GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                         reinterpret_cast<LPCSTR>(pc), &hmodule);
++      char name[MAX_PATH] = "?";
++      if (hmodule != nullptr)
++        GetModuleFileNameA(hmodule, name, MAX_PATH);
++
++      pos = Put(line, sizeof(line), 0, "  #");
++      pos = PutDec(line, sizeof(line), pos, static_cast<u64>(frame));
++      pos = Put(line, sizeof(line), pos, " pc=");
++      pos = PutHex(line, sizeof(line), pos, pc);
++      pos = Put(line, sizeof(line), pos, " ");
++      pos = Put(line, sizeof(line), pos, BaseName(name));
++      pos = Put(line, sizeof(line), pos, "+");
++      pos = PutHex(line, sizeof(line), pos,
++                   hmodule ? pc - reinterpret_cast<DWORD64>(hmodule) : 0);
++      Put(line, sizeof(line), pos, "\n");
++      Write(file, line);
++
++      DWORD64 image_base = 0;
++      PRUNTIME_FUNCTION function = RtlLookupFunctionEntry(pc, &image_base, nullptr);
++      if (function == nullptr)
++      {
++        // Leaf function without unwind data: the return address is on top of
++        // the stack. Stop rather than read an unmapped stack.
++        if (IsBadReadPtr(reinterpret_cast<const void*>(ctx.Rsp), sizeof(DWORD64)))
++          break;
++        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
++        ctx.Rsp += sizeof(DWORD64);
++        continue;
++      }
++      void* handler_data = nullptr;
++      DWORD64 establisher_frame = 0;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, pc, function, &ctx, &handler_data,
++                       &establisher_frame, nullptr);
++      if (ctx.Rip == pc)
++        break;
++    }
++  }
++  __except (EXCEPTION_EXECUTE_HANDLER)
++  {
++    Write(file, "  (unwind aborted: the stack walk itself faulted)\n");
++  }
++#else
++  Write(file, "backtrace: (no unwinder on this architecture)\n");
++#endif
++
++  CloseHandle(file);
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++#else  // POSIX
++
++const char* SignalName(int sig)
++{
++  switch (sig)
++  {
++  case SIGSEGV:
++    return "SIGSEGV";
++  case SIGBUS:
++    return "SIGBUS";
++  case SIGILL:
++    return "SIGILL";
++  case SIGFPE:
++    return "SIGFPE";
++  case SIGABRT:
++    return "SIGABRT";
++  case SIGTRAP:
++    return "SIGTRAP";
++  default:
++    return "signal";
++  }
++}
++
++void WriteAll(int fd, const char* s)
++{
++  size_t left = std::strlen(s);
++  while (left > 0)
++  {
++    const ssize_t n = write(fd, s, left);
++    if (n <= 0)
++      return;
++    s += n;
++    left -= static_cast<size_t>(n);
++  }
++}
++
++// Post-mortem scratch lives in static storage: the JIT's fault handler
++// (MemTools) re-raises to this one on its own ~8 KiB alternate stack.
++char s_path[1200];
++char s_line[600];
++void* s_frames[64];
++
++void Handler(int sig, siginfo_t* info, void* /*context*/)
++{
++  char* const path = s_path;
++  BuildPath(path, sizeof(s_path));
++  const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
++  if (fd >= 0)
++  {
++    char* const line = s_line;
++    size_t pos = Put(line, sizeof(s_line), 0, "OrreLink crash report (posix)\nversion=");
++    pos = Put(line, sizeof(s_line), pos, s_version);
++    pos = Put(line, sizeof(s_line), pos, "\nsignal=");
++    pos = PutDec(line, sizeof(s_line), pos, static_cast<u64>(sig));
++    pos = Put(line, sizeof(s_line), pos, " (");
++    pos = Put(line, sizeof(s_line), pos, SignalName(sig));
++    pos = Put(line, sizeof(s_line), pos, ") code=");
++    pos = PutDec(line, sizeof(s_line), pos, static_cast<u64>(info ? info->si_code : 0));
++    pos = Put(line, sizeof(s_line), pos, " addr=");
++    pos = PutHex(line, sizeof(s_line), pos,
++                 reinterpret_cast<u64>(info ? info->si_addr : nullptr));
++    Put(line, sizeof(s_line), pos, "\nbacktrace (module+offset):\n");
++    WriteAll(fd, line);
++
++    void** const frames = s_frames;
++    const int count = backtrace(frames, 64);
++    for (int i = 0; i < count; ++i)
++    {
++      Dl_info dl{};
++      const bool known = dladdr(frames[i], &dl) != 0 && dl.dli_fname != nullptr;
++      pos = Put(line, sizeof(s_line), 0, "  #");
++      pos = PutDec(line, sizeof(s_line), pos, static_cast<u64>(i));
++      pos = Put(line, sizeof(s_line), pos, " pc=");
++      pos = PutHex(line, sizeof(s_line), pos, reinterpret_cast<u64>(frames[i]));
++      pos = Put(line, sizeof(s_line), pos, " ");
++      pos = Put(line, sizeof(s_line), pos, known ? BaseName(dl.dli_fname) : "?");
++      pos = Put(line, sizeof(s_line), pos, "+");
++      pos = PutHex(line, sizeof(s_line), pos,
++                   known ? reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(dl.dli_fbase) :
++                           0);
++      if (known && dl.dli_sname != nullptr)
++      {
++        pos = Put(line, sizeof(s_line), pos, " (");
++        pos = Put(line, sizeof(s_line), pos, dl.dli_sname);
++        pos = Put(line, sizeof(s_line), pos, "+");
++        pos = PutHex(line, sizeof(s_line), pos,
++                     reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(dl.dli_saddr));
++        pos = Put(line, sizeof(s_line), pos, ")");
++      }
++      Put(line, sizeof(s_line), pos, "\n");
++      WriteAll(fd, line);
++    }
++    WriteAll(fd, "symbolized (best effort):\n");
++    backtrace_symbols_fd(frames, count, fd);
++    close(fd);
++  }
++  // Hand the signal back to the default action so the OS still writes its own
++  // crash log / core dump exactly as before.
++  signal(sig, SIG_DFL);
++  raise(sig);
++}
++
++// The alternate stack lets the handler run after a stack overflow.
++alignas(16) char s_alt_stack[256 * 1024];
++#endif
++}  // namespace
++
++void Install(const std::string& directory)
++{
++  File::CreateFullPath(directory);
++  Put(s_directory, sizeof(s_directory), 0, directory.c_str());
++  Put(s_version, sizeof(s_version), 0, Common::GetScmDescStr().c_str());
++
++#ifdef _WIN32
++  SetUnhandledExceptionFilter(Filter);
++#else
++  // First-use initialisation that must not happen inside the handler: glibc's
++  // first backtrace() dlopens libgcc_s (malloc + loader lock) and the first
++  // localtime_r() loads the zone data (malloc). A crash while the heap lock is
++  // held would otherwise deadlock here instead of dying.
++  void* warm[1];
++  backtrace(warm, 1);
++  BuildPath(s_path, sizeof(s_path));
++
++  stack_t stack{};
++  stack.ss_sp = s_alt_stack;
++  stack.ss_size = sizeof(s_alt_stack);
++  stack.ss_flags = 0;
++  sigaltstack(&stack, nullptr);
++
++  struct sigaction action{};
++  action.sa_sigaction = Handler;
++  action.sa_flags = SA_SIGINFO | SA_ONSTACK;
++  sigemptyset(&action.sa_mask);
++  // Linux: the JIT's fault handler (MemTools) is installed later, saves
++  // whatever is here as its "previous" handler, and hands it every fault that
++  // is not a fastmem access -- so this still runs for real crashes. macOS: the
++  // JIT uses Mach exception ports and never touches sigaction; unhandled
++  // faults arrive here as plain SIGSEGV/SIGBUS.
++  const int signals[] = {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP};
++  for (const int sig : signals)
++    sigaction(sig, &action, nullptr);
++#endif
++}
++#endif  // ANDROID
++}  // namespace Common::CrashReport
+diff --git a/Source/Core/Common/CrashReport.h b/Source/Core/Common/CrashReport.h
+new file mode 100644
+index 0000000..4428c3f
+--- /dev/null
++++ b/Source/Core/Common/CrashReport.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 Dolphin Emulator Project
++// SPDX-License-Identifier: GPL-2.0-or-later
++
++#pragma once
++
++#include <string>
++
++namespace Common::CrashReport
++{
++// Installs last-chance handlers (Windows: an unhandled-exception filter; POSIX:
++// fatal-signal handlers on an alternate stack) that write a plain-text report
++// into `directory` before the process dies, then hand the crash back to the OS
++// so its own behaviour (dialog, core dump, crash log) is unchanged.
++//
++// The report names every return address as module+offset, which resolves
++// offline against the build's PDB/.map (Windows), dSYM (macOS) or unstripped
++// binary (Linux) -- the CI keeps those next to each release. Desktop only;
++// Android already has tombstones. Safe to call once, early, after the user
++// directory is known; the directory is created if missing.
++void Install(const std::string& directory);
++}  // namespace Common::CrashReport
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 59e82f6..4839a2e 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <string>
+ #include <vector>
+ 
+ #include <fmt/format.h>
+@@ -965,6 +966,70 @@ int CSIDevice_GBAEmu::TransferInterval()
+   return SIDevice_GetGBATransferTime(m_system.GetSystemTimers(), m_last_cmd);
+ }
+ 
++u16 CSIDevice_GBAEmu::GbaKeysFromPad(const GCPadStatus& pad_status)
++{
++  static constexpr std::array<PadButton, 10> buttons_map = {
++      PadButton::PAD_BUTTON_A,      // A
++      PadButton::PAD_BUTTON_B,      // B
++      PadButton::PAD_TRIGGER_Z,     // Select
++      PadButton::PAD_BUTTON_START,  // Start
++      PadButton::PAD_BUTTON_RIGHT,  // Right
++      PadButton::PAD_BUTTON_LEFT,   // Left
++      PadButton::PAD_BUTTON_UP,     // Up
++      PadButton::PAD_BUTTON_DOWN,   // Down
++      PadButton::PAD_TRIGGER_R,     // R
++      PadButton::PAD_TRIGGER_L,     // L
++  };
++  u16 keys = 0;
++  for (size_t i = 0; i < buttons_map.size(); ++i)
++    keys |= static_cast<u16>(static_cast<bool>((pad_status.button & buttons_map[i])) << i);
++  return keys;
++}
++
++std::string CSIDevice_GBAEmu::DescribeGbaKeys(u16 keys)
++{
++  static constexpr std::array<const char*, 10> names = {"A",    "B",  "Select", "Start", "Right",
++                                                       "Left", "Up", "Down",   "R",     "L"};
++  std::string out;
++  for (size_t i = 0; i < names.size(); ++i)
++  {
++    if ((keys >> i) & 1)
++    {
++      if (!out.empty())
++        out += '+';
++      out += names[i];
++    }
++  }
++  return out.empty() ? "-" : out;
++}
++
++// Diagnostic only. Which buttons the emulated GBA is about to see, logged on
++// change: the missing half of every "my GBA does not respond" report so far.
++void CSIDevice_GBAEmu::LogGbaKeys(u16 keys)
++{
++  const u64 now = m_system.GetCoreTiming().GetTicks();
++  const u64 second = m_system.GetSystemTimers().GetTicksPerSecond();
++  if (now - m_diag_keys_window >= second)
++  {
++    if (m_diag_keys_dropped != 0)
++    {
++      GBADetectLog::LogEvent(m_device_number, now, "keys-dropped",
++                             fmt::format("n={}", m_diag_keys_dropped), false);
++    }
++    m_diag_keys_window = now;
++    m_diag_keys_in_window = 0;
++    m_diag_keys_dropped = 0;
++  }
++  if (m_diag_keys_in_window >= 30)
++  {
++    ++m_diag_keys_dropped;
++    return;
++  }
++  ++m_diag_keys_in_window;
++  GBADetectLog::LogEvent(m_device_number, now, "keys",
++                         fmt::format("{:03x} {}", keys, DescribeGbaKeys(keys)), false);
++}
++
+ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+ {
+   GCPadStatus pad_status{};
+@@ -1003,22 +1068,12 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+   SerialInterface::CSIDevice_GCController::HandleMoviePadStatus(m_system.GetMovie(),
+                                                                 m_device_number, &pad_status);
+ 
+-  static constexpr std::array<PadButton, 10> buttons_map = {
+-      PadButton::PAD_BUTTON_A,      // A
+-      PadButton::PAD_BUTTON_B,      // B
+-      PadButton::PAD_TRIGGER_Z,     // Select
+-      PadButton::PAD_BUTTON_START,  // Start
+-      PadButton::PAD_BUTTON_RIGHT,  // Right
+-      PadButton::PAD_BUTTON_LEFT,   // Left
+-      PadButton::PAD_BUTTON_UP,     // Up
+-      PadButton::PAD_BUTTON_DOWN,   // Down
+-      PadButton::PAD_TRIGGER_R,     // R
+-      PadButton::PAD_TRIGGER_L,     // L
+-  };
+-
+-  m_keys = 0;
+-  for (size_t i = 0; i < buttons_map.size(); ++i)
+-    m_keys |= static_cast<u16>(static_cast<bool>((pad_status.button & buttons_map[i]))) << i;
++  m_keys = GbaKeysFromPad(pad_status);
++  if (m_keys != m_diag_prev_keys)
++  {
++    m_diag_prev_keys = m_keys;
++    LogGbaKeys(m_keys);
++  }
+ 
+   // Use X button as a reset signal for NetPlay/Movies. Reset asynchronously on
+   // the core's own event thread -- the synchronous Reset() here can deadlock on
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+index 635d23d..7be0484 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.h
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <cstddef>
+ #include <memory>
++#include <string>
+ 
+ #include "Common/CommonTypes.h"
+ #include "Core/HW/SI/SI_Device.h"
+@@ -20,6 +21,8 @@ class Core;
+ 
+ class GBAHostInterface;
+ 
++struct GCPadStatus;
++
+ namespace SerialInterface
+ {
+ // One entry per SI channel; must match MAX_SI_CHANNELS (static_assert in the
+@@ -73,6 +76,12 @@ public:
+   void DoState(PointerWrap& p) override;
+   void OnEvent(u64 userdata, s64 cycles_late) override;
+ 
++  // Diagnostics shared with the netplay local-pad poll: the GBA key bitmask
++  // (bit order A, B, Select, Start, Right, Left, Up, Down, R, L) a GC pad state
++  // maps to, and its readable form ("A+Right", "-" for none).
++  static u16 GbaKeysFromPad(const GCPadStatus& pad_status);
++  static std::string DescribeGbaKeys(u16 keys);
++
+ private:
+   enum class NextAction
+   {
+@@ -113,6 +122,14 @@ private:
+   bool m_netplay_pad_is_local = true;
+   bool m_netplay_locality_cached = false;
+   u16 m_keys = 0;
++  // 'keys' log lines: one per change of the keys the emulated GBA sees
++  // (netplay-synced, so identical on every machine), at most 30 per second per
++  // socket; the overflow is counted and reported once the window rolls.
++  u16 m_diag_prev_keys = 0;
++  u64 m_diag_keys_window = 0;
++  u32 m_diag_keys_in_window = 0;
++  u32 m_diag_keys_dropped = 0;
++  void LogGbaKeys(u16 keys);
+ 
+   // Diagnostic-only mirror of the previous poll's link state, so window_count
+   // can count open edges without reading (or perturbing) m_link_was_enabled,
+diff --git a/Source/Core/Core/MemTools.cpp b/Source/Core/Core/MemTools.cpp
+index f66aca2..4b2e702 100644
+--- a/Source/Core/Core/MemTools.cpp
++++ b/Source/Core/Core/MemTools.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "Core/MemTools.h"
+ 
++#include <algorithm>
+ #include <cstdlib>
+ 
+ #include "Common/CommonFuncs.h"
+@@ -303,18 +304,29 @@ static void sigsegv_handler(int sig, siginfo_t* info, void* raw_context)
+                         old_sa_segv;
+ 
+   sigaction(sig, &old_sa, nullptr);
++  if ((old_sa.sa_flags & SA_SIGINFO) != 0 && old_sa.sa_sigaction != nullptr)
++  {
++    // Hand the original siginfo/context to the previous handler (the crash
++    // reporter) so it records the real faulting address, not a raise().
++    old_sa.sa_sigaction(sig, info, raw_context);
++    return;
++  }
+   raise(sig);
+ }
+ 
+ void InstallExceptionHandler()
+ {
++  // SIGSTKSZ is ~8 KiB on glibc: enough for this handler alone, not for the
++  // crash reporter it chains to (backtrace + dladdr) on top of an AVX-512
++  // signal frame. 64 KiB costs nothing.
++  const size_t stack_size = std::max<size_t>(SIGSTKSZ, 64 * 1024);
+   stack_t signal_stack;
+ #ifdef __FreeBSD__
+-  signal_stack.ss_sp = (char*)malloc(SIGSTKSZ);
++  signal_stack.ss_sp = (char*)malloc(stack_size);
+ #else
+-  signal_stack.ss_sp = malloc(SIGSTKSZ);
++  signal_stack.ss_sp = malloc(stack_size);
+ #endif
+-  signal_stack.ss_size = SIGSTKSZ;
++  signal_stack.ss_size = stack_size;
+   signal_stack.ss_flags = 0;
+   if (sigaltstack(&signal_stack, nullptr) != 0)
+     PanicAlertFmt("sigaltstack failed: {}", Common::LastStrerrorString());
+diff --git a/Source/Core/Core/NetPlayClient.cpp b/Source/Core/Core/NetPlayClient.cpp
+index fde2392..f756e86 100644
+--- a/Source/Core/Core/NetPlayClient.cpp
++++ b/Source/Core/Core/NetPlayClient.cpp
+@@ -53,6 +53,7 @@
+ #ifdef HAS_LIBMGBA
+ #include "Core/HW/GBACore.h"
+ #include "Core/HW/GBADetectLog.h"
++#include "Core/HW/SI/SI_DeviceGBAEmu.h"
+ #endif
+ #include "Core/HW/GBAPad.h"
+ #include "Core/HW/GCMemcard/GCMemcard.h"
+@@ -76,6 +77,7 @@
+ #include "Core/System.h"
+ #include "DiscIO/Blob.h"
+ 
++#include "InputCommon/ControlReference/ControlReference.h"
+ #include "InputCommon/GCAdapter.h"
+ #include "UICommon/GameFile.h"
+ #include "VideoCommon/OnScreenDisplay.h"
+@@ -2686,6 +2688,61 @@ bool NetPlayClient::WiimoteUpdate(const std::span<WiimoteDataBatchEntry>& entrie
+   return true;
+ }
+ 
++#ifdef HAS_LIBMGBA
++namespace
++{
++// Diagnostic only: what THIS machine's keyboard/controller produced for its own
++// GBA, before the state enters the netplay pad buffer, and whether Dolphin was
++// even reading input (gate=0 -- no game window focused and Background Input
++// off -- means every key was ignored). One line per change, budgeted like the
++// SI-side 'keys' lines; the two together separate "never pressed", "pressed but
++// ignored" and "pressed but lost in transit".
++void LogLocalGbaKeys(int ingame_pad, int local_pad, const GCPadStatus& pad_status)
++{
++  if (ingame_pad < 0 || ingame_pad >= 4)
++    return;
++  static std::array<u16, 4> prev_keys{};
++  static std::array<bool, 4> prev_gate{true, true, true, true};
++  static std::array<u64, 4> window{};
++  static std::array<u32, 4> in_window{};
++  static std::array<u32, 4> dropped{};
++
++  const u16 keys = SerialInterface::CSIDevice_GBAEmu::GbaKeysFromPad(pad_status);
++  const bool gate = ControlReference::GetInputGate();
++  if (keys == prev_keys[ingame_pad] && gate == prev_gate[ingame_pad])
++    return;
++  prev_keys[ingame_pad] = keys;
++  prev_gate[ingame_pad] = gate;
++
++  auto& system = Core::System::GetInstance();
++  const u64 now = system.GetCoreTiming().GetTicks();
++  const u64 second = system.GetSystemTimers().GetTicksPerSecond();
++  if (now - window[ingame_pad] >= second)
++  {
++    if (dropped[ingame_pad] != 0)
++    {
++      GBADetectLog::LogEvent(ingame_pad, now, "keys-local-dropped",
++                             fmt::format("n={}", dropped[ingame_pad]), false);
++    }
++    window[ingame_pad] = now;
++    in_window[ingame_pad] = 0;
++    dropped[ingame_pad] = 0;
++  }
++  if (in_window[ingame_pad] >= 30)
++  {
++    ++dropped[ingame_pad];
++    return;
++  }
++  ++in_window[ingame_pad];
++  GBADetectLog::LogEvent(ingame_pad, now, "keys-local",
++                         fmt::format("slot={} {:03x} {} gate={}", local_pad, keys,
++                                     SerialInterface::CSIDevice_GBAEmu::DescribeGbaKeys(keys),
++                                     gate ? 1 : 0),
++                         false);
++}
++}  // namespace
++#endif
++
+ bool NetPlayClient::PollLocalPad(const int local_pad, sf::Packet& packet)
+ {
+   const int ingame_pad = LocalPadToInGamePad(local_pad);
+@@ -2695,6 +2752,9 @@ bool NetPlayClient::PollLocalPad(const int local_pad, sf::Packet& packet)
+   if (m_net_settings.gba_config[ingame_pad].enabled)
+   {
+     pad_status = Pad::GetGBAStatus(local_pad);
++#ifdef HAS_LIBMGBA
++    LogLocalGbaKeys(ingame_pad, local_pad, pad_status);
++#endif
+   }
+   else if (Config::Get(Config::GetInfoForSIDevice(local_pad)) ==
+            SerialInterface::SIDEVICE_WIIU_ADAPTER)
+diff --git a/Source/Core/DolphinLib.props b/Source/Core/DolphinLib.props
+index 3a93cdb..f356781 100644
+--- a/Source/Core/DolphinLib.props
++++ b/Source/Core/DolphinLib.props
+@@ -145,6 +145,7 @@
+     <ClInclude Include="Common\MemArena.h" />
+     <ClInclude Include="Common\MemoryUtil.h" />
+     <ClInclude Include="Common\MinizipUtil.h" />
++    <ClInclude Include="Common\CrashReport.h" />
+     <ClInclude Include="Common\MsgHandler.h" />
+     <ClInclude Include="Common\Mutex.h" />
+     <ClInclude Include="Common\NandPaths.h" />
+@@ -893,6 +894,7 @@
+     <ClCompile Include="Common\Matrix.cpp" />
+     <ClCompile Include="Common\MemArenaWin.cpp" />
+     <ClCompile Include="Common\MemoryUtil.cpp" />
++    <ClCompile Include="Common\CrashReport.cpp" />
+     <ClCompile Include="Common\MsgHandler.cpp" />
+     <ClCompile Include="Common\NandPaths.cpp" />
+     <ClCompile Include="Common\Network.cpp" />
+diff --git a/Source/Core/DolphinQt/Main.cpp b/Source/Core/DolphinQt/Main.cpp
+index 7f8f9b9..d4d8806 100644
+--- a/Source/Core/DolphinQt/Main.cpp
++++ b/Source/Core/DolphinQt/Main.cpp
+@@ -21,6 +21,8 @@
+ #include <QWidget>
+ 
+ #include "Common/Config/Config.h"
++#include "Common/CrashReport.h"
++#include "Common/FileUtil.h"
+ #include "Common/MsgHandler.h"
+ #include "Common/ScopeGuard.h"
+ #include "Common/StringUtil.h"
+@@ -193,6 +195,8 @@ int main(int argc, char* argv[])
+ 
+   UICommon::SetUserDirectory(static_cast<const char*>(options.get("user")));
+   UICommon::CreateDirectories();
++  // Crash reports land next to the session logs, so Share Log's folder has them.
++  Common::CrashReport::Install(File::GetUserPath(D_GBAUSER_IDX));
+   UICommon::Init();
+   Resources::Init();
+   Settings::Instance().SetBatchModeEnabled(options.is_set("batch"));
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 4ea0a9e..a376da3 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -342,6 +342,10 @@ XDLauncherDialog::XDLauncherDialog(const GameListModel& game_list_model, QWidget
+ {
+   setWindowTitle(tr("OrreLink Launcher"));
+ 
++  // Old "Use defaults" mappings (T/G/F/H) become the current WASD ones here,
++  // before the checklist reads them.
++  XDNetplay::MigrateLegacyGbaDefaults();
++
+   CreateMainLayout();
+   ConnectWidgets();
+ }
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index b67bf21..16ddd87 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -327,6 +327,55 @@ bool GbaInputMapped()
+   return GbaSlotMapped(0) && GbaSlotMapped(1);
+ }
+ 
++namespace
++{
++std::vector<std::string> GbaGroupExpressions(int slot, GBAPadGroup group)
++{
++  std::vector<std::string> out;
++  const ControllerEmu::ControlGroup* controls = Pad::GetGBAGroup(slot, group);
++  if (!controls)
++    return out;
++  for (const auto& control : controls->controls)
++    out.push_back(control->control_ref ? control->control_ref->GetExpression() : std::string());
++  return out;
++}
++}  // namespace
++
++bool MigrateLegacyGbaDefaults()
++{
++  if (!Pad::IsGBAInitialized())
++    return false;
++
++  // Exactly the 1.5.12 defaults: D-pad Up/Down/Left/Right and the L/R pair;
++  // A, B, Start, Select did not change and are not checked.
++  static const std::vector<std::string> legacy_dpad = {"`T`", "`G`", "`F`", "`H`"};
++  InputConfig* const config = Pad::GetGBAConfig();
++  bool changed = false;
++  for (int slot = 0; slot < config->GetControllerCount(); ++slot)
++  {
++    const std::vector<std::string> dpad = GbaGroupExpressions(slot, GBAPadGroup::DPad);
++    const std::vector<std::string> buttons = GbaGroupExpressions(slot, GBAPadGroup::Buttons);
++    // Buttons group order: B, A, L, R, Select, Start.
++    if (dpad != legacy_dpad || buttons.size() < 4 || buttons[2] != "`Q`" || buttons[3] != "`W`")
++      continue;
++    // Only the six keys that moved; A/B/Start/Select and the device stay as
++    // the player has them.
++    ControllerEmu::ControlGroup* const dpad_group = Pad::GetGBAGroup(slot, GBAPadGroup::DPad);
++    ControllerEmu::ControlGroup* const button_group =
++        Pad::GetGBAGroup(slot, GBAPadGroup::Buttons);
++    dpad_group->SetControlExpression(0, "`W`");
++    dpad_group->SetControlExpression(1, "`S`");
++    dpad_group->SetControlExpression(2, "`A`");
++    dpad_group->SetControlExpression(3, "`D`");
++    button_group->SetControlExpression(3, "`E`");
++    config->GetController(slot)->UpdateReferences(g_controller_interface);
++    changed = true;
++  }
++  if (changed)
++    config->SaveConfig();
++  return changed;
++}
++
+ bool ApplyDefaultGbaInput()
+ {
+   if (!Pad::IsGBAInitialized())
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index cf440dc..cd8b72a 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -99,6 +99,13 @@ bool GbaInputMapped();
+ // Loads Dolphin's default keyboard/controller mapping onto GBA 1 and saves it.
+ bool ApplyDefaultGbaInput();
+ 
++// A GBA slot whose D-pad and L/R are exactly what an older launcher's "Use
++// defaults" wrote (T/G/F/H, Q/W) gets those six keys moved to the current
++// defaults (W/S/A/D, Q/E) once, silently; its other buttons and its device are
++// untouched, and any other mapping is left alone. Returns true if any slot was
++// rewritten.
++bool MigrateLegacyGbaDefaults();
++
+ // Copy the bundled EMERALD-2/3.sav templates next to the imported Emerald
+ // dump's derived save paths for ports 2 and 3. Existing saves are never
+ // overwritten; missing Sys templates are tolerated.
+diff --git a/Source/VSProps/Base.props b/Source/VSProps/Base.props
+index 2d22925..d2f9616 100644
+--- a/Source/VSProps/Base.props
++++ b/Source/VSProps/Base.props
+@@ -82,6 +82,8 @@
+     <!--Link Base-->
+     <Link>
+       <GenerateDebugInformation>true</GenerateDebugInformation>
++      <GenerateMapFile>true</GenerateMapFile>
++      <MapFileName>$(OutDir)$(TargetName).map</MapFileName>
+       <TreatLinkerWarningAsErrors>true</TreatLinkerWarningAsErrors>
+       <AdditionalOptions>/experimental:deterministic %(AdditionalOptions)</AdditionalOptions>
+     </Link>
+-- 
+2.39.5 (Apple Git-154)
+
