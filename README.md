@@ -191,11 +191,27 @@ records each phase (`link-progress` lines: negotiating, upload percentage,
 client starting) for each socket in turn, which is what to send if a link ever
 does stall.
 
-- **During that wait, do not press B.** It backs you out of VS mode mid-upload
-  and that link can never complete.
+- **During that wait, do not press B — on the GameCube pad or on either GBA.**
+  It backs you out of VS mode mid-upload, and a GBA that reports B when the game
+  asks for A makes XD drop both links with a "GBA not detected" message.
 - **If nothing has happened for well over a minute**, press B, back out of VS
   mode, go in again, and let it retry. Going back in re-arms the handshake, and
   the retry has worked every time we have hit it.
+
+### The team pick (the screen most first-timers call a freeze)
+
+About 18 seconds after both GBAs are linked, each GBA shows your party and the
+GameCube screen goes still. That is the team pick, and it happens **on the GBA
+screen**: A adds a Pokémon, B removes one, and after four picks a confirm word
+goes back to the game. The GameCube screen does not move until **both** players
+have confirmed — it has waited nine minutes in a real session while one player
+worked out their keys. Two things that look identical to a hang but are not:
+
+- keys reach the game only while an OrreLink window (the game or a GBA window)
+  is the active window — Discord in front means nothing you press counts;
+- a network change on either machine (Wi-Fi dropping and reconnecting, switching
+  networks) freezes both screens at the same instant, and after 20 seconds of
+  silence the other side ends the match on its own.
 
 ## Good to know
 

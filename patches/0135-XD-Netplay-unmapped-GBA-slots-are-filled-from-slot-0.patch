@@ -1,0 +1,116 @@
+From 3028b8a68dac147482896f18da92be8300739365 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Mon, 7 Sep 2026 19:41:00 -0700
+Subject: [PATCH] XD Netplay: unmapped GBA slots are filled from slot 0 at
+ startup; the launcher explains the GBA team pick
+
+- Older launchers mapped only slot 0 while the host reads slot 1, so the
+  1.5.13 checklist showed those configs as 'not mapped' and pushed players
+  to 'Use defaults', which changed their keys without saying so. Empty
+  slots now take slot 0's mapping once, keys unchanged.
+- One line under the checklist: the team pick is on the GBA screen (A adds,
+  B removes) and the GameCube screen stays still until both confirm; the
+  tooltip carries the focus rule and the B-cancels-the-link warning.
+---
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 12 +++++++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.cpp   | 31 +++++++++++++++++++
+ .../DolphinQt/XDNetplay/XDNetplayConfig.h     | 11 ++++---
+ 3 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index a376da3..427f192 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -382,6 +382,18 @@ void XDLauncherDialog::CreateMainLayout()
+   m_gba_customize_button->setToolTip(tr("Remap the GBA buttons. Applies to every GBA slot, so it "
+                                         "works whether you join or host."));
+   checklist_layout->addWidget(m_gba_customize_button, row - 1, 3);  // beside 'Use defaults'
++  {
++    // The one phase every first-timer has called a freeze: XD draws a still
++    // screen while each player picks a team on their GBA.
++    auto* pick_note = MakeNoteLabel(
++        tr("Team pick happens on the GBA screen: A adds a Pokémon, B removes one. The GameCube "
++           "screen stays still until both players have confirmed."));
++    pick_note->setToolTip(
++        tr("Keys reach the game only while an OrreLink window (game or GBA) is the active "
++           "window. Pressing B while the GBAs are still connecting cancels the link."));
++    checklist_layout->addWidget(pick_note, row, 0, 1, 4);
++    row++;
++  }
+   checklist_layout->setColumnStretch(1, 1);
+   checklist_box->setLayout(checklist_layout);
+   layout->addWidget(checklist_box);
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+index 16ddd87..0cae0d5 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.cpp
+@@ -12,6 +12,7 @@
+ #include "Common/Config/Config.h"
+ #include "Common/Crypto/SHA1.h"
+ #include "Common/FileUtil.h"
++#include "Common/IniFile.h"
+ #include "Common/IOFile.h"
+ #include "Common/StringUtil.h"
+ 
+@@ -371,6 +372,36 @@ bool MigrateLegacyGbaDefaults()
+     config->GetController(slot)->UpdateReferences(g_controller_interface);
+     changed = true;
+   }
++  // Older launchers only ever mapped slot 0, but the host reads slot 1, so the
++  // checklist showed such a config as "not mapped" and steered the player to
++  // "Use defaults" -- which quietly changed their keys. Fill slots that have
++  // nothing at all from slot 0 instead; the keys the player knows stay as
++  // they are.
++  const auto slot_is_empty = [&](int slot) {
++    for (const GBAPadGroup group : {GBAPadGroup::DPad, GBAPadGroup::Buttons})
++    {
++      for (const std::string& expression : GbaGroupExpressions(slot, group))
++      {
++        if (!expression.empty())
++          return false;
++      }
++    }
++    return true;
++  };
++  if (!slot_is_empty(0))
++  {
++    Common::IniFile::Section section;
++    config->GetController(0)->SaveConfig(&section);
++    for (int slot = 1; slot < config->GetControllerCount(); ++slot)
++    {
++      if (!slot_is_empty(slot))
++        continue;
++      ControllerEmu::EmulatedController* const target = config->GetController(slot);
++      target->LoadConfig(&section);
++      target->UpdateReferences(g_controller_interface);
++      changed = true;
++    }
++  }
+   if (changed)
+     config->SaveConfig();
+   return changed;
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+index cd8b72a..1ec1538 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDNetplayConfig.h
+@@ -99,11 +99,12 @@ bool GbaInputMapped();
+ // Loads Dolphin's default keyboard/controller mapping onto GBA 1 and saves it.
+ bool ApplyDefaultGbaInput();
+ 
+-// A GBA slot whose D-pad and L/R are exactly what an older launcher's "Use
+-// defaults" wrote (T/G/F/H, Q/W) gets those six keys moved to the current
+-// defaults (W/S/A/D, Q/E) once, silently; its other buttons and its device are
+-// untouched, and any other mapping is left alone. Returns true if any slot was
+-// rewritten.
++// One-time repairs of older launchers' GBA mappings, run at startup: (1) a
++// slot whose D-pad and L/R are exactly the old "Use defaults" keys (T/G/F/H,
++// Q/W) gets those six moved to the current defaults (W/S/A/D, Q/E), other
++// buttons and device untouched; (2) slots with no mapping at all are filled
++// from slot 0 (older launchers mapped only slot 0; the host reads slot 1).
++// Anything else is left alone. Returns true if any slot was rewritten.
+ bool MigrateLegacyGbaDefaults();
+ 
+ // Copy the bundled EMERALD-2/3.sav templates next to the imported Emerald
+-- 
+2.39.5 (Apple Git-154)
+
