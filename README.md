@@ -305,6 +305,11 @@ and the guest's:
   A player who "can't do anything on the GBA" shows up here in one look:
   no `keys-local` lines means nothing reached Dolphin; `keys-local` without
   matching `keys` means the press was lost between the machines.
+- `session-end`, `stop-request`, `player-left` and `link-silent` — why a
+  match ended and who ended it (`kind=peer-lost` after 20 s of silence from
+  the other side, `local`/`server` stop requests, a player leaving the room),
+  each with the wall-clock time; `netlat` lines carry `wall=` too, so a
+  freeze can be matched to the minute against what the players remember.
 
 ## When the network won't let you connect
 
