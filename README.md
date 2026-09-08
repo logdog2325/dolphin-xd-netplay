@@ -33,6 +33,13 @@ refused with the reason. **Free** turns all of it off and leaves XD's menus
 alone; **OU** applies the community's OU cheat set instead. Rooms show their
 format in the lobby name (`[Orre]`, `[Hoenn-L]`, …).
 
+**Battle timer (optional).** Tick **Battle timer** under the Format and set the
+seconds per turn (default 60) and minutes per game (default 20). XD's own timer
+is pinned to those values for both players, the same way the format is, and the
+in-game rules screen shows them. Off by default; not offered for Free and OU,
+which leave XD's rules screen alone. Menus are slow over netplay, so 60 s per
+turn is the sensible minimum until a session proves smoother.
+
 **Team Editor.** Import a Showdown export or a pokepast.es link, set your
 in-game name, save. Imports assume maximum happiness unless the paste has a
 `Happiness:` line. One button raises every Pokémon to Lv. 100 in level-100
@@ -110,7 +117,7 @@ below, and it is why a guest who builds a team in their own Team Editor and then
 joins a room finds their team was not used — their local save was replaced by
 the host's. Guests hand their team over instead. It takes one button.
 
-**Format, music and battle location are the host's.** They are synced to the
+**Format, battle timer, music and battle location are the host's.** They are synced to the
 room with the host's picks; a joiner's launcher settings for those three do
 nothing in a room they join. Trainer models are per player.
 
@@ -119,7 +126,7 @@ nothing in a room they join. Trainer models are per player.
 **Set your team before you open the room.** Once it is open your guest slot
 locks, and at Start your saves are already on their way to everyone.
 
-1. Pick your **Format** (and any Battle Style picks) in the launcher.
+1. Pick your **Format** (plus the Battle timer or any Battle Style picks) in the launcher.
 2. Open the **Team Editor** and set the dropdown at the top to
    **Host — GBA port 2**. That is your slot.
 3. **Import** a Showdown export or a pokepast.es link, set your in-game name,

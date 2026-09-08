@@ -1,0 +1,573 @@
+From 223d0f111164a23e24e33428ad0ff277091736f9 Mon Sep 17 00:00:00 2001
+From: logdog2325 <loganjayfisher@gmail.com>
+Date: Tue, 8 Sep 2026 14:44:06 -0700
+Subject: [PATCH] XD Netplay v1.5.15: host-side battle timer folded into the
+ format rules pin
+
+- Word 5 of XD's Custom-1 rules record is the timer pair: s16 +0x14 minutes
+  per game (the game multiplies by 60), s16 +0x16 seconds per turn; the sign
+  is the switch (rules screen negates to turn OFF; enable wrappers require
+  > 0); read live by the battle through the record getters. When the new
+  MAIN_XD_TIMER_ENABLED is on and a rules format is picked, FormatRuleLines
+  pins (game_min << 16) | turn_s instead of the stock 0xFFC4FFEC, clamped to
+  the rules screen's own ranges (1..99 min, 10..99 s) so it also renders.
+- Launcher (desktop and Android): a Battle timer checkbox with two number
+  fields under the Format pick, default off, 60 s / 20 min; greyed for Free
+  and OU, which pin no record.
+- Log: 'battlestyle timer 60s/20min word=...' when live; timer= on the
+  cheats line.
+- XDNetplay::VERSION 1.5.15.
+---
+ .../features/settings/model/BooleanSetting.kt |   8 ++
+ .../features/settings/model/IntSetting.kt     |  15 +++
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  27 ++++
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 121 +++++++++++++++++-
+ .../app/src/main/res/values/strings.xml       |   6 +
+ Source/Core/Core/Config/MainSettings.cpp      |   3 +
+ Source/Core/Core/Config/MainSettings.h        |   9 ++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  |  63 +++++++++
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |   8 ++
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   |  42 +++++-
+ Source/Core/UICommon/XDNetplay/Version.h      |   2 +-
+ 11 files changed, 299 insertions(+), 5 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index 4235494..7d365f2 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -1007,6 +1007,14 @@ enum class BooleanSetting(
+         Settings.SECTION_INI_XD_NETPLAY,
+         "SubmitUseSave",
+         false
++    ),
++
++    // Same key as the C++ MAIN_XD_TIMER_ENABLED (host's battle timer switch).
++    MAIN_XD_TIMER_ENABLED(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "TimerEnabled",
++        false
+     );
+ 
+     override val isOverridden: Boolean
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+index e26324e..6e341d4 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/IntSetting.kt
+@@ -209,6 +209,21 @@ enum class IntSetting(
+         Settings.SECTION_INI_XD_NETPLAY,
+         "Format",
+         0
++    ),
++
++    // Same keys as the C++ MAIN_XD_TIMER_TURN_SECONDS / _GAME_MINUTES: the
++    // host's battle timer, folded into the format rules pin by shared core.
++    MAIN_XD_TIMER_TURN_SECONDS(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "TimerTurnSeconds",
++        60
++    ),
++    MAIN_XD_TIMER_GAME_MINUTES(
++        Settings.FILE_DOLPHIN,
++        Settings.SECTION_INI_XD_NETPLAY,
++        "TimerGameMinutes",
++        20
+     );
+ 
+     override val isOverridden: Boolean
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index a5c07d8..9a90d22 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -84,6 +84,12 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     // gates in shared core read when this device hosts; a pick here is
+     // already "applied".
+     private var formatId by mutableStateOf(FormatBridge.FORMAT_FREE)
++    // Host's battle timer (native Main/XDNetplay/Timer* keys). Applied by
++    // shared core through the same rules pin as the format when this device
++    // hosts with a rules format; a joiner's values do nothing.
++    private var timerEnabled by mutableStateOf(false)
++    private var timerTurnSeconds by mutableStateOf(60)
++    private var timerGameMinutes by mutableStateOf(20)
+     private var practiceDummy by mutableStateOf(false)
+ 
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+@@ -357,6 +363,24 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                         IntSetting.MAIN_XD_FORMAT.setInt(NativeConfig.LAYER_BASE, id)
+                         NativeConfig.save(NativeConfig.LAYER_BASE)
+                     },
++                    timerEnabled = timerEnabled,
++                    onTimerEnabledChanged = { on ->
++                        timerEnabled = on
++                        BooleanSetting.MAIN_XD_TIMER_ENABLED.setBoolean(NativeConfig.LAYER_BASE, on)
++                        NativeConfig.save(NativeConfig.LAYER_BASE)
++                    },
++                    timerTurnSeconds = timerTurnSeconds,
++                    onTimerTurnSecondsChanged = { v ->
++                        timerTurnSeconds = v
++                        IntSetting.MAIN_XD_TIMER_TURN_SECONDS.setInt(NativeConfig.LAYER_BASE, v)
++                        NativeConfig.save(NativeConfig.LAYER_BASE)
++                    },
++                    timerGameMinutes = timerGameMinutes,
++                    onTimerGameMinutesChanged = { v ->
++                        timerGameMinutes = v
++                        IntSetting.MAIN_XD_TIMER_GAME_MINUTES.setInt(NativeConfig.LAYER_BASE, v)
++                        NativeConfig.save(NativeConfig.LAYER_BASE)
++                    },
+                     onBattle = { NetplaySetupActivity.launch(this) },
+                     onSearchForMatch = { searchForMatch() },
+                     searching = searching,
+@@ -564,6 +588,9 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         musicId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_MUSIC)
+         venueId = BattleStyleBridge.getSelection(BattleStyleBridge.SELECTION_VENUE)
+         formatId = IntSetting.MAIN_XD_FORMAT.int
++        timerEnabled = BooleanSetting.MAIN_XD_TIMER_ENABLED.boolean
++        timerTurnSeconds = IntSetting.MAIN_XD_TIMER_TURN_SECONDS.int
++        timerGameMinutes = IntSetting.MAIN_XD_TIMER_GAME_MINUTES.int
+         practiceDummy = BooleanSetting.MAIN_GBA_PRACTICE_DUMMY.boolean
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 73b6bb7..72e75aa 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -29,6 +29,14 @@ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
+ import androidx.compose.material3.TextButton
+ import androidx.compose.runtime.Composable
++import androidx.compose.material3.Checkbox
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
+ import androidx.compose.ui.Alignment
+ import androidx.compose.ui.Modifier
+ import androidx.compose.ui.res.stringResource
+@@ -87,6 +95,12 @@ fun XDLauncherScreen(
+     onVenueChanged: (Int) -> Unit,
+     formatId: Int,
+     onFormatChanged: (Int) -> Unit,
++    timerEnabled: Boolean,
++    onTimerEnabledChanged: (Boolean) -> Unit,
++    timerTurnSeconds: Int,
++    onTimerTurnSecondsChanged: (Int) -> Unit,
++    timerGameMinutes: Int,
++    onTimerGameMinutesChanged: (Int) -> Unit,
+     onSearchForMatch: () -> Unit,
+     searching: Boolean,
+     onFindBattles: () -> Unit,
+@@ -203,7 +217,13 @@ fun XDLauncherScreen(
+                     onMusicChanged = onMusicChanged,
+                     onVenueChanged = onVenueChanged,
+                     formatId = formatId,
+-                    onFormatChanged = onFormatChanged
++                    onFormatChanged = onFormatChanged,
++                    timerEnabled = timerEnabled,
++                    onTimerEnabledChanged = onTimerEnabledChanged,
++                    timerTurnSeconds = timerTurnSeconds,
++                    onTimerTurnSecondsChanged = onTimerTurnSecondsChanged,
++                    timerGameMinutes = timerGameMinutes,
++                    onTimerGameMinutesChanged = onTimerGameMinutesChanged
+                 )
+                 Spacer(Modifier.height(12.dp))
+                 // The headline action: no codes to trade, no lobby to read.
+@@ -273,7 +293,13 @@ private fun BattleStyleCard(
+     onMusicChanged: (Int) -> Unit,
+     onVenueChanged: (Int) -> Unit,
+     formatId: Int,
+-    onFormatChanged: (Int) -> Unit
++    onFormatChanged: (Int) -> Unit,
++    timerEnabled: Boolean,
++    onTimerEnabledChanged: (Boolean) -> Unit,
++    timerTurnSeconds: Int,
++    onTimerTurnSecondsChanged: (Int) -> Unit,
++    timerGameMinutes: Int,
++    onTimerGameMinutesChanged: (Int) -> Unit
+ ) {
+     Card(modifier = Modifier.fillMaxWidth()) {
+         Column(
+@@ -361,6 +387,15 @@ private fun BattleStyleCard(
+                     }
+                 }
+             )
++            BattleTimerRow(
++                enabled = FormatBridge.hasTeamRules(formatId),
++                checked = timerEnabled,
++                onCheckedChange = onTimerEnabledChanged,
++                turnSeconds = timerTurnSeconds,
++                onTurnSecondsChanged = onTimerTurnSecondsChanged,
++                gameMinutes = timerGameMinutes,
++                onGameMinutesChanged = onTimerGameMinutesChanged
++            )
+             Text(
+                 text = stringResource(R.string.xd_style_section_hint),
+                 style = MaterialTheme.typography.bodySmall,
+@@ -614,3 +649,85 @@ private fun CheckRow(
+         }
+     }
+ }
++
++/**
++ * Host's battle timer: one word of the same rules record the Format pins, so it
++ * only exists where a record is pinned (enabled = a rules format is picked).
++ * Values are committed only inside the game's own editable ranges; shared core
++ * clamps again at emit time.
++ */
++@Composable
++private fun BattleTimerRow(
++    enabled: Boolean,
++    checked: Boolean,
++    onCheckedChange: (Boolean) -> Unit,
++    turnSeconds: Int,
++    onTurnSecondsChanged: (Int) -> Unit,
++    gameMinutes: Int,
++    onGameMinutesChanged: (Int) -> Unit
++) {
++    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Checkbox(
++                checked = checked && enabled,
++                onCheckedChange = onCheckedChange,
++                enabled = enabled
++            )
++            Text(
++                text = stringResource(R.string.xd_timer_label),
++                style = MaterialTheme.typography.bodyLarge
++            )
++        }
++        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
++            NumberField(
++                label = stringResource(R.string.xd_timer_turn_label),
++                value = turnSeconds,
++                range = 10..99,
++                enabled = enabled && checked,
++                onCommit = onTurnSecondsChanged,
++                modifier = Modifier.weight(1f)
++            )
++            NumberField(
++                label = stringResource(R.string.xd_timer_game_label),
++                value = gameMinutes,
++                range = 1..99,
++                enabled = enabled && checked,
++                onCommit = onGameMinutesChanged,
++                modifier = Modifier.weight(1f)
++            )
++        }
++        Text(
++            text = stringResource(
++                if (enabled) R.string.xd_timer_hint else R.string.xd_timer_hint_off
++            ),
++            style = MaterialTheme.typography.bodySmall,
++            color = MaterialTheme.colorScheme.onSurfaceVariant
++        )
++    }
++}
++
++@Composable
++private fun NumberField(
++    label: String,
++    value: Int,
++    range: IntRange,
++    enabled: Boolean,
++    onCommit: (Int) -> Unit,
++    modifier: Modifier
++) {
++    // Digits are held in the field while typed; only an in-range number is
++    // committed, so a half-typed "6" never lands as a 6-second turn.
++    var text by remember(value) { mutableStateOf(value.toString()) }
++    OutlinedTextField(
++        value = text,
++        onValueChange = { typed ->
++            text = typed.filter { it.isDigit() }.take(2)
++            text.toIntOrNull()?.let { if (it in range) onCommit(it) }
++        },
++        label = { Text(label) },
++        singleLine = true,
++        enabled = enabled,
++        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++        modifier = modifier
++    )
++}
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 14592b9..231d8b6 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -1148,6 +1148,12 @@ It can efficiently compress both junk data and encrypted Wii data.
+     <string name="xd_format_hint_hoenn_suffix">" Entries: bring 6, pick 3."</string>
+     <string name="xd_format_hint_hoenn_standard">Applies to rooms you host (listed with a [Hoenn] tag): no Mewtwo, Mew, Lugia, Ho-Oh, Celebi, Kyogre, Groudon, Rayquaza, Jirachi, or Deoxys; no duplicate species; no duplicate held items; Soul Dew banned. Sleep, Freeze, and Self-KO clauses are enforced by the game itself.</string>
+     <string name="xd_format_hint_orre">Applies to rooms you host (listed with an [Orre] tag): no Mewtwo, Mew, Lugia, Ho-Oh, Celebi, Kyogre, Groudon, Rayquaza, Jirachi, or Deoxys; no duplicate species; no duplicate held items; Soul Dew banned. Sleep, Freeze, and Self-KO clauses are enforced by the game itself.</string>
++    <!-- Host-side battle timer, folded into the format rules pin. -->
++    <string name="xd_timer_label">Battle timer</string>
++    <string name="xd_timer_turn_label">Seconds per turn</string>
++    <string name="xd_timer_game_label">Minutes per game</string>
++    <string name="xd_timer_hint">Host only: XD\'s timer is pinned to these values for both players, like the format.</string>
++    <string name="xd_timer_hint_off">Needs an Orre or Hoenn format — Free and OU leave XD\'s rules screen alone.</string>
+     <!-- Non-blocking paste-time note; %1$s is a reason from shared core,
+          e.g. "banned species: Kyogre". -->
+     <string name="xd_format_note">note: this team is not %1$s legal - %2$s</string>
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index f390b9a..f648027 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -428,6 +428,9 @@ const Info<int> MAIN_XD_STYLE_GUEST_MODEL{{System::Main, "XDNetplay", "StyleGues
+ const Info<int> MAIN_XD_STYLE_MUSIC{{System::Main, "XDNetplay", "StyleMusic"}, 0};
+ const Info<int> MAIN_XD_STYLE_VENUE{{System::Main, "XDNetplay", "StyleVenue"}, 0};
+ const Info<int> MAIN_XD_FORMAT{{System::Main, "XDNetplay", "Format"}, 0};
++const Info<bool> MAIN_XD_TIMER_ENABLED{{System::Main, "XDNetplay", "TimerEnabled"}, false};
++const Info<int> MAIN_XD_TIMER_TURN_SECONDS{{System::Main, "XDNetplay", "TimerTurnSeconds"}, 60};
++const Info<int> MAIN_XD_TIMER_GAME_MINUTES{{System::Main, "XDNetplay", "TimerGameMinutes"}, 20};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_2{{System::Main, "XDNetplay", "ImportedSave2"}, ""};
+ const Info<std::string> MAIN_XD_IMPORTED_SAVE_3{{System::Main, "XDNetplay", "ImportedSave3"}, ""};
+ const Info<std::string> MAIN_XD_SUBMIT_TEAM_B64{{System::Main, "XDNetplay", "SubmitTeamB64"}, ""};
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index de79601..a469da1 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -256,6 +256,15 @@ extern const Info<int> MAIN_XD_STYLE_VENUE;
+ // a joiner's own value is irrelevant while joining. Unknown values behave as
+ // Free, never clamped.
+ extern const Info<int> MAIN_XD_FORMAT;
++// Host-side battle timer, folded into the format rules pin: when enabled and
++// the Format pins a rules record, BattleCustomizer emits that record's timer
++// word (+0x14 s16 minutes per game, +0x16 s16 seconds per turn; positive = on)
++// with these values instead of the stock "60 min / 20 s, both off". Free and
++// OU pin no record, so the timer is inert there. Clamped at emit time to the
++// game's own editable ranges (game 1..99 min, turn 10..99 s).
++extern const Info<bool> MAIN_XD_TIMER_ENABLED;
++extern const Info<int> MAIN_XD_TIMER_TURN_SECONDS;
++extern const Info<int> MAIN_XD_TIMER_GAME_MINUTES;
+ 
+ // Display filename of the user save imported over a GBA socket's team save by
+ // UICommon/XDNetplay/SaveImport; "" = the bundled team-editor save. Display
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index 427f192..d01d2e8 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <QAbstractItemModel>
+ #include <QCheckBox>
++#include <QHBoxLayout>
++#include <QSpinBox>
+ #include <QDesktopServices>
+ #include <QDir>
+ #include <QComboBox>
+@@ -549,6 +551,34 @@ void XDLauncherDialog::CreateMainLayout()
+     m_format_combo->addItem(
+         QString::fromUtf8(XDNetplay::FormatRules::FormatDisplayName(format_id)), format_id);
+   }
++  {
++    // Battle timer: the other non-cosmetic pick. It is one word of the same
++    // Custom-1 record the Format pins, so it only exists where a record is
++    // pinned; RefreshTimerRow greys it for Free/OU.
++    const QString timer_tip =
++        tr("Host only. XD's per-turn and per-game timer, pinned for both players like the "
++           "format. Needs an Orre or Hoenn format; off by default.");
++    m_timer_check = new QCheckBox(tr("Battle timer"));
++    m_timer_turn_spin = new QSpinBox;
++    m_timer_turn_spin->setRange(10, 99);
++    m_timer_turn_spin->setSuffix(tr(" s per turn"));
++    m_timer_game_spin = new QSpinBox;
++    m_timer_game_spin->setRange(1, 99);
++    m_timer_game_spin->setSuffix(tr(" min per game"));
++    for (QWidget* w : {static_cast<QWidget*>(m_timer_check),
++                       static_cast<QWidget*>(m_timer_turn_spin),
++                       static_cast<QWidget*>(m_timer_game_spin)})
++    {
++      w->setToolTip(timer_tip);
++    }
++    auto* timer_fields = new QHBoxLayout;
++    timer_fields->addWidget(m_timer_turn_spin);
++    timer_fields->addWidget(m_timer_game_spin);
++    timer_fields->addStretch(1);
++    style_layout->addWidget(m_timer_check, style_row, 0);
++    style_layout->addLayout(timer_fields, style_row, 1);
++    style_row++;
++  }
+   const auto populate_style_combo =
+       [this](QComboBox* combo, std::span<const XDNetplay::BattleCustomizer::StyleOption> table,
+              bool model_table, bool terrain_suffix) {
+@@ -805,6 +835,22 @@ void XDLauncherDialog::ConnectWidgets()
+   connect_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
+   connect_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
+   connect_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
++  connect(m_timer_check, &QCheckBox::toggled, this, [this](bool checked) {
++    Config::SetBaseOrCurrent(Config::MAIN_XD_TIMER_ENABLED, checked);
++    Config::Save();
++    RefreshTimerRow();
++  });
++  connect(m_timer_turn_spin, &QSpinBox::valueChanged, this, [](int value) {
++    Config::SetBaseOrCurrent(Config::MAIN_XD_TIMER_TURN_SECONDS, value);
++    Config::Save();
++  });
++  connect(m_timer_game_spin, &QSpinBox::valueChanged, this, [](int value) {
++    Config::SetBaseOrCurrent(Config::MAIN_XD_TIMER_GAME_MINUTES, value);
++    Config::Save();
++  });
++  // The Format decides whether a record is pinned at all, so it gates the row.
++  connect(m_format_combo, &QComboBox::currentIndexChanged, this,
++          [this](int) { RefreshTimerRow(); });
+ 
+   connect(m_share_log_button, &QPushButton::clicked, this, &XDLauncherDialog::OnShareLog);
+   connect(m_gba_customize_button, &QPushButton::clicked, this,
+@@ -863,9 +909,26 @@ void XDLauncherDialog::showEvent(QShowEvent* event)
+   refresh_style_combo(m_style_guest_model_combo, Config::MAIN_XD_STYLE_GUEST_MODEL);
+   refresh_style_combo(m_style_music_combo, Config::MAIN_XD_STYLE_MUSIC);
+   refresh_style_combo(m_style_venue_combo, Config::MAIN_XD_STYLE_VENUE);
++  {
++    const QSignalBlocker b1(m_timer_check), b2(m_timer_turn_spin), b3(m_timer_game_spin);
++    m_timer_check->setChecked(Config::Get(Config::MAIN_XD_TIMER_ENABLED));
++    m_timer_turn_spin->setValue(Config::Get(Config::MAIN_XD_TIMER_TURN_SECONDS));
++    m_timer_game_spin->setValue(Config::Get(Config::MAIN_XD_TIMER_GAME_MINUTES));
++  }
++  RefreshTimerRow();
+   RefreshChecklist();
+ }
+ 
++void XDLauncherDialog::RefreshTimerRow()
++{
++  const bool pinned =
++      XDNetplay::FormatRules::HasTeamRules(m_format_combo->currentData().toInt());
++  m_timer_check->setEnabled(pinned);
++  const bool fields_on = pinned && m_timer_check->isChecked();
++  m_timer_turn_spin->setEnabled(fields_on);
++  m_timer_game_spin->setEnabled(fields_on);
++}
++
+ void XDLauncherDialog::RefreshChecklist()
+ {
+   AutoDiscoverFromGameFolder();
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 1cf5c63..0e84965 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -16,6 +16,7 @@ class QComboBox;
+ class QLabel;
+ class QLineEdit;
+ class QPushButton;
++class QSpinBox;
+ class QShowEvent;
+ class TeamEditorDialog;
+ 
+@@ -73,6 +74,7 @@ private:
+   void CreateMainLayout();
+   void ConnectWidgets();
+   void RefreshChecklist();
++  void RefreshTimerRow();
+   void RefreshSaveSlots();
+   void AutoDiscoverFromGameFolder();
+   void FitToScreen();
+@@ -128,6 +130,12 @@ private:
+   // FORMAT (Free / Orre Colosseum / OU), persisted in MAIN_XD_FORMAT and enforced
+   // by FormatRules' gates -- see the tooltip built in CreateMainLayout.
+   QComboBox* m_format_combo;
++  // Battle timer row: a host pick folded into the format rules pin by
++  // BattleCustomizer::FormatRuleLines. Greyed while the Format pins no record
++  // (Free/OU); the fields follow the checkbox.
++  QCheckBox* m_timer_check = nullptr;
++  QSpinBox* m_timer_turn_spin = nullptr;
++  QSpinBox* m_timer_game_spin = nullptr;
+   QComboBox* m_style_host_model_combo;
+   QComboBox* m_style_guest_model_combo;
+   QComboBox* m_style_music_combo;
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index 825c379..ad50725 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -4,6 +4,7 @@
+ #include "UICommon/XDNetplay/BattleCustomizer.h"
+ 
+ #include <mutex>
++#include <algorithm>
+ #include <optional>
+ #include <span>
+ #include <string>
+@@ -848,6 +849,38 @@ constexpr u32 RULESET_LV50_WORDS[36] = {
+     0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000,
+ };
+ constexpr int RULESET_ENTRIES_WORD = 6;  // u16 at +0x1A = low half of word 6
++// Word 5 = the two battle timers: s16 at +0x14 = MINUTES per game (the game's
++// getter at 0x8004ce20 multiplies it by 60), s16 at +0x16 = SECONDS per turn
++// (getter 0x8004cdfc). The sign is the switch: the rules screen negates a value
++// to turn it OFF and the battle's enable wrappers (0x801f1cd8 / 0x801f1d28)
++// require > 0. Stock 0xFFC4FFEC = 60 min / 20 s, both off. The battle reads
++// the record LIVE through those getters (no copy at battle start), so the
++// per-frame pin below is all it takes; the in-game rules screen renders one
++// digit per cell, so values above 99 misdraw there -- the ranges below are the
++// screen's own limits (up/down clamp 1..99 for the game, 10..99 for the turn).
++constexpr int RULESET_TIMER_WORD = 5;
++constexpr int TIMER_TURN_MIN_S = 10, TIMER_TURN_MAX_S = 99;
++constexpr int TIMER_GAME_MIN_MIN = 1, TIMER_GAME_MAX_MIN = 99;
++
++// The timer word to pin, or nullopt when the timer is off.
++std::optional<u32> TimerWord()
++{
++  if (!Config::Get(Config::MAIN_XD_TIMER_ENABLED))
++    return std::nullopt;
++  const int turn_s = std::clamp(Config::Get(Config::MAIN_XD_TIMER_TURN_SECONDS),
++                                TIMER_TURN_MIN_S, TIMER_TURN_MAX_S);
++  const int game_min = std::clamp(Config::Get(Config::MAIN_XD_TIMER_GAME_MINUTES),
++                                  TIMER_GAME_MIN_MIN, TIMER_GAME_MAX_MIN);
++  return (static_cast<u32>(game_min) & 0xFFFFu) << 16 | (static_cast<u32>(turn_s) & 0xFFFFu);
++}
++
++std::string TimerSummary()
++{
++  const std::optional<u32> word = TimerWord();
++  if (!word)
++    return "off";
++  return fmt::format("{}s/{}min", *word & 0xFFFFu, *word >> 16);
++}
+ 
+ std::string FormatRuleLines()
+ {
+@@ -893,13 +926,18 @@ std::string FormatRuleLines()
+   for (const auto& line : ORRE_MENU_GLOBAL_LINES)
+     AppendLine(&lines, line[0], line[1]);
+   AppendLine(&lines, BATTLE_TYPE_GLOBAL, battle_type);
++  const std::optional<u32> timer_word = TimerWord();
+   for (size_t i = 0; i < 36; i++)
+   {
+     u32 word = words[i];
+     if (i == RULESET_ENTRIES_WORD)
+       word = (word & 0xFFFF0000u) | entries;
++    else if (i == RULESET_TIMER_WORD && timer_word)
++      word = *timer_word;
+     AppendLine(&lines, ORRE_RULESET_BASE + static_cast<u32>(4 * i), word);
+   }
++  if (timer_word)
++    LogNote(fmt::format("battlestyle timer {} word={:08X}", TimerSummary(), *timer_word));
+   return lines;
+ }
+ 
+@@ -1244,10 +1282,10 @@ void PrepareForStart()
+         s_cheats_before = !need_cheats;
+     }
+     Config::SetBaseOrCurrent(Config::MAIN_ENABLE_CHEATS, need_cheats);
+-    LogNote(fmt::format("battlestyle cheats {} for this session (format={} block={})",
++    LogNote(fmt::format("battlestyle cheats {} for this session (format={} timer={} block={})",
+                         need_cheats ? "on" : "off",
+                         FormatRules::FormatDisplayName(Config::Get(Config::MAIN_XD_FORMAT)),
+-                        active ? "active" : "empty"));
++                        TimerSummary(), active ? "active" : "empty"));
+   }
+ }
+ 
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 4e3567b..020d41a 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.14";
++constexpr char VERSION[] = "1.5.15";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
