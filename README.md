@@ -101,7 +101,7 @@ wrong file is caught immediately instead of failing mysteriously.
 ## Getting started
 
 1. Grab the build for your platform from
-   [Releases](https://github.com/logdog2325/dolphin-xd-netplay/releases) — every
+   [Releases](https://github.com/logdog2325/orrelink/releases) — every
    player must be on the **same version**; netplay refuses mismatched builds.
 2. **Desktop:** put the XD disc image, the Emerald ROM and the BIOS in one
    folder. Open the app — the **OrreLink launcher** appears on startup and
