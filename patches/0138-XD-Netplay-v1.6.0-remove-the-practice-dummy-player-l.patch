@@ -1,0 +1,373 @@
+From e9a111ceecfc52840a4227c82b8e49f1d0316192 Mon Sep 17 00:00:00 2001
+From: logdog2325 <226450061+logdog2325@users.noreply.github.com>
+Date: Sun, 13 Sep 2026 10:03:21 -0700
+Subject: [PATCH] XD Netplay v1.6.0: remove the practice dummy; player-left
+ logging without a gap
+
+- The practice dummy (auto-played GBA port 3 for solo sparring) is gone on
+  every platform: the GBA/PracticeDummy key, the netplay pin that forced it
+  off, the SI input injection, the launcher checkbox, the Android switch and
+  settings entry, and the boot line's practice_dummy field.
+- NetPlayServer::OnDisconnect logs player-left through LogPostSession alone,
+  which writes through the live sink while a session is open and appends
+  otherwise, so no line can fall between IsSessionOpen and LogEvent.
+- TimerWord/TimerSummary are static (they sit outside the file's anonymous
+  namespace).
+- XDNetplay::VERSION 1.6.0.
+---
+ .../features/settings/model/BooleanSetting.kt |  6 ----
+ .../settings/ui/SettingsFragmentPresenter.kt  |  8 ------
+ .../xdnetplay/ui/XDLauncherActivity.kt        |  8 ------
+ .../features/xdnetplay/ui/XDLauncherScreen.kt | 18 ------------
+ .../app/src/main/res/values/strings.xml       |  2 --
+ Source/Core/Core/Config/MainSettings.cpp      |  1 -
+ Source/Core/Core/Config/MainSettings.h        |  1 -
+ .../ConfigLoaders/NetPlayConfigLoader.cpp     |  4 ---
+ Source/Core/Core/Core.cpp                     |  3 +-
+ Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp    | 28 -------------------
+ Source/Core/Core/NetPlayServer.cpp            |  9 +++---
+ .../DolphinQt/XDNetplay/XDLauncherDialog.cpp  | 15 +---------
+ .../DolphinQt/XDNetplay/XDLauncherDialog.h    |  1 -
+ .../UICommon/XDNetplay/BattleCustomizer.cpp   |  4 +--
+ Source/Core/UICommon/XDNetplay/Version.h      |  2 +-
+ 15 files changed, 9 insertions(+), 101 deletions(-)
+
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+index 7d365f2..20c0811 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/model/BooleanSetting.kt
+@@ -313,12 +313,6 @@ enum class BooleanSetting(
+         "MuteLinkAudio",
+         false
+     ),
+-    MAIN_GBA_PRACTICE_DUMMY(
+-        Settings.FILE_DOLPHIN,
+-        Settings.SECTION_INI_GBA,
+-        "PracticeDummy",
+-        false
+-    ),
+     MAIN_IR_ALWAYS_RECENTER(
+         Settings.FILE_DOLPHIN,
+         Settings.SECTION_INI_ANDROID,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
+index a36a721..1b33f0e 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/settings/ui/SettingsFragmentPresenter.kt
+@@ -1493,14 +1493,6 @@ class SettingsFragmentPresenter(
+     }
+ 
+     private fun addGbaLinkSettings(sl: ArrayList<SettingsItem>) {
+-        sl.add(
+-            SwitchSetting(
+-                context,
+-                BooleanSetting.MAIN_GBA_PRACTICE_DUMMY,
+-                R.string.gba_practice_dummy,
+-                R.string.gba_practice_dummy_description
+-            )
+-        )
+         sl.add(
+             SwitchSetting(
+                 context,
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+index 9a90d22..4edcf02 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherActivity.kt
+@@ -90,7 +90,6 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+     private var timerEnabled by mutableStateOf(false)
+     private var timerTurnSeconds by mutableStateOf(60)
+     private var timerGameMinutes by mutableStateOf(20)
+-    private var practiceDummy by mutableStateOf(false)
+ 
+     /** True from the moment "Search for Match" is tapped until it joins, hosts or gives up. */
+     private var searching by mutableStateOf(false)
+@@ -326,12 +325,6 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+                     onPickEmeraldRom = { pickEmeraldRom.launch(arrayOf("*/*")) },
+                     onTeamEditor = { TeamEditorActivity.launch(this) },
+                     onPlayXd = { bootXd() },
+-                    practiceDummy = practiceDummy,
+-                    onPracticeDummyChanged = { on ->
+-                        practiceDummy = on
+-                        BooleanSetting.MAIN_GBA_PRACTICE_DUMMY.setBoolean(NativeConfig.LAYER_BASE, on)
+-                        NativeConfig.save(NativeConfig.LAYER_BASE)
+-                    },
+                     modelOptions = modelOptions,
+                     musicOptions = musicOptions,
+                     venueOptions = venueOptions,
+@@ -591,7 +584,6 @@ class XDLauncherActivity : AppCompatActivity(), ThemeProvider {
+         timerEnabled = BooleanSetting.MAIN_XD_TIMER_ENABLED.boolean
+         timerTurnSeconds = IntSetting.MAIN_XD_TIMER_TURN_SECONDS.int
+         timerGameMinutes = IntSetting.MAIN_XD_TIMER_GAME_MINUTES.int
+-        practiceDummy = BooleanSetting.MAIN_GBA_PRACTICE_DUMMY.boolean
+         migrateContentPaths()
+         emeraldRomSet = ensureGbaConfig()
+         xdGameFound = GameFileCacheManager.getGameFileByGameId(XD_GAME_ID) != null
+diff --git a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+index 72e75aa..fd57bdd 100644
+--- a/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
++++ b/Source/Android/app/src/main/java/org/dolphinemu/dolphinemu/features/xdnetplay/ui/XDLauncherScreen.kt
+@@ -5,7 +5,6 @@ package org.dolphinemu.dolphinemu.features.xdnetplay.ui
+ import androidx.compose.foundation.layout.Arrangement
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.Row
+-import androidx.compose.material3.Switch
+ import androidx.compose.foundation.layout.Spacer
+ import androidx.compose.foundation.layout.fillMaxSize
+ import androidx.compose.foundation.layout.fillMaxWidth
+@@ -79,8 +78,6 @@ fun XDLauncherScreen(
+     onPickEmeraldRom: () -> Unit,
+     onTeamEditor: () -> Unit,
+     onPlayXd: () -> Unit,
+-    practiceDummy: Boolean,
+-    onPracticeDummyChanged: (Boolean) -> Unit,
+     onBattle: () -> Unit,
+     modelOptions: List<BattleStyleBridge.StyleOption>,
+     musicOptions: List<BattleStyleBridge.StyleOption>,
+@@ -180,21 +177,6 @@ fun XDLauncherScreen(
+                 ) {
+                     Text("Boot Pokémon XD (solo)", style = MaterialTheme.typography.titleMedium)
+                 }
+-                Spacer(Modifier.height(12.dp))
+-                Row(
+-                    modifier = Modifier.fillMaxWidth(),
+-                    verticalAlignment = Alignment.CenterVertically
+-                ) {
+-                    Column(Modifier.weight(1f)) {
+-                        Text("Practice vs dummy", style = MaterialTheme.typography.bodyLarge)
+-                        Text(
+-                            "Auto-plays GBA port 3 so you can practice link battles alone.",
+-                            style = MaterialTheme.typography.bodySmall
+-                        )
+-                    }
+-                    Switch(checked = practiceDummy, onCheckedChange = onPracticeDummyChanged)
+-                }
+-
+                 Spacer(Modifier.height(12.dp))
+                 // The battle Format pick plus the cosmetic battle-style
+                 // selectors, host-side. The guest picks its OWN model in the
+diff --git a/Source/Android/app/src/main/res/values/strings.xml b/Source/Android/app/src/main/res/values/strings.xml
+index 231d8b6..7fd1a56 100644
+--- a/Source/Android/app/src/main/res/values/strings.xml
++++ b/Source/Android/app/src/main/res/values/strings.xml
+@@ -76,8 +76,6 @@
+     <string name="gba_link_scale_fit">Fit, keep aspect ratio</string>
+     <string name="gba_link_scale_stretch">Stretch to full screen</string>
+     <string name="gba_link_scale_integer">Integer scale</string>
+-    <string name="gba_practice_dummy">Practice Dummy on GBA 3</string>
+-    <string name="gba_practice_dummy_description">Auto-presses A on GBA port 3 so you can battle a scripted opponent by yourself. Turn off for real matches.</string>
+     <string name="gba_link_external_display">Use External Display for GBA Link</string>
+     <string name="gba_link_external_display_description">Shows the active GBA Link screen on a valid external presentation display when one is connected.</string>
+     <string name="gba_link_position">GBA Screen Position</string>
+diff --git a/Source/Core/Core/Config/MainSettings.cpp b/Source/Core/Core/Config/MainSettings.cpp
+index f648027..ef8b118 100644
+--- a/Source/Core/Core/Config/MainSettings.cpp
++++ b/Source/Core/Core/Config/MainSettings.cpp
+@@ -408,7 +408,6 @@ const std::array<Info<std::string>, 5> MAIN_GBA_ROM_PATHS{
+ const Info<std::string> MAIN_GBA_SAVES_PATH{{System::Main, "GBA", "SavesPath"}, ""};
+ const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH{{System::Main, "GBA", "SavesInRomPath"}, false};
+ const Info<bool> MAIN_GBA_LINK_MUTED{{System::Main, "GBA", "MuteLinkAudio"}, false};
+-const Info<bool> MAIN_GBA_PRACTICE_DUMMY{{System::Main, "GBA", "PracticeDummy"}, false};
+ // Debounced falling-edge GBA auto-reset (fast fresh-boot-window cadence for
+ // XD's edge-triggered detection). Default on; timer backstop remains either way.
+ const Info<bool> MAIN_GBA_EDGE_RESET{{System::Main, "GBA", "EdgeReset"}, true};
+diff --git a/Source/Core/Core/Config/MainSettings.h b/Source/Core/Core/Config/MainSettings.h
+index a469da1..6ba195d 100644
+--- a/Source/Core/Core/Config/MainSettings.h
++++ b/Source/Core/Core/Config/MainSettings.h
+@@ -228,7 +228,6 @@ extern const std::array<Info<std::string>, 5> MAIN_GBA_ROM_PATHS;
+ extern const Info<std::string> MAIN_GBA_SAVES_PATH;
+ extern const Info<bool> MAIN_GBA_SAVES_IN_ROM_PATH;
+ extern const Info<bool> MAIN_GBA_LINK_MUTED;
+-extern const Info<bool> MAIN_GBA_PRACTICE_DUMMY;
+ extern const Info<bool> MAIN_GBA_EDGE_RESET;
+ extern const Info<bool> MAIN_GBA_FULLBOOT_PRESENCE;
+ 
+diff --git a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+index e0449fc..969c4bd 100644
+--- a/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
++++ b/Source/Core/Core/ConfigLoaders/NetPlayConfigLoader.cpp
+@@ -90,10 +90,6 @@ public:
+     // Not in NetSettings; read by PowerPC.cpp / JitBase.cpp and changes both
+     // timing and semantics on the interpreter cores. Pin it off for everyone.
+     layer->Set(Config::MAIN_ACCURATE_CPU_CACHE, false);
+-    // OrreLink: the practice dummy injects A/Right/Down into GBA port 3 LOCALLY
+-    // (SI_DeviceGBAEmu) -- a host that left it on would feed its copy of the
+-    // guest's GBA input nobody else sees. Never under netplay.
+-    layer->Set(Config::MAIN_GBA_PRACTICE_DUMMY, false);
+     // Per-machine and never synced upstream; "none" defeats the deterministic
+     // GPU thread while cpu_thread itself is synced. Pin the default for all.
+     layer->Set(Config::MAIN_GPU_DETERMINISM_MODE, std::string("auto"));
+diff --git a/Source/Core/Core/Core.cpp b/Source/Core/Core/Core.cpp
+index 24b6615..2fb31c7 100644
+--- a/Source/Core/Core/Core.cpp
++++ b/Source/Core/Core/Core.cpp
+@@ -710,7 +710,7 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+         "cpu arch={} core_cfg={} core_eff=\"{}\" dispatch={} hw_fma={} hw_afp={} use_fma={} "
+         "accurate_fmadds={} accurate_nans={} fprf={} float_exc={} div0_exc={} disable_icache={} "
+         "accurate_dcache={} fastmem={} follow_branch={} mmu={} cpu_thread={} oc={} "
+-        "sync_on_skip_idle={} cheats={} gpu_det={} dsp_hle={} dsp_thread={} practice_dummy={} "
++        "sync_on_skip_idle={} cheats={} gpu_det={} dsp_hle={} dsp_thread={} "
+         "debug={} soft_flush={} netplay={} xd_clock={} xd_clock_cfg={} xd_salt={:08x} "
+         "xd_seed={:08x} xd_period={} xd_inc={} xd_clock_v={} rev={} orrelink={}",
+         NetPlay::LocalCpuArch(), static_cast<int>(Config::Get(Config::MAIN_CPU_CORE)),
+@@ -729,7 +729,6 @@ static void EmuThread(Core::System& system, std::unique_ptr<BootParameters> boot
+         Config::Get(Config::MAIN_SYNC_ON_SKIP_IDLE) ? 1 : 0, Config::AreCheatsEnabled() ? 1 : 0,
+         Config::Get(Config::MAIN_GPU_DETERMINISM_MODE), Config::Get(Config::MAIN_DSP_HLE) ? 1 : 0,
+         Config::Get(Config::MAIN_DSP_THREAD) ? 1 : 0,
+-        Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY) ? 1 : 0,
+         Config::Get(Config::MAIN_ENABLE_DEBUGGING) ? 1 : 0,
+         ppc.GetPPCState().software_fpu_flush ? 1 : 0,
+         NetPlay::IsNetPlayRunning() ? 1 : 0, HLE_XD::IsInstalled() ? "on" : "off",
+diff --git a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+index 4839a2e..90ba352 100644
+--- a/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
++++ b/Source/Core/Core/HW/SI/SI_DeviceGBAEmu.cpp
+@@ -1036,34 +1036,6 @@ DataResponse CSIDevice_GBAEmu::GetData(u32& hi, u32& low)
+   if (!NetPlay::IsNetPlayRunning())
+   {
+     pad_status = Pad::GetGBAStatus(m_device_number);
+-
+-    // Practice dummy: drive GBA port 3 so a single player can spar against a
+-    // scripted opponent without netplay. Press A to confirm/attack, and inject
+-    // a D-pad tap between A presses so XD's "select a Pokemon" screen advances
+-    // to a *different* Pokemon each cycle instead of re-confirming the same
+-    // slot forever (which never completes team selection).
+-    // Not before the link is up: Emerald's joybus window lives on the copyright
+-    // screen, and holding A walks straight past it, so a dummy that starts
+-    // mashing at boot stops socket 3 from ever being detected.
+-    if (m_device_number == 2 && (m_link_established || m_battle_locked) &&
+-        Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY))
+-    {
+-      const u64 tenths = m_system.GetCoreTiming().GetTicks() /
+-                         (m_system.GetSystemTimers().GetTicksPerSecond() / 10);
+-      const u64 phase = tenths % 7;
+-      if (phase < 2)
+-      {
+-        pad_status.button |= PadButton::PAD_BUTTON_A;
+-      }
+-      else if (phase == 4)
+-      {
+-        // Move the cursor in the A-release gap. Alternate Right/Down each cycle
+-        // to sweep a 2D roster grid and avoid wedging against an edge; a single
+-        // 0.1s tap steps exactly one slot (too short to trigger auto-repeat).
+-        pad_status.button |= (tenths / 7 % 2 == 0) ? PadButton::PAD_BUTTON_RIGHT
+-                                                   : PadButton::PAD_BUTTON_DOWN;
+-      }
+-    }
+   }
+   SerialInterface::CSIDevice_GCController::HandleMoviePadStatus(m_system.GetMovie(),
+                                                                 m_device_number, &pad_status);
+diff --git a/Source/Core/Core/NetPlayServer.cpp b/Source/Core/Core/NetPlayServer.cpp
+index 5dde118..2055c23 100644
+--- a/Source/Core/Core/NetPlayServer.cpp
++++ b/Source/Core/Core/NetPlayServer.cpp
+@@ -626,11 +626,10 @@ unsigned int NetPlayServer::OnDisconnect(const Client& player)
+ 
+ #ifdef HAS_LIBMGBA
+   {
+-    const std::string detail = fmt::format("pid={} running={}", pid, m_is_running ? 1 : 0);
+-    if (GBADetectLog::IsSessionOpen())
+-      GBADetectLog::LogEvent(0, 0, "player-left", detail);
+-    else
+-      GBADetectLog::LogPostSession("player-left " + detail);
++    // LogPostSession writes through the live sink while a session is open and
++    // appends to the last log otherwise, with no window between the two.
++    GBADetectLog::LogPostSession(
++        fmt::format("player-left pid={} running={}", pid, m_is_running ? 1 : 0));
+   }
+ #endif
+ 
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+index d01d2e8..3395eb8 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.cpp
+@@ -440,9 +440,6 @@ void XDLauncherDialog::CreateMainLayout()
+   auto* battle_box = new QGroupBox(tr("Battle"));
+   auto* battle_layout = new QGridLayout;
+   m_boot_button = new NonDefaultQPushButton(tr("Boot Pokémon XD (solo)"));
+-  m_practice_dummy_check = new QCheckBox(tr("Practice vs dummy"));
+-  m_practice_dummy_check->setToolTip(
+-      tr("Auto-plays GBA port 3 so you can practice link battles alone."));
+   // The headline action: one button, no codes to trade. Everything below it is
+   // the manual escape hatch for people who already know their opponent.
+   m_search_button = new NonDefaultQPushButton(tr("Search for Match"));
+@@ -459,8 +456,7 @@ void XDLauncherDialog::CreateMainLayout()
+   // row; word wrap because the "hosting and waiting" line is a sentence.
+   m_match_status = MakeNoteLabel(QString());
+   m_match_status->hide();
+-  battle_layout->addWidget(m_boot_button, 0, 0);
+-  battle_layout->addWidget(m_practice_dummy_check, 0, 1);
++  battle_layout->addWidget(m_boot_button, 0, 0, 1, 2);
+   battle_layout->addWidget(m_search_button, 1, 0, 1, 2);
+   battle_layout->addWidget(m_match_status, 2, 0, 1, 2);
+   battle_layout->addWidget(m_host_button, 3, 0, 1, 2);
+@@ -811,11 +807,6 @@ void XDLauncherDialog::ConnectWidgets()
+   });
+   connect(m_team_editor_button, &QPushButton::clicked, this, &XDLauncherDialog::OnTeamEditor);
+ 
+-  connect(m_practice_dummy_check, &QCheckBox::toggled, this, [](bool checked) {
+-    Config::SetBaseOrCurrent(Config::MAIN_GBA_PRACTICE_DUMMY, checked);
+-    Config::Save();
+-  });
+-
+   // Persist a Battle Style pick the moment it is made -- same idiom as the
+   // checkboxes above. Only the config key is written here: the AR block is
+   // assembled from these keys by BattleCustomizer's lifecycle hooks (start
+@@ -881,10 +872,6 @@ void XDLauncherDialog::showEvent(QShowEvent* event)
+   // solo boot, the team editor, hosting -- reads the socket saves. No-op
+   // unless leftovers exist; refuses to run while a room or emulation is live.
+   XDNetplay::DisposableSave::HealLeftoverSession();
+-  {
+-    const QSignalBlocker blocker(m_practice_dummy_check);
+-    m_practice_dummy_check->setChecked(Config::Get(Config::MAIN_GBA_PRACTICE_DUMMY));
+-  }
+   {
+     // The hub carries the same toggle, so this one can be stale by the time the
+     // launcher is opened from it.
+diff --git a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+index 0e84965..7d6223b 100644
+--- a/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
++++ b/Source/Core/DolphinQt/XDNetplay/XDLauncherDialog.h
+@@ -141,7 +141,6 @@ private:
+   QComboBox* m_style_music_combo;
+   QComboBox* m_style_venue_combo;
+ 
+-  QCheckBox* m_practice_dummy_check;
+   QCheckBox* m_show_on_startup_check;
+   QPushButton* m_boot_button;
+   QPushButton* m_host_button;
+diff --git a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+index ad50725..42c6428 100644
+--- a/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
++++ b/Source/Core/UICommon/XDNetplay/BattleCustomizer.cpp
+@@ -863,7 +863,7 @@ constexpr int TIMER_TURN_MIN_S = 10, TIMER_TURN_MAX_S = 99;
+ constexpr int TIMER_GAME_MIN_MIN = 1, TIMER_GAME_MAX_MIN = 99;
+ 
+ // The timer word to pin, or nullopt when the timer is off.
+-std::optional<u32> TimerWord()
++static std::optional<u32> TimerWord()
+ {
+   if (!Config::Get(Config::MAIN_XD_TIMER_ENABLED))
+     return std::nullopt;
+@@ -874,7 +874,7 @@ std::optional<u32> TimerWord()
+   return (static_cast<u32>(game_min) & 0xFFFFu) << 16 | (static_cast<u32>(turn_s) & 0xFFFFu);
+ }
+ 
+-std::string TimerSummary()
++static std::string TimerSummary()
+ {
+   const std::optional<u32> word = TimerWord();
+   if (!word)
+diff --git a/Source/Core/UICommon/XDNetplay/Version.h b/Source/Core/UICommon/XDNetplay/Version.h
+index 020d41a..9f2d92c 100644
+--- a/Source/Core/UICommon/XDNetplay/Version.h
++++ b/Source/Core/UICommon/XDNetplay/Version.h
+@@ -11,5 +11,5 @@ namespace XDNetplay
+ // fork's release, so it cannot answer "which XD Netplay am I?" -- this constant is the only thing
+ // that can. It MUST be bumped in the same patch that a release is tagged from: ship a tag ahead of
+ // this string and every user of that release is told they are out of date forever.
+-constexpr char VERSION[] = "1.5.15";
++constexpr char VERSION[] = "1.6.0";
+ }  // namespace XDNetplay
+-- 
+2.39.5 (Apple Git-154)
+
