@@ -430,6 +430,10 @@ OrreLink stands on other people's work.
   over netplay. OrreLink grew out of it: the netplay-ready game configuration
   and the *XD OU Fixes* Action Replay set behind the OU format are carried
   over from that bundle.
+- **Akiak** — the original **OrreLink**, whose name this project carries and
+  whose working netplay setup showed what an XD link session needs to be
+  configured like; the Orre and Hoenn format set the rules pins follow; and
+  testing every release from the first.
 - **PKHeX** (kwsch and contributors) — the Gen 3 save-structure references the
   team saves are built against, and the Gen 4 code PBR Online ports (save
   container geometry, BK4 encryption, experience tables, string tables).
