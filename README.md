@@ -276,7 +276,7 @@ mixed Mac, Windows and Android room, and how to check a match from its logs:
 
 OrreLink stands on other people's work.
 
-- **imablissy and papajefe** made the original **XD Netplay** build, the
+- **im a blisy ._. and papajefe** made the original **XD Netplay** build, the
   Windows Dolphin bundle that first got GBA-vs-GBA Pokémon XD battles working
   over netplay. OrreLink grew out of it. The netplay-ready game configuration
   and the *XD OU Fixes* Action Replay set behind the OU format are carried
