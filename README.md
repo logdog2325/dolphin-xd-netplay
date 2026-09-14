@@ -420,3 +420,25 @@ interoperate.
 
 To build: run the **build** workflow from the Actions tab (tick `build_macos`,
 `build_windows` and `build_linux` as needed). Artifacts appear on the run page.
+
+## Credits
+
+OrreLink stands on other people's work.
+
+- **imablissy and papajefe** made the original **XD Netplay** build — the
+  Windows Dolphin bundle that first got GBA-vs-GBA Pokémon XD battles working
+  over netplay. OrreLink grew out of it: the netplay-ready game configuration
+  and the *XD OU Fixes* Action Replay set behind the OU format are carried
+  over from that bundle.
+- **PKHeX** (kwsch and contributors) — the Gen 3 save-structure references the
+  team saves are built against, and the Gen 4 code PBR Online ports (save
+  container geometry, BK4 encryption, experience tables, string tables).
+- **Dolphin Emulator Project** — OrreLink is a fork of Dolphin and stays under
+  Dolphin's licence, GPL-2.0-or-later.
+- **SapphireRhodonite** — Dolphin pull request #14745, the Android dual-screen
+  GBA support the Thor's second screen is built on.
+- **mGBA** (endrift and contributors) — the emulated Game Boy Advances inside
+  Dolphin.
+- **pret** decompilation projects (pokeruby, pokefirered, pokeemerald) — the
+  Gen 3 save layout and character map.
+- **Pokémon Showdown** — the team paste format the editor reads.
